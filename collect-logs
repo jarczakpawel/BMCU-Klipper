@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PY=${PYTHON_BIN:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}
+[ -n "$PY" ] || { echo "Python is required." >&2; exit 1; }
+
+BMCU_DIR=${BMCU_DIR:-}
+if [ -z "$BMCU_DIR" ]; then
+    for dir in "$HOME/printer_data/config/bmcu" /home/*/printer_data/config/bmcu /root/printer_data/config/bmcu; do
+        if [ -f "$dir/runtime/INSTALLATION.json" ]; then
+            BMCU_DIR=$dir
+            break
+        fi
+    done
+fi
+[ -n "$BMCU_DIR" ] || { echo "Set BMCU_DIR to the installed BMCU configuration directory." >&2; exit 1; }
+
+TS=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)
+OUT=${BMCU_LOG_ARCHIVE:-"$PWD/bmcu-diagnostics-$TS.tar.gz"}
+
+exec "$PY" "$BASE/scripts/bmcu_collect_logs.py" --bmcu-dir "$BMCU_DIR" --output "$OUT" "$@"

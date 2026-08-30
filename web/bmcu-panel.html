@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>BMCU Control</title>
+  <link rel="stylesheet" href="/panel.css">
+  <script defer src="/panel.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <button class="brand" data-view="dashboard" type="button" aria-label="Open dashboard">
+        <span id="brandDot" class="status-dot pending" aria-hidden="true"></span>
+        <span>BMCU</span>
+      </button>
+      <div id="releaseStatus" class="release-status hidden" aria-live="polite"><span id="releaseSpinner" class="mini-spinner" aria-hidden="true"></span><span id="releaseText"></span></div>
+      <nav id="mainNav" class="main-nav" aria-label="Main navigation">
+        <button class="nav-item active" data-view="dashboard" type="button">Dashboard</button>
+        <button class="nav-item" data-view="diagnostics" type="button">Diagnostics</button>
+        <button class="nav-item" data-view="settings" type="button">Settings</button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="app-shell">
+
+    <section id="view-dashboard" class="view active" data-view="dashboard">
+      <div class="page-heading"><div><h1>Dashboard</h1></div></div>
+      <div id="noticeRegion" class="notice-stack"></div>
+      <div id="summaryGrid" class="summary-grid"></div>
+      <div class="dashboard-grid">
+        <section class="panel-card span-2"><div class="section-head"><div><h2>Channels</h2></div></div><div id="dashboardChannels" class="channel-list"></div></section>
+        <section class="panel-card routing-panel span-2"><div class="section-head"><div><h2>Routing</h2><p id="routingHelp">Logical source routing.</p></div></div><div id="toolMap" class="mapping-list native-tool-map"></div><div id="dashboardRouting" class="dashboard-routing"></div><div class="routing-actions"><span id="routeSaveStatus" class="muted">No unsaved routing changes</span><div><button id="discardRoutes" class="button secondary" type="button">Discard changes</button><button id="saveRoutes" class="button primary" type="button">Save routing</button></div></div></section>
+        <section id="sourcePathPanel" class="panel-card ownership-panel source-panel span-2"><div class="section-head"><div><h2>Toolhead filament paths</h2><p id="sourcePathHelp">Configured and physical filament sources.</p></div></div><div id="ownershipList" class="head-source-grid"></div></section>
+      </div>
+    </section>
+
+    <section id="view-diagnostics" class="view" data-view="diagnostics">
+      <div class="page-heading"><div><h1>Diagnostics</h1></div><button id="openDiagnosticsExport" class="button secondary" type="button">Export logs</button></div>
+      <div id="diagnosticDevices" class="diagnostic-device-grid"></div>
+      <div id="diagnosticChannels" class="diagnostic-grid"></div>
+    </section>
+
+    <section id="view-settings" class="view" data-view="settings">
+      <div class="page-heading">
+        <div><h1>Settings</h1></div>
+      </div>
+      <div class="settings-grid">
+        <section class="panel-card"><div class="section-head"><div><h2>Setup</h2><p>Connection, routing, calibration and print behaviour</p></div></div><div id="setupStatus" class="check-list"></div><div class="setup-preference"><label class="switch-row"><span><strong>Leave final filament loaded</strong><small>Off by default. After a successful print, keep the last confirmed BMCU filament loaded only when that toolhead has no later source change. The next print reuses it or unloads it automatically before another source uses the same path. Cancellation and recovery safety are unchanged.</small></span><input id="leaveFinalFilamentLoaded" type="checkbox"></label><div class="inline-save-actions"><span id="setupPreferenceState" class="muted">Saved</span><button id="cancelSetupPreferences" class="button secondary" type="button">Cancel</button><button id="saveSetupPreferences" class="button primary" type="button">Save</button></div></div></section>
+        <section class="panel-card"><div class="section-head"><div><h2>System</h2><p>Installed package, detected printer and BMCU status</p></div></div><div id="systemInfo" class="info-list"></div><div id="packageUpdateActions" class="package-update-actions hidden"><span id="packageUpdateStatus" class="muted"></span><a id="packageReleaseLink" class="button primary" href="https://github.com/jarczakpawel/BMCU-Klipper/releases/latest" target="_blank" rel="noopener noreferrer">Open latest release</a></div><div id="printerIntegrationAdvice" class="notice warning compact hidden"><span class="notice-icon">!</span><div><h3></h3><p></p><button id="openPrinterHelp" class="button secondary" type="button">Setup and OrcaSlicer settings</button></div></div></section>
+        <section class="panel-card span-2"><div class="section-head"><div><h2>Lighting profiles</h2><p>Named profiles for system light, filament colours, buffer position and channel status.</p></div></div><p id="systemLedEmpty" class="muted">No BMCU detected.</p><div id="systemLedSettings" class="led-settings"></div></section>
+        <section id="tailTrackingSection" class="panel-card span-2"><div class="section-head"><div><h2>Generic toolhead integration</h2><p>Configure each detected Klipper extruder/toolhead independently. Generic BMCU uses two printer macros: one complete toolhead preparation macro after SEND OUT and one complete before-pullback macro before the long BMCU retract.</p></div></div><div id="tailTrackingSettings" class="calibration-grid"></div></section>
+        <section id="u1GcodeSection" class="panel-card span-2 hidden">
+          <div class="section-head"><div><h2>Snapmaker U1 tip forming</h2><p>Default applies to every material without its own setting.</p></div><button id="openU1TipHelp" class="button secondary" type="button">Tip-forming help</button></div>
+          <div class="u1-profile-layout">
+            <div class="u1-profile-list">
+              <div class="u1-profile-table-wrap">
+                <table class="u1-profile-table">
+                  <thead><tr><th>Profile</th></tr></thead>
+                  <tbody id="u1ProfileRows"></tbody>
+                </table>
+              </div>
+              <div class="u1-profile-add">
+                <label class="field"><span>Add material</span><input id="u1MaterialName" type="text" maxlength="40" placeholder="PLA, PETG, TPU..."></label>
+                <button id="u1MaterialAdd" class="button secondary" type="button">Add</button>
+              </div>
+            </div>
+            <div id="u1ProfileEditor" class="u1-profile-editor">
+              <div class="u1-profile-editor-head"><div><h3 id="u1ProfileTitle">Default</h3><small id="u1ProfileRule">Used when no material override exists</small></div><span id="u1GcodeState" class="badge good">Saved</span></div>
+              <div class="u1-tip-options">
+                <label class="field"><span>Temperature</span><select id="u1TipTempMode"><option value="project">From print (G-code)</option><option value="default">Snapmaker default</option><option value="custom">Custom</option></select><small id="u1TipTempExplanation">Later loads and tip forming follow the selected source.</small></label>
+                <label id="u1TipTempCustomField" class="field hidden"><span>Custom temperature</span><div class="input-with-unit"><input id="u1TipTemp" type="number" min="170" max="300" step="1"><span>°C</span></div></label>
+              </div>
+
+              <div id="u1MovementEditor" class="u1-movement-grid">
+                <article class="u1-movement-card" data-u1-movement="rigid_standard">
+                  <div class="u1-movement-head"><div><strong>Normal filament</strong><small>0.4 / 0.6 / 0.8 mm nozzle</small></div><button class="small-action" type="button" data-u1-reset-movement="rigid_standard">Restore BMCU stock</button></div>
+                  <textarea id="u1MoveRigidStandard" maxlength="2048" class="gcode-editor compact" spellcheck="false"></textarea>
+                  <div id="u1TimingRigidStandard" class="u1-timing-summary"></div><details class="u1-timing-details"><summary>Command timing</summary><div id="u1TimingRigidStandardLines" class="u1-timing-lines"></div></details>
+                  <details><summary>BMCU stock</summary><pre id="u1DefaultRigidStandard" class="code-block compact-code"></pre></details>
+                  <details><summary>Snapmaker stock</summary><pre id="u1SnapmakerRigidStandard" class="code-block compact-code"></pre></details>
+                </article>
+                <article class="u1-movement-card" data-u1-movement="soft_standard">
+                  <div class="u1-movement-head"><div><strong>Flexible filament</strong><small>0.4 / 0.6 / 0.8 mm nozzle</small></div></div>
+                  <textarea id="u1MoveSoftStandard" maxlength="2048" class="gcode-editor compact" spellcheck="false"></textarea>
+                  <div id="u1TimingSoftStandard" class="u1-timing-summary"></div><details class="u1-timing-details"><summary>Command timing</summary><div id="u1TimingSoftStandardLines" class="u1-timing-lines"></div></details>
+                  <details><summary>BMCU stock</summary><pre id="u1DefaultSoftStandard" class="code-block compact-code"></pre></details>
+                  <details><summary>Snapmaker stock</summary><pre id="u1SnapmakerSoftStandard" class="code-block compact-code"></pre></details>
+                </article>
+                <article class="u1-movement-card" data-u1-movement="rigid_fine">
+                  <div class="u1-movement-head"><div><strong>Normal filament</strong><small>0.2 mm nozzle</small></div><button class="small-action" type="button" data-u1-reset-movement="rigid_fine">Restore BMCU stock</button></div>
+                  <textarea id="u1MoveRigidFine" maxlength="2048" class="gcode-editor compact" spellcheck="false"></textarea>
+                  <div id="u1TimingRigidFine" class="u1-timing-summary"></div><details class="u1-timing-details"><summary>Command timing</summary><div id="u1TimingRigidFineLines" class="u1-timing-lines"></div></details>
+                  <details><summary>BMCU stock</summary><pre id="u1DefaultRigidFine" class="code-block compact-code"></pre></details>
+                  <details><summary>Snapmaker stock</summary><pre id="u1SnapmakerRigidFine" class="code-block compact-code"></pre></details>
+                </article>
+                <article class="u1-movement-card" data-u1-movement="soft_fine">
+                  <div class="u1-movement-head"><div><strong>Flexible filament</strong><small>0.2 mm nozzle</small></div></div>
+                  <textarea id="u1MoveSoftFine" maxlength="2048" class="gcode-editor compact" spellcheck="false"></textarea>
+                  <div id="u1TimingSoftFine" class="u1-timing-summary"></div><details class="u1-timing-details"><summary>Command timing</summary><div id="u1TimingSoftFineLines" class="u1-timing-lines"></div></details>
+                  <details><summary>BMCU stock</summary><pre id="u1DefaultSoftFine" class="code-block compact-code"></pre></details>
+                  <details><summary>Snapmaker stock</summary><pre id="u1SnapmakerSoftFine" class="code-block compact-code"></pre></details>
+                </article>
+              </div>
+
+              <div class="u1-gcode-actions"><button id="u1GcodeSave" class="button primary" type="button">Save</button><button id="u1GcodeCancel" class="button secondary" type="button">Cancel</button><button id="u1GcodeReset" class="button secondary" type="button">Restore BMCU stock values</button><button id="u1GcodeDelete" class="button secondary hidden" type="button">Use Default profile</button></div>
+            </div>
+          </div>
+        </section>
+        <section id="bmcuSettingsSection" class="panel-card span-2">
+          <div class="section-head"><div><h2>BMCU settings</h2><p>Loading handoff, preparation pressure, calibration and module management.</p></div></div>
+          <div id="bmcuSettings" class="bmcu-settings-grid"></div>
+        </section>
+        <section id="firmwareFlashSection" class="panel-card span-2"><div class="section-head"><div><h2>Firmware flash</h2><p>Expert firmware flashing - select USB or TTL bootloader.</p></div></div>
+          <div id="flashDangerNotice" class="notice error compact"><span class="notice-icon">!</span><div><h3>Danger - firmware flashing can reprogram the wrong device</h3><p>Be extremely careful with every flash method. Selecting the wrong device or serial port can erase or reprogram another printer/controller device. The safest option is to flash the BMCU from a PC or phone with only the intended BMCU or adapter connected. When flashing from a printer: unplug the intended BMCU or adapter, refresh the serial-port list and confirm its port disappears; reconnect it, refresh again and confirm the same port returns. Continue only if you know exactly what you are doing and have positively identified the target. This applies to both USB and TTL.</p></div></div>
+          <div class="flash-mode-grid" role="radiogroup" aria-label="Firmware flash method">
+            <label class="flash-mode-card"><input type="radio" name="updateMode" value="usb" checked><span><strong>USB</strong><small>Built-in USB-UART connection. BOOT and RESET are controlled automatically through DTR/RTS. Do not press any buttons.</small></span></label>
+            <label class="flash-mode-card"><input type="radio" name="updateMode" value="ttl"><span><strong>TTL</strong><small>Expert mode. Manual BOOT/RESET and direct access to every detected serial port. When prompted, hold BOOT, tap RESET and release BOOT.</small></span></label>
+          </div>
+          <div id="unknownCh340Notice" class="notice error compact hidden"><span class="notice-icon">!</span><div><h3>Unknown serial device selected</h3><p>Do not trust the port name alone. Unplug the intended BMCU adapter and refresh - this exact port must disappear. Reconnect it and refresh again - the same port must return. If you cannot prove that, do not flash it.</p></div></div>
+          <div class="update-pane firmware-flash-pane">
+            <label class="field"><span>BMCU connection</span><select id="updateDevice"></select></label>
+            <label class="field"><span>Serial port</span><select id="updatePort"></select></label>
+            <button id="updatePortsRefresh" class="button secondary" type="button">Refresh serial ports</button>
+            <label class="field full"><span>Firmware .bin</span><input id="updateFileLocal" type="file" accept=".bin,application/octet-stream"></label>
+            <p class="firmware-note">Online downloads the latest published firmware; local mode flashes the selected file as-is. Both use the same flasher. Application image: 1-61440 bytes. Complete image: exactly 65536 bytes.</p>
+            <div class="firmware-actions full"><button id="updateOnline" class="button primary" type="button">Download latest & flash</button><button id="updateUpload" class="button secondary" type="button">Flash local file</button></div>
+          </div>
+          <div id="updateStatus" class="update-status">No firmware flash is running.</div>
+        </section>
+
+      </div>
+    </section>
+  </main>
+
+  <dialog id="diagnosticsExportDialog" class="dialog compact-dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2>Export logs</h2><p>Select the data to include in the diagnostic archive.</p></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <div class="diagnostics-modal-toolbar"><span>Include</span><div><button id="diagnosticsSelectAll" class="small-action" type="button">All</button><button id="diagnosticsSelectNone" class="small-action" type="button">None</button></div></div>
+      <div class="diagnostics-export-options">
+        <label><input type="checkbox" data-diagnostics-option="bmcu_logs" checked><span>BMCU logs</span></label>
+        <label><input type="checkbox" data-diagnostics-option="klipper_log" checked><span>Klipper log</span></label>
+        <label><input type="checkbox" data-diagnostics-option="moonraker_log" checked><span>Moonraker log</span></label>
+        <label><input type="checkbox" data-diagnostics-option="config" checked><span>BMCU configuration</span></label>
+        <label><input type="checkbox" data-diagnostics-option="runtime" checked><span>Runtime status</span></label>
+        <label><input type="checkbox" data-diagnostics-option="printer_status" checked><span>Printer status</span></label>
+        <label><input type="checkbox" data-diagnostics-option="last_gcode"><span>Last G-code</span></label>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="diagnosticsExport" class="button primary" type="button">Export</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="u1TipHelpDialog" class="dialog wide-dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2>Snapmaker U1 tip-forming help</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <div class="help-content u1-tip-help">
+        <section><h3>Profiles</h3><p>Four variants are available: Normal/Flexible filament for 0.2 mm and standard 0.4-0.8 mm nozzles. Default is used unless an exact material override exists.</p></section>
+        <section><h3>Commands</h3><ul class="help-command-list">
+          <li><strong><code>BMCU_PARK_HEAD</code></strong> - marks the point where U1 may start parking the source Head. Commands already queued after the marker can finish on that source Head while another Head is prepared. Same-Head changes wait for the tip program instead of parking.</li>
+          <li><strong><code>BMCU_TEMP S205</code></strong> - sets an absolute source-Head target.</li>
+          <li><strong><code>BMCU_TEMP OFFSET=-15</code></strong> - offsets the selected print/profile temperature.</li>
+          <li><strong><code>BMCU_TEMP_RESET</code></strong> - restores the selected base temperature.</li>
+          <li><strong><code>BMCU_HOTEND_FAN SPEED=1.0</code></strong> - forces the source Head heatbreak/hotend fan to 100%.</li>
+          <li><strong><code>BMCU_HOTEND_FAN_RESET</code></strong> - returns the hotend fan to Snapmaker automatic control.</li>
+        </ul></section>
+        <section><h3>Observed U1 cooling</h3><p>On this U1, changing the target from 220°C to 205°C reduced the measured source-Head temperature from about 219°C to 205.7°C in about 10.5 s. Actual cooling depends on temperature, airflow and environment.</p></section>
+        <section><h3>Timing preview</h3><p>E-moves use the configured U1 extrusion limits and <strong><code>G4</code></strong> is counted exactly. Temperature/fan commands and <strong><code>BMCU_PARK_HEAD</code></strong> show 0 s because they do not wait. Mechanical Head parking/picking and heater cooling are not added.</p></section>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Close</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="printerHelpDialog" class="dialog wide-dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2 id="printerHelpTitle">Snapmaker U1 setup and slicer profiles</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <div id="printerHelpBody" class="help-content">
+        <div id="printerHelpU1">
+        <section>
+          <h3>1. Snapmaker U1</h3>
+          <ol>
+            <li>On the touchscreen enable <strong>Settings → Print Preferences → Auto Loading → Automatic Loading</strong>.</li>
+            <li>Keep the native filament runout sensor enabled for all four physical heads.</li>
+            <li>On Dashboard verify that every BMCU Channel is routed to the physical head connected by PTFE.</li>
+          </ol>
+        </section>
+
+        <section>
+          <h3>2. Install a slicer preset</h3>
+          <div class="notice warning compact"><span class="notice-icon">!</span><div><h3>Use the current generated preset</h3><p>Generate the preset from this panel and reslice before printing.</p></div></div>
+          <div class="profile-summary">
+            <div><span>BMCU modules</span><strong id="printerHelpProfileBmcuCount">1</strong></div>
+            <div><span>Extruders</span><strong id="printerHelpProfileToolCount">8</strong></div>
+            <div><span>Slots</span><strong id="printerHelpProfileTools">1 (T0)-8 (T7)</strong></div>
+          </div>
+          <div class="profile-download-options">
+            <div class="profile-download-option">
+              <h3>OrcaSlicer</h3>
+              <p>Recommended complete BMCU preset with printer, process and Snapmaker PLA settings.</p>
+              <button id="downloadOrcaProfileBundle" class="button primary profile-download-button" type="button">Download complete preset (.orca_printer)</button>
+              <button id="downloadOrcaProfileJson" class="button secondary profile-download-button" type="button">Printer preset only (.json)</button>
+              <ol class="import-steps">
+                <li>Open <strong>File → Import → Import Configs…</strong>.</li>
+                <li>Select the downloaded preset.</li>
+                <li>Select <strong>Snapmaker U1 BMCU</strong>.</li>
+              </ol>
+            </div>
+            <div class="profile-download-option">
+              <h3>Snapmaker Orca</h3>
+              <p>Complete BMCU preset for Snapmaker Orca with printer, process and Snapmaker PLA settings.</p>
+              <button id="downloadSnapmakerOrcaProfile" class="button primary profile-download-button" type="button">Download complete preset (.orca_printer)</button>
+              <ol class="import-steps">
+                <li>Open <strong>File → Import → Import Configs…</strong>.</li>
+                <li>Select the downloaded <strong>Snapmaker U1 BMCU.orca_printer</strong>.</li>
+                <li>Select <strong>Snapmaker U1 BMCU</strong>.</li>
+              </ol>
+            </div>
+          </div>
+          <div class="notice compact"><span class="notice-icon">i</span><div><h3>Generated for the current setup</h3><p id="printerHelpProfileNote">Generate the profile again after changing the number of BMCU modules.</p></div></div>
+          <div class="notice compact"><span class="notice-icon">i</span><div><h3>Filament metadata</h3><p>For every used BMCU slot the generated preset sends Orca's current material type and filament colour with the print plan. The plan is emitted before the first executable command of the normal U1 start sequence. BMCU applies metadata only after the complete plan passes validation and <code>BMCU_PRINT_COMMIT</code> succeeds, then sends one module-wide slot update to the BMCU. Native U1 Heads are not modified. A transient metadata-sync failure does not invalidate a committed print; it is retried before the first BMCU operation. Changing a filament in Orca does not contact the printer immediately - the values travel with the sliced G-code.</p></div></div>
+          <div class="notice compact"><span class="notice-icon">i</span><div><h3>Tool-change behavior</h3><p>The first required source is loaded before printing. <code>BMCU_PARK_HEAD</code> lets a different physical Head start parking while queued post-marker tip moves finish on the source Head. Temperature/fan commands stay bound to that source Head. Same-Head changes skip the unnecessary park/pick cycle.</p></div></div>
+        </section>
+
+        <section>
+          <h3>3. If you keep a custom U1 start/end program</h3>
+          <p>The generated preset is recommended. If you merge BMCU into your own U1 program, keep this order:</p>
+          <ol>
+            <li>Before the normal U1 start sequence opens tool loading, submit the complete source plan. For BMCU sources T4+ include the slicer's material and colour:</li>
+          </ol>
+          <pre class="code-block compact-code">BMCU_PRINT_BEGIN SCHEMA=1 RESET=1
+BMCU_PRINT_MAP TOOL=0
+...
+BMCU_PRINT_MAP TOOL=4 MATERIAL="{filament_type[4]}" COLOR="{filament_colour[4]}"
+BMCU_PRINT_COMMIT</pre>
+          <ol start="2">
+            <li>At each place where U1 normally auto-loads a physical Head, use <strong><code>BMCU_AUTO_FEED EXTRUDER=&lt;0..3&gt; INITIAL_TOOL={initial_extruder} REQUIRE_PLAN=1</code></strong>. BMCU delegates to stock loading or loads the mapped BMCU source.</li>
+            <li>Orca's filament-change G-code must call <strong><code>BMCU_TOOL_CHANGE TOOL=&lt;next T&gt;</code></strong>. Keep your ordinary travel/preheat around it.</li>
+            <li>Put <strong><code>BMCU_PRINT_END MODE=AUTO CLEAR=0</code></strong> immediately before the normal Snapmaker <strong><code>PRINT_END</code></strong>.</li>
+          </ol>
+          <p><strong><code>BMCU_PARK_HEAD</code></strong> belongs inside the tip-forming movement profile, not in Orca tool-change G-code.</p>
+        </section>
+
+        <section>
+          <h3>4. Do not patch an old preset</h3>
+          <div class="notice warning compact"><span class="notice-icon">!</span><div><h3>The generated sequence is one contract</h3><p>Do not copy only the internal profile marker into an older preset. Import the current JSON or bundle and reslice.</p></div></div>
+        </section>
+        </div>
+
+        <div id="printerHelpGeneric" class="hidden">
+          <section>
+            <h3>1. Printer and PTFE routing</h3>
+            <ol>
+              <li>Route every BMCU Channel that physically reaches the same Klipper extruder Endpoint. Channels sharing one toolhead need a real PTFE combiner.</li>
+              <li>Calibrate BMCU. In <strong>Generic toolhead integration</strong>, choose the real Klipper extruder and a real toolhead sensor when one exists.</li>
+              <li>Select the required <strong>Toolhead preparation macro</strong>. BMCU calls it only after SEND OUT reaches the toolhead boundary and the route is in <strong>Preparing / BEFORE_ON_USE</strong>. The macro owns the complete printer-side load: heating, extruder capture, movement to the melt zone/nozzle and any final seat or prime. It must return only when the filament is physically print-ready.</li>
+              <li>Select the required <strong>Before pullback macro</strong>. BMCU calls it while the route is in <strong>BEFORE_PULL_BACK</strong>. The macro owns the complete printer-side unload: heating, tip forming or cutting, hotend retraction and release from the extruder. It must return only when BMCU may safely start the long PTFE pullback.</li>
+              <li>Both macros receive <code>ENDPOINT</code>, <code>MATERIAL</code> and <code>REASON</code>. Generic BMCU never adds hidden extruder distances, temperatures, prime moves, tip-forming or cutter geometry around them.</li>
+              <li>Toolchanger Select/Verify/Deselect and extra route sensors are optional under <strong>Advanced</strong>. A normal single-extruder printer leaves them at None.</li>
+              <li>Without a toolhead filament sensor, BMCU pauses immediately when its input becomes empty. Insert replacement filament into the same Channel and use the printer's normal Resume; BMCU performs Load first and only then releases Resume.</li>
+            </ol>
+          </section>
+          <section>
+            <h3>2. OrcaSlicer tools</h3>
+            <p>Set Orca to <strong><span id="genericExtruderCount">1</span> extruders</strong>, enable <strong>Single Extruder Multi Material</strong> and leave <strong>Manual Filament Change</strong> off so Orca runs the custom Change filament G-code.</p>
+            <p><strong>T0 / Orca slot 1 is External</strong> - manual filament. BMCU sources use their persistent <strong>T1+</strong> assignments. Use only the slots shown below.</p>
+            <p>The start block shown below also sends <code>filament_type[]</code> and <code>filament_colour[]</code> for used BMCU slots. BMCU stages these values with the route and updates the Channel material/colour in the panel only after the complete plan commits successfully. T0 External is intentionally not synchronized. Changing a filament in Orca does not contact the printer immediately - the values travel with the sliced G-code.</p>
+            <div id="genericToolMap" class="info-list"></div>
+            <p>External is intentionally manual: BMCU does not ask for load/unload confirmation and does not pretend to know whether manual filament remains in the tube. <strong>Do not mix T0 External with BMCU T1+ in an unattended automatic multi-material print</strong> unless your own printer G-code explicitly handles the manual source transition.</p>
+          </section>
+          <section>
+            <h3>3. Machine start G-code</h3>
+            <p>Put the source plan at the very beginning of Machine start G-code, before your existing start macro, homing or any printer movement:</p>
+            <pre id="genericStartPlan" class="code-block compact-code"></pre>
+            <p>The first <strong><code>BMCU_TOOL_CHANGE</code></strong> must run <strong>after the hotend is ready to load and before the first purge/extrusion</strong>:</p>
+            <pre id="genericInitialTool" class="code-block compact-code"></pre>
+            <p>If your existing <strong><code>PRINT_START</code></strong> already performs a purge internally, put that BMCU tool selection inside <strong><code>PRINT_START</code></strong> immediately before its purge, or move the purge after the BMCU call. Do not load after a purge that already happened.</p>
+          </section>
+          <section>
+            <h3>4. Change filament G-code</h3>
+            <p>In Orca's Change filament G-code:</p>
+            <pre id="genericToolChange" class="code-block compact-code"></pre>
+            <p>BMCU enters BEFORE_PULL_BACK and waits for the printer's complete before-pullback macro, performs the long PTFE retract, sends the next source, then waits in Preparing for the printer's complete toolhead preparation macro before returning control to Orca.</p>
+          </section>
+          <section>
+            <h3>5. Machine end G-code</h3>
+            <p>Call BMCU before your printer's normal shutdown/end macro:</p>
+            <pre id="genericPrintEnd" class="code-block compact-code"></pre>
+          </section>
+        </div>
+        </div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Close</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="copyFallbackDialog" class="dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2>Copy text</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <p class="help-copy">This browser blocks direct clipboard access over HTTP. The text below is selected. Press <strong>Ctrl+C</strong> on Windows/Linux or <strong>Command+C</strong> on macOS.</p>
+      <textarea id="copyFallbackText" class="copy-fallback-text" readonly></textarea>
+      <div class="dialog-actions"><button id="selectCopyFallback" class="button secondary" type="button">Select all</button><button class="button primary" value="cancel" type="submit">Done</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="channelDialog" class="dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2 id="channelDialogTitle">Channel</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <div id="editDetectorNotice" class="notice compact"></div>
+      <div class="form-grid">
+        <label class="field full"><span>Label</span><input id="editName" maxlength="80" autocomplete="off" placeholder="e.g. Green PLA"></label>
+        <label class="field"><span>Material</span><input id="editMaterial" type="text" maxlength="40" autocomplete="off" spellcheck="false" placeholder="PLA, PETG, TPU..."></label>
+        <label class="field"><span>Colour</span><input id="editColor" type="color"></label>
+        <label class="field"><span>Refill group</span><input id="editRefillGroup" maxlength="64" placeholder="e.g. Green PLA"></label>
+        <label class="field"><span>Priority</span><input id="editRefillPriority" type="number" min="0" max="10000"></label>
+        <label id="editLogicalToolRow" class="field hidden"><span>Slot</span><select id="editLogicalTool"></select><small id="editLogicalToolHelp">Physical heads use 1 (T0)-4 (T3). BMCU uses 5 (T4)-32 (T31). Changing this requires updating the OrcaSlicer printer profile or Machine G-code.</small></label>
+        <label class="field full"><span>Retraction length</span><div class="length-pair"><div class="input-with-unit"><input id="editUnloadRetract" type="number" min="1" max="200" step="0.01" value="20" inputmode="decimal"><span>cm</span></div><div class="input-with-unit converted-length"><input id="editUnloadRetractInches" type="text" value="7.87" readonly tabindex="-1" aria-label="Retraction length in inches"><span>in</span></div></div><small>Distance pulled back after unloading.</small></label>
+        <label class="field full"><span>Autoload length</span><div class="length-pair"><div class="input-with-unit"><input id="editAutoload" type="number" min="1" max="100" step="0.01" value="12" inputmode="decimal"><span>cm</span></div><div class="input-with-unit converted-length"><input id="editAutoloadInches" type="text" value="4.72" readonly tabindex="-1" aria-label="Autoload length in inches"><span>in</span></div></div><small id="editAutoloadHelp">Initial feed after filament is detected. Default: 12 cm.</small></label>
+        <label class="switch-row full"><span><strong>Automatic refill</strong><small>Allow this source to replace another compatible source.</small></span><input id="editRefill" type="checkbox"></label>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="saveChannel" class="button primary" value="default" type="button">Save filament</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="calibrationSafetyDialog" class="dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2 id="calibrationSafetyTitle">Prepare channels for calibration</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <p class="dialog-copy">Completely remove filament from every selected connected channel. Calibration measures the empty buffer path only. The magnetic filament-movement sensor is verified automatically during autoload or a real load. The status below updates automatically.</p>
+      <div class="flash-safety-table-wrap">
+        <table class="flash-safety-table">
+          <thead><tr><th>Channel</th><th>Input detector</th><th>Route</th></tr></thead>
+          <tbody id="calibrationSafetyChannels"></tbody>
+        </table>
+      </div>
+      <p id="calibrationSafetyStatus" class="flash-safety-status warn">Waiting for live BMCU status.</p>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="calibrationSafetyContinue" class="button primary" value="default" type="button" disabled>Start calibration</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="flashSafetyDialog" class="dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><div><h2 id="flashSafetyTitle">Remove all filament before flashing</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
+      <p id="flashSafetyCopy" class="dialog-copy">Completely remove every filament from the BMCU, including filament still inside its input path. The status below updates automatically.</p>
+      <div id="flashSafetyTableWrap" class="flash-safety-table-wrap">
+        <table class="flash-safety-table">
+          <thead><tr><th>Channel</th><th>Input detector</th><th>Route</th></tr></thead>
+          <tbody id="flashSafetyChannels"></tbody>
+        </table>
+      </div>
+      <p id="flashSafetyStatus" class="flash-safety-status warn">Waiting for live BMCU status.</p>
+      <div id="flashConfirmations" class="flash-confirmations hidden">
+        <label id="flashTargetRiskRow" class="confirm-check"><input id="flashTargetRisk" type="checkbox"><span><strong>Correct flash target verified</strong><small>I verified that the selected BMCU or serial port is the intended physical device and understand that flashing the wrong target can erase or reprogram another controller.</small></span></label>
+        <label id="flashUnknownTargetRow" class="confirm-check hidden"><input id="flashUnknownTarget" type="checkbox"><span><strong>Unknown serial device physically identified</strong><small>I unplugged the intended adapter, refreshed and confirmed this exact port disappeared, then reconnected it, refreshed and confirmed the same port returned.</small></span></label>
+        <label id="flashEraseNvmRow" class="confirm-check hidden"><input id="flashEraseNvm" type="checkbox"><span><strong id="flashEraseNvmTitle">Clear calibration data</strong><small id="flashEraseNvmHelp">Optional. Leave unchecked to preserve the verified 4096-byte BMCU calibration area.</small></span></label>
+        <label id="flashReplaceNvmRow" class="confirm-check hidden"><input id="flashReplaceNvm" type="checkbox"><span><strong id="flashReplaceNvmTitle">Calibration data will be replaced</strong><small id="flashReplaceNvmHelp">A complete 65536-byte image contains its own final 4096-byte NVM area.</small></span></label>
+        <label id="flashTtlTargetRow" class="confirm-check hidden"><input id="flashTtlTarget" type="checkbox"><span><strong>TTL target and risk confirmed</strong><small>I verified that the selected port is connected to this exact BMCU and understand that selecting the wrong serial port can reprogram another device.</small></span></label>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" value="cancel" type="submit">Cancel</button><button id="flashSafetyContinue" class="button primary" value="default" type="button" disabled>Continue flashing</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="lightingColorDialog" class="dialog compact-dialog lighting-picker-dialog">
+    <div class="dialog-card">
+      <div class="dialog-head"><div><h2 id="lightingPickerTitle">Colour</h2><small>Live preview is shown on the BMCU while this picker is open.</small></div><button id="lightingPickerClose" class="icon-button" type="button" aria-label="Close">×</button></div>
+      <div class="lighting-picker-body">
+        <div id="lightingPickerSv" class="lighting-picker-sv" role="slider" aria-label="Saturation and brightness" tabindex="0"><i id="lightingPickerCursor"></i></div>
+        <label class="lighting-picker-hue"><span>Hue</span><input id="lightingPickerHue" type="range" min="0" max="360" step="1" value="0" aria-label="Hue"></label>
+        <div class="lighting-picker-meta"><i id="lightingPickerPreview" class="lighting-picker-preview"></i><label class="field"><span>HEX</span><input id="lightingPickerHex" class="lighting-picker-hex" type="text" maxlength="7" autocomplete="off" spellcheck="false" inputmode="text" aria-label="Colour HEX value"></label></div>
+      </div>
+      <div class="lighting-picker-actions">
+        <button id="lightingPickerBack" class="button secondary" type="button">Back</button>
+        <button id="lightingPickerDefault" class="button secondary" type="button">Default</button>
+        <span></span>
+        <button id="lightingPickerDone" class="button primary" type="button">Done</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="confirmDialog" class="dialog compact-dialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head"><h2 id="confirmTitle">Confirm</h2></div>
+      <div id="confirmVisual" class="confirm-visual hidden"></div>
+      <p id="confirmText" class="dialog-copy"></p>
+      <div class="dialog-actions"><button id="confirmCancel" class="button secondary" value="cancel" type="submit">Cancel</button><button id="confirmAction" class="button primary" value="default" type="button">Continue</button></div>
+    </form>
+  </dialog>
+
+  <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+</body>
+</html>

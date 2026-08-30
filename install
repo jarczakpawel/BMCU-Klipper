@@ -1,0 +1,57 @@
+#!/bin/sh
+set -eu
+umask 077
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
+HOME=/root
+LANG=C
+LC_ALL=C
+PYTHONDONTWRITEBYTECODE=1
+export PATH HOME LANG LC_ALL PYTHONDONTWRITEBYTECODE
+unset ENV BASH_ENV CDPATH
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONWARNINGS PYTHON_BIN
+unset LD_PRELOAD LD_LIBRARY_PATH
+unset http_proxy https_proxy all_proxy no_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
+unset TMPDIR TMP TEMP SSL_CERT_FILE SSL_CERT_DIR
+unset KLIPPER_DIR CONFIG_DIR PRINTER_CFG BMCU_PYTHON BMCU_USER
+unset BMCU_MOONRAKER_URL MOONRAKER_CONF
+unset BMCU_KLIPPER_SERVICE_BACKEND BMCU_KLIPPER_SERVICE_NAME
+
+BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+PYTHON=
+for candidate in /usr/bin/python3 /bin/python3; do
+  if [ -x "$candidate" ] && [ ! -L "$candidate" ]; then
+    PYTHON=$candidate
+    break
+  fi
+  if [ -x "$candidate" ]; then
+    PYTHON=$candidate
+    break
+  fi
+done
+if [ -z "$PYTHON" ]; then
+  echo "ERROR: Python 3.7 or newer is required." >&2
+  exit 1
+fi
+
+run_python() {
+  exec "$PYTHON" -I "$BASE/scripts/install.py" "$@"
+}
+
+if [ "$(id -u)" -eq 0 ]; then
+  run_python "$@"
+fi
+
+for privilege in /usr/bin/sudo /bin/sudo; do
+  if [ -x "$privilege" ]; then
+    exec "$privilege" -- "$PYTHON" -I "$BASE/scripts/install.py" "$@"
+  fi
+done
+for privilege in /usr/bin/doas /bin/doas; do
+  if [ -x "$privilege" ]; then
+    exec "$privilege" -- "$PYTHON" -I "$BASE/scripts/install.py" "$@"
+  fi
+done
+
+echo "ERROR: Run this command as root, or install sudo/doas." >&2
+exit 1

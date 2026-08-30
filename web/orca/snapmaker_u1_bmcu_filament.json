@@ -1,0 +1,70 @@
+{
+	"type": "filament",
+	"name": "Snapmaker PLA @U1 BMCU",
+	"inherits": "Snapmaker PLA @U1",
+	"from": "User",
+	"instantiation": "true",
+	"compatible_printers": [
+		"Snapmaker U1 BMCU"
+	],
+	"enable_pressure_advance": [
+		"0"
+	],
+	"hot_plate_temp": [
+		"55"
+	],
+	"hot_plate_temp_initial_layer": [
+		"55"
+	],
+	"filament_type": [
+		"PLA"
+	],
+	"filament_flow_ratio": [
+		"0.98"
+	],
+	"filament_max_volumetric_speed": [
+		"14"
+	],
+	"filament_minimal_purge_on_wipe_tower": [
+		"0"
+	],
+	"nozzle_temperature": [
+		"220"
+	],
+	"nozzle_temperature_initial_layer": [
+		"220"
+	],
+	"nozzle_temperature_range_low": [
+		"190"
+	],
+	"nozzle_temperature_range_high": [
+		"240"
+	],
+	"temperature_vitrification": [
+		"65"
+	],
+	"overhang_fan_threshold": [
+		"0%"
+	],
+	"close_fan_the_first_x_layers": [
+		"1"
+	],
+	"reduce_fan_stop_start_freq": [
+		"1"
+	],
+	"fan_cooling_layer_time": [
+		"100"
+	],
+	"fan_min_speed": [
+		"100"
+	],
+	"slow_down_min_speed": [
+		"15"
+	],
+	"additional_cooling_fan_speed": [
+		"70"
+	],
+	"filament_density": [
+		"1.24"
+	]
+}
