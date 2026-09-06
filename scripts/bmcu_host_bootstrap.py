@@ -19,8 +19,14 @@ import sys
 import tempfile
 import time
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_EXTRAS = os.path.join(_ROOT, 'klippy', 'extras')
+if _EXTRAS not in sys.path:
+    sys.path.insert(0, _EXTRAS)
+from bmcu_core.release import PACKAGE_VERSION
+
 PRODUCT = 'BMCU-Klipper'
-VERSION = '1.0.0'
+VERSION = PACKAGE_VERSION
 MODULES = ('bmcu.py', 'bmcu_core', 'bmcu_panel.py')
 MAX_JSON = 1024 * 1024
 MAX_CONFIG = 16 * 1024 * 1024

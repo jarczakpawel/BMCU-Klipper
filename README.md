@@ -54,10 +54,10 @@ sh ./install
 
 ## Uninstallation
 
-From the extracted package matching the installed version:
+From an extracted BMCU-Klipper package:
 
 ```sh
-./uninstall
+sh ./uninstall
 ```
 
 The uninstaller removes components managed by BMCU-Klipper and restores modified host components.

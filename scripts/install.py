@@ -25,7 +25,14 @@ import types
 
 sys.dont_write_bytecode = True
 
-PRODUCT_VERSION = '1.0.0'
+PRODUCT = 'BMCU-Klipper'
+PRODUCT_VERSION = None
+OWNERSHIP_MARKER = PRODUCT
+OWNER_RE = re.compile(
+    r'^%s(?: [0-9]+\.[0-9]+\.[0-9]+)?$' % re.escape(PRODUCT))
+MANAGED_HEADER_RE = re.compile(
+    (r'(?m)^# Managed by %s(?: [0-9]+\.[0-9]+\.[0-9]+)?(?:\.| -)' %
+     re.escape(PRODUCT)).encode('ascii'))
 BEGIN = '# BEGIN BMCU-KLIPPER AUTO-INCLUDE'
 END = '# END BMCU-KLIPPER AUTO-INCLUDE'
 INCLUDES = (
@@ -46,7 +53,9 @@ U1_RUNNER = '/oem/bmcu-klipper/run-host-bootstrap.py'
 U1_RUNNER_MARKER = '/oem/bmcu-klipper/.managed-by-bmcu'
 U1_SERIAL_RULE_DIR = '/etc/udev/rules.d'
 U1_SERIAL_RULE = '/etc/udev/rules.d/99-bmcu-klipper.rules'
-U1_SERIAL_RULE_MARKER = '# Managed by BMCU-Klipper 1.0.0 - Snapmaker U1 CH340 access'
+U1_SERIAL_RULE_LABEL = 'Snapmaker U1 CH340 access'
+U1_SERIAL_RULE_MARKER = '# Managed by %s - %s' % (
+    OWNERSHIP_MARKER, U1_SERIAL_RULE_LABEL)
 U1_SERIAL_VENDOR = '1a86'
 U1_SERIAL_PRODUCTS = ('5523', '7522', '7523', '7584', '55d4')
 U1_SERVICE_BEGIN = '# BEGIN BMCU-KLIPPER SERVICE-HOOKS'
@@ -155,6 +164,34 @@ def snapshot_bytes(snapshot, relative):
         return snapshot[key]
     except KeyError:
         raise InstallError('package file is missing: %s' % key)
+
+def release_versions_from_snapshot(snapshot):
+    data = snapshot_bytes(snapshot, 'version')
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise InstallError('version file is not valid UTF-8')
+    result = {}
+    pattern = r'(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})'
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            key, value = line.split('=', 1)
+        elif ':' in line:
+            key, value = line.split(':', 1)
+        else:
+            continue
+        key, value = key.strip().lower(), value.strip().lower()
+        if key not in ('package', 'firmware'):
+            continue
+        if not re.fullmatch(pattern, value):
+            raise InstallError('invalid %s version' % key)
+        result[key] = value
+    if 'package' not in result or 'firmware' not in result:
+        raise InstallError('version file is incomplete')
+    return result
 
 def write_snapshot_file(snapshot, relative, destination, mode):
     data = snapshot_bytes(snapshot, relative)
@@ -602,7 +639,7 @@ def run_as_user(cmd, user, uid, gid, check=False, env=None, timeout=120):
 
 def query_json(url, timeout=3.0):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    request = urllib.request.Request(url, headers={'User-Agent': 'BMCU-Installer/1.0.0'})
+    request = urllib.request.Request(url, headers={'User-Agent': 'BMCU-Installer/%s' % PRODUCT_VERSION})
     with opener.open(request, timeout=timeout) as response:
         raw = response.read(1024 * 1024 + 1)
     if len(raw) > 1024 * 1024:
@@ -1663,6 +1700,22 @@ def ensure_root_directory(path, mode=0o755):
 def shell_quote(value):
     return "'" + str(value).replace("'", "'\\''") + "'"
 
+def ownership_value_matches(value):
+    return OWNER_RE.fullmatch(str(value or '')) is not None
+
+def ownership_marker_matches(data):
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    return ownership_value_matches(
+        bytes(data).decode('utf-8', 'replace').strip())
+
+def u1_serial_rule_marker_matches(first_line):
+    prefix = '# Managed by '
+    suffix = ' - ' + U1_SERIAL_RULE_LABEL
+    if not first_line.startswith(prefix) or not first_line.endswith(suffix):
+        return False
+    return ownership_value_matches(first_line[len(prefix):-len(suffix)])
+
 def u1_serial_rule_bytes(target_group):
     group = str(target_group or '').strip()
     if not re.match(r'^[A-Za-z_][A-Za-z0-9_.-]*$', group):
@@ -1680,7 +1733,8 @@ def managed_u1_serial_rule(data):
         text = bytes(data).decode('utf-8')
     except UnicodeDecodeError:
         return False
-    return (text.startswith(U1_SERIAL_RULE_MARKER + '\n') and
+    first_line = text.splitlines()[0] if text.splitlines() else ''
+    return (u1_serial_rule_marker_matches(first_line) and
             'MODE="0660"' in text and
             (('KERNEL=="ttyUSB*"' in text and 'KERNEL=="ttyCH343USB*"' in text) or
              ('ATTRS{idVendor}=="%s"' % U1_SERIAL_VENDOR in text and
@@ -1722,7 +1776,7 @@ def u1_runner_bytes(target_user, uid, gid, target_python, metadata_path):
     groups = supplementary_groups(target_user, gid)
     home = pwd.getpwnam(target_user).pw_dir
     text = """#!/usr/bin/python3
-# Managed by BMCU-Klipper 1.0.0. Generated root-owned privilege dropper.
+# Managed by BMCU-Klipper. Generated root-owned privilege dropper.
 import glob
 import os
 import stat
@@ -1805,7 +1859,7 @@ os.execve(
 def u1_inline_block(system_python, runner_path, newline='\n'):
     lines = [
         U1_SERVICE_BEGIN,
-        '# Managed by BMCU-Klipper 1.0.0 - called only at each actual Klipper launch.',
+        '# Managed by BMCU-Klipper - called only at each actual Klipper launch.',
         '# The call sites are injected immediately before start-stop-daemon -S,',
         '# after Snapmaker has powered and re-enumerated the U1 USB hardware.',
         'bmcu_prepare_klipper_start()',
@@ -1828,7 +1882,7 @@ def managed_boot_hook(path):
         data, _info = read_regular(path)
     except (OSError, InstallError):
         return False
-    return b'Managed by BMCU-Klipper 1.0.0' in data[:1024]
+    return MANAGED_HEADER_RE.search(data[:1024]) is not None
 
 def systemd_unit_name(service):
     name = str((service or {}).get('name') or 'klipper')
@@ -1847,7 +1901,7 @@ def systemd_quote(value):
 
 def systemd_hook_bytes(target_python, metadata_path):
     script = os.path.join(os.path.dirname(metadata_path), 'scripts', 'bmcu_host_bootstrap.py')
-    text = """# Managed by BMCU-Klipper 1.0.0 - repair persistent Klipper modules before Klipper starts.
+    text = """# Managed by BMCU-Klipper - repair persistent Klipper modules before Klipper starts.
 [Service]
 ExecStartPre=%s -I %s --repair --metadata %s --quiet
 """ % (
@@ -1981,8 +2035,7 @@ def _managed_u1_runner_dir():
         return False
     if (marker_info.st_uid != 0 or marker_info.st_gid != 0 or
             stat.S_IMODE(marker_info.st_mode) != 0o600 or
-            marker_data.decode('utf-8', 'replace').strip() !=
-            'BMCU-Klipper 1.0.0'):
+            not ownership_marker_matches(marker_data)):
         return False
     if os.path.lexists(U1_RUNNER):
         try:
@@ -2097,7 +2150,7 @@ def install_boot_repair(platform_id, service, target_user, uid, gid,
             'runner_marker_previous_info': runner_marker_previous_info,
             'runner_marker_previous_xattrs': runner_marker_previous_xattrs,
             'runner_installed': runner_data,
-            'runner_marker_installed': b'BMCU-Klipper 1.0.0\n',
+            'runner_marker_installed': (OWNERSHIP_MARKER + '\n').encode('utf-8'),
             'serial_rule_supported': serial_rule_supported,
             'serial_rule_previous': serial_rule_previous,
             'serial_rule_previous_info': serial_rule_previous_info,
@@ -2154,7 +2207,7 @@ def install_boot_repair(platform_id, service, target_user, uid, gid,
                 record['runner_dir_created'] = True
             os.chown(U1_RUNNER_DIR, 0, 0)
             os.chmod(U1_RUNNER_DIR, 0o700)
-            marker_data = b'BMCU-Klipper 1.0.0\n'
+            marker_data = (OWNERSHIP_MARKER + '\n').encode('utf-8')
             if runner_marker_previous is None:
                 write_new_atomic(U1_RUNNER_MARKER, marker_data, 0o600)
             else:
@@ -2496,7 +2549,7 @@ def populate_runtime(snapshot, runtime, installation):
     write_snapshot_file(snapshot, 'version', os.path.join(runtime, 'version'), 0o640)
     write_new_atomic(
         os.path.join(runtime, '.managed-by-bmcu'),
-        b'BMCU-Klipper\n', 0o640)
+        (OWNERSHIP_MARKER + '\n').encode('utf-8'), 0o640)
     metadata = (json.dumps(
         installation, indent=2, sort_keys=True) + '\n').encode('utf-8')
     write_new_atomic(
@@ -2595,8 +2648,7 @@ def load_managed_metadata(bmcu_dir):
             'existing BMCU directory is not a managed BMCU-Klipper installation')
     marker = os.path.join(bmcu_dir, 'runtime', '.managed-by-bmcu')
     marker_data, _marker_info = read_regular(marker)
-    marker_value = marker_data.decode('utf-8', 'replace').strip()
-    if marker_value != 'BMCU-Klipper' and not marker_value.startswith('BMCU-Klipper '):
+    if not ownership_marker_matches(marker_data):
         raise InstallError(
             'existing BMCU installation has no valid ownership marker')
     return value
@@ -2744,7 +2796,7 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
         installation = dict(metadata)
         boot_hook_path, boot_hook_type = planned_boot_hook(plan['platform_id'], service)
         installation.update(
-            product='BMCU-Klipper', version=PRODUCT_VERSION, schema=1,
+            product=PRODUCT, version=PRODUCT_VERSION, schema=1,
             klipper_dir=plan['klipper_dir'], config_dir=plan['config_dir'],
             printer_cfg=printer_cfg, user=target_user, group=target_group,
             python=os.path.realpath(target_python),
@@ -2870,7 +2922,7 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
         shutil.rmtree(old_runtime)
         assert_directory_identity(stage, stage_identity)
         shutil.rmtree(stage)
-        print('\nBMCU-Klipper 1.0.0 host installation is ready and persistent.')
+        print('\nBMCU-Klipper %s host installation is ready and persistent.' % PRODUCT_VERSION)
         if panel_enabled:
             print('Panel URL: %s' % panel_url(panel_port))
             ip_url = panel_ip_url(panel_port)
@@ -2984,7 +3036,7 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
         raise InstallError(message)
 
 def parser():
-    p = argparse.ArgumentParser(prog='BMCU-Klipper-1.0.0 installer')
+    p = argparse.ArgumentParser(prog='BMCU-Klipper installer')
     p.add_argument('--klipper-dir', default='')
     p.add_argument('--config-dir', default='')
     p.add_argument('--printer-cfg', default='')
@@ -3015,6 +3067,8 @@ def main():
 
     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     snapshot = load_release_snapshot(package)
+    global PRODUCT_VERSION
+    PRODUCT_VERSION = release_versions_from_snapshot(snapshot)['package']
     platform = load_package_module('bmcu_platform', snapshot, package)
     print('Package integrity: %d files verified' % (len(snapshot) - 1))
 
@@ -3047,7 +3101,7 @@ def main():
     gid = grp.getgrnam(target_group).gr_gid
     validate_root_run_installation(plan, target_python, uid)
 
-    print('\n=== BMCU-Klipper 1.0.0 installation ===')
+    print('\n=== BMCU-Klipper %s installation ===' % PRODUCT_VERSION)
     print('Platform:       %s' % plan['platform_id'])
     print('Klipper:        %s' % klipper_dir)
     print('Configuration:  %s' % printer_cfg)
@@ -3111,7 +3165,7 @@ def main():
         panel_token = os.urandom(32).hex()
         boot_hook_path, boot_hook_type = planned_boot_hook(plan['platform_id'], service)
         installation = dict(
-            product='BMCU-Klipper', version=PRODUCT_VERSION, schema=1,
+            product=PRODUCT, version=PRODUCT_VERSION, schema=1,
             klipper_dir=klipper_dir, config_dir=config_dir,
             printer_cfg=printer_cfg, user=target_user, group=target_group,
             python=os.path.realpath(target_python),
@@ -3342,7 +3396,7 @@ def main():
                 '; '.join(rollback_errors))
         raise InstallError(message)
 
-    print('\nInstallation complete: BMCU-Klipper 1.0.0')
+    print('\nInstallation complete: BMCU-Klipper %s' % PRODUCT_VERSION)
     print('Configuration: %s' % bmcu_dir)
     if not args.no_panel:
         print('Panel URL: %s' % panel_url(args.panel_port))

@@ -16,6 +16,7 @@ from collections import deque
 from contextlib import contextmanager
 
 from . import compat, protocol, presets
+from .release import PACKAGE_VERSION
 from .device import BMCUDevice
 from .endpoints import (create_endpoint, normalize_u1_material_name,
                         u1_tip_profile_defaults,
@@ -219,8 +220,8 @@ class BMCUManager(object):
         except (IOError, OSError, IndexError):
             pass
         logging.info(
-            'BMCU-Klipper 1.0.0 package build %s',
-            self.package_build_id)
+            'BMCU-Klipper %s package build %s',
+            PACKAGE_VERSION, self.package_build_id)
 
         self.devices = []
         self.devices_by_name = {}
@@ -382,7 +383,7 @@ class BMCUManager(object):
         self._u1_background_poll_interval = 0.500
         self._background_idle_margin = 0.050
         self._critical_status_fallback = {
-            'package_version': '1.0.0',
+            'package_version': PACKAGE_VERSION,
             'package_build_id': self.package_build_id,
             'controller_mode': self.controller_mode,
             'debug': bool(self.debug_enabled),
@@ -3223,7 +3224,7 @@ class BMCUManager(object):
             })
         return {
             'schema_version': PRINT_PLAN_SCHEMA,
-            'package_version': '1.0.0',
+            'package_version': PACKAGE_VERSION,
             'package_build_id': self.package_build_id,
             'systems': systems,
             'print_job_id': self.print_job_id,
@@ -3559,7 +3560,7 @@ class BMCUManager(object):
                 mapping['endpoint'] = self._channel_endpoint_name(device, channel)
                 stable_tools[str(tool)] = mapping
         result = {
-            'package_version': '1.0.0',
+            'package_version': PACKAGE_VERSION,
             'package_build_id': self.package_build_id,
             'controller_mode': self.controller_mode,
             'debug': bool(self.debug_enabled),

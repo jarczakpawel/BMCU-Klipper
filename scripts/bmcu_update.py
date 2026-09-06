@@ -25,8 +25,15 @@ from pathlib import Path
 _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
+_ROOT = str(Path(__file__).resolve().parents[1])
+_EXTRAS = str(Path(_ROOT) / 'klippy' / 'extras')
+if _EXTRAS not in sys.path:
+    sys.path.insert(0, _EXTRAS)
 
+from bmcu_core.release import PACKAGE_VERSION
 from bmcu_isp import FLASH_SIZE, flash_image
+
+USER_AGENT = 'BMCU-Klipper-Updater/%s' % PACKAGE_VERSION
 
 APP_SIZE = 60 * 1024
 MAX_RAW_FIRMWARE = FLASH_SIZE
@@ -192,7 +199,7 @@ def _validate_final_scheme(initial_url, final_url, label):
 
 def _http_bytes(url, maximum, timeout, label):
     request = urllib.request.Request(
-        url, headers={'User-Agent': 'BMCU-Klipper-Updater/1.0.0'})
+        url, headers={'User-Agent': USER_AGENT})
     try:
         response = urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
@@ -333,7 +340,7 @@ def moonraker_gcode(moonraker, script, timeout=20):
         url, data=data, headers={
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'User-Agent': 'BMCU-Klipper-Updater/1.0.0',
+            'User-Agent': USER_AGENT,
         }, method='POST')
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -435,7 +442,7 @@ def raw_flash_guard_release(args, devices):
 
 def printer_is_idle(moonraker, timeout=5):
     url = moonraker.rstrip('/') + '/printer/objects/query?print_stats'
-    request = urllib.request.Request(url, headers={'User-Agent': 'BMCU-Klipper-Updater/1.0.0'})
+    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read(MAX_MOONRAKER_RESPONSE + 1)
     if len(raw) > MAX_MOONRAKER_RESPONSE:
@@ -513,7 +520,7 @@ def moonraker_bmcu_status(moonraker, timeout=5):
     url = moonraker.rstrip('/') + '/printer/objects/query?bmcu'
     request = urllib.request.Request(url, headers={
         'Accept': 'application/json',
-        'User-Agent': 'BMCU-Klipper-Updater/1.0.0',
+        'User-Agent': USER_AGENT,
     })
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read(MAX_MOONRAKER_RESPONSE + 1)

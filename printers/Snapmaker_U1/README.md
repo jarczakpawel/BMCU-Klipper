@@ -340,10 +340,10 @@ After every Snapmaker firmware update:
 
 ## Uninstallation
 
-Connect to U1 over SSH, enter the extracted BMCU-Klipper directory matching the installed version and run:
+Connect to U1 over SSH, enter the extracted BMCU-Klipper directory and run:
 
 ```sh
-./uninstall
+sh ./uninstall
 ```
 
 The uninstaller removes managed BMCU components from `printer.cfg`, Klipper modules, runtime, serial-port access and the U1 hook.

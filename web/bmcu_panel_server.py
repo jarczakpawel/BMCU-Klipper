@@ -44,10 +44,15 @@ HTTP_CONNECTION_TIMEOUT = 15.0
 MAX_PANEL_GCODE = 40 * 1024
 MAX_ORCA_TEMPLATE_BYTES = 512 * 1024
 DIAGNOSTICS_EXPORT_TIMEOUT = 180.0
-PACKAGE_VERSION = '1.0.0'
-REQUIRED_FIRMWARE_VERSION = '1.0.0'
 REMOTE_VERSION_URL = 'https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/version'
 MAX_VERSION_BYTES = 4096
+_RUNTIME_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+_EXTRAS = os.path.join(_RUNTIME_ROOT, 'klippy', 'extras')
+if _EXTRAS not in sys.path:
+    sys.path.insert(0, _EXTRAS)
+from bmcu_core.release import (
+    PACKAGE_VERSION, REQUIRED_FIRMWARE_TEXT, parse_release_versions)
+REQUIRED_FIRMWARE_VERSION = REQUIRED_FIRMWARE_TEXT
 ALLOWED_PANEL_COMMANDS = {
     'BMCU_APPLY_PRESET',
     'BMCU_CALIBRATE',
@@ -89,51 +94,14 @@ NO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirect())
 def _reject_json_constant(value):
     raise ValueError('non-standard JSON number: %s' % value)
 
-def _parse_release_versions(text):
-    result = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith('#'):
-            continue
-        if '=' in line:
-            key, value = line.split('=', 1)
-        elif ':' in line:
-            key, value = line.split(':', 1)
-        else:
-            continue
-        key, value = key.strip().lower(), value.strip()
-        if key not in ('package', 'firmware'):
-            continue
-        parts = value.split('.')
-        if len(parts) != 3 or any(not part.isdigit() for part in parts):
-            raise ValueError('invalid %s version' % key)
-        result[key] = value
-    if 'package' not in result or 'firmware' not in result:
-        raise ValueError('remote version file is incomplete')
-    return result
-
-def _local_release_versions():
-    path = pathlib.Path(__file__).resolve().parent.parent / 'version'
-    data = path.read_bytes()
-    if len(data) > MAX_VERSION_BYTES:
-        raise ValueError('local version file is too large')
-    return _parse_release_versions(data.decode('utf-8'))
-
-try:
-    _LOCAL_VERSIONS = _local_release_versions()
-    PACKAGE_VERSION = _LOCAL_VERSIONS['package']
-    REQUIRED_FIRMWARE_VERSION = _LOCAL_VERSIONS['firmware']
-except Exception:
-    pass
-
 def _remote_release_versions():
     request = urllib.request.Request(
-        REMOTE_VERSION_URL, headers={'User-Agent': 'BMCU-Klipper/1.0.0'})
+        REMOTE_VERSION_URL, headers={'User-Agent': 'BMCU-Klipper/%s' % PACKAGE_VERSION})
     with urllib.request.urlopen(request, timeout=6) as response:
         data = response.read(MAX_VERSION_BYTES + 1)
     if len(data) > MAX_VERSION_BYTES:
         raise ValueError('remote version file is too large')
-    return _parse_release_versions(data.decode('utf-8'))
+    return parse_release_versions(data.decode('utf-8'))
 
 def validate_moonraker_url(value):
     raw = str(value or '')
@@ -1399,7 +1367,7 @@ class UpdateJobs:
                 self._safe_remove_upload(firmware_path, upload_info or {})
 
 class PanelHandler(http.server.SimpleHTTPRequestHandler):
-    server_version = 'BMCUPanel/1.0.0'
+    server_version = 'BMCUPanel/%s' % PACKAGE_VERSION
     moonraker = 'http://127.0.0.1:7125'
     jobs = None
     package_build_id = 'unpackaged'

@@ -3,9 +3,9 @@ import binascii
 import math
 import struct
 
+from .release import REQUIRED_FIRMWARE, REQUIRED_FIRMWARE_TEXT
+
 PROTO_VERSION = 1
-REQUIRED_FIRMWARE = (1, 0, 0)
-REQUIRED_FIRMWARE_TEXT = '1.0.0'
 
 MSG_HELLO = 0x01
 MSG_PING = 0x02
