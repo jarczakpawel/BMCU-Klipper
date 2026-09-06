@@ -853,7 +853,7 @@ def query_printer_idle(url: str, timeout: float = 3.0) -> tuple[bool, str]:
     except (TypeError, ValueError, RuntimeError) as exc:
         return False, "Moonraker query blocked: %s" % exc
     endpoint = base + "/printer/objects/query?print_stats"
-    request = urllib.request.Request(endpoint, headers={"User-Agent": "BMCU-Installer/1.0.0"})
+    request = urllib.request.Request(endpoint, headers={"User-Agent": "BMCU-Installer"})
     try:
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

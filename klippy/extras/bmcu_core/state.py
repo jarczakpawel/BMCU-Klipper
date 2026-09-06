@@ -842,7 +842,7 @@ class StateStore(object):
             if (loaded.get('schema') != STATE_SCHEMA or
                     loaded.get('version') != STATE_VERSION):
                 logging.warning(
-                    'BMCU state is not the final 1.0.0 format; fresh defaults are used')
+                    'BMCU state format is unsupported; fresh defaults are used')
                 return
 
             base = default_state()

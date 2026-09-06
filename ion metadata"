@@ -1,0 +1,850 @@
+[1mdiff --git a/README.md b/README.md[m
+[1mindex 8408836..072711e 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -54,10 +54,10 @@[m [msh ./install[m
+ [m
+ ## Uninstallation[m
+ [m
+[31m-From the extracted package matching the installed version:[m
+[32m+[m[32mFrom an extracted BMCU-Klipper package:[m
+ [m
+ ```sh[m
+[31m-./uninstall[m
+[32m+[m[32msh ./uninstall[m
+ ```[m
+ [m
+ The uninstaller removes components managed by BMCU-Klipper and restores modified host components.[m
+[1mdiff --git a/klippy/extras/bmcu_core/manager.py b/klippy/extras/bmcu_core/manager.py[m
+[1mindex f2b6bd1..86806e8 100644[m
+[1m--- a/klippy/extras/bmcu_core/manager.py[m
+[1m+++ b/klippy/extras/bmcu_core/manager.py[m
+[36m@@ -16,6 +16,7 @@[m [mfrom collections import deque[m
+ from contextlib import contextmanager[m
+ [m
+ from . import compat, protocol, presets[m
+[32m+[m[32mfrom .release import PACKAGE_VERSION[m
+ from .device import BMCUDevice[m
+ from .endpoints import (create_endpoint, normalize_u1_material_name,[m
+                         u1_tip_profile_defaults,[m
+[36m@@ -219,8 +220,8 @@[m [mclass BMCUManager(object):[m
+         except (IOError, OSError, IndexError):[m
+             pass[m
+         logging.info([m
+[31m-            'BMCU-Klipper 1.0.0 package build %s',[m
+[31m-            self.package_build_id)[m
+[32m+[m[32m            'BMCU-Klipper %s package build %s',[m
+[32m+[m[32m            PACKAGE_VERSION, self.package_build_id)[m
+ [m
+         self.devices = [][m
+         self.devices_by_name = {}[m
+[36m@@ -382,7 +383,7 @@[m [mclass BMCUManager(object):[m
+         self._u1_background_poll_interval = 0.500[m
+         self._background_idle_margin = 0.050[m
+         self._critical_status_fallback = {[m
+[31m-            'package_version': '1.0.0',[m
+[32m+[m[32m            'package_version': PACKAGE_VERSION,[m
+             'package_build_id': self.package_build_id,[m
+             'controller_mode': self.controller_mode,[m
+             'debug': bool(self.debug_enabled),[m
+[36m@@ -3223,7 +3224,7 @@[m [mclass BMCUManager(object):[m
+             })[m
+         return {[m
+             'schema_version': PRINT_PLAN_SCHEMA,[m
+[31m-            'package_version': '1.0.0',[m
+[32m+[m[32m            'package_version': PACKAGE_VERSION,[m
+             'package_build_id': self.package_build_id,[m
+             'systems': systems,[m
+             'print_job_id': self.print_job_id,[m
+[36m@@ -3559,7 +3560,7 @@[m [mclass BMCUManager(object):[m
+                 mapping['endpoint'] = self._channel_endpoint_name(device, channel)[m
+                 stable_tools[str(tool)] = mapping[m
+         result = {[m
+[31m-            'package_version': '1.0.0',[m
+[32m+[m[32m            'package_version': PACKAGE_VERSION,[m
+             'package_build_id': self.package_build_id,[m
+             'controller_mode': self.controller_mode,[m
+             'debug': bool(self.debug_enabled),[m
+[1mdiff --git a/klippy/extras/bmcu_core/protocol.py b/klippy/extras/bmcu_core/protocol.py[m
+[1mindex da6c1b8..cef59fa 100644[m
+[1m--- a/klippy/extras/bmcu_core/protocol.py[m
+[1m+++ b/klippy/extras/bmcu_core/protocol.py[m
+[36m@@ -3,9 +3,9 @@[m [mimport binascii[m
+ import math[m
+ import struct[m
+ [m
+[32m+[m[32mfrom .release import REQUIRED_FIRMWARE, REQUIRED_FIRMWARE_TEXT[m
+[32m+[m
+ PROTO_VERSION = 1[m
+[31m-REQUIRED_FIRMWARE = (1, 0, 0)[m
+[31m-REQUIRED_FIRMWARE_TEXT = '1.0.0'[m
+ [m
+ MSG_HELLO = 0x01[m
+ MSG_PING = 0x02[m
+[1mdiff --git a/klippy/extras/bmcu_core/state.py b/klippy/extras/bmcu_core/state.py[m
+[1mindex 085bcab..d38ad8f 100644[m
+[1m--- a/klippy/extras/bmcu_core/state.py[m
+[1m+++ b/klippy/extras/bmcu_core/state.py[m
+[36m@@ -842,7 +842,7 @@[m [mclass StateStore(object):[m
+             if (loaded.get('schema') != STATE_SCHEMA or[m
+                     loaded.get('version') != STATE_VERSION):[m
+                 logging.warning([m
+[31m-                    'BMCU state is not the final 1.0.0 format; fresh defaults are used')[m
+[32m+[m[32m                    'BMCU state format is unsupported; fresh defaults are used')[m
+                 return[m
+ [m
+             base = default_state()[m
+[1mdiff --git a/printers/Snapmaker_U1/README.md b/printers/Snapmaker_U1/README.md[m
+[1mindex e96a6ff..08b4926 100644[m
+[1m--- a/printers/Snapmaker_U1/README.md[m
+[1m+++ b/printers/Snapmaker_U1/README.md[m
+[36m@@ -340,10 +340,10 @@[m [mAfter every Snapmaker firmware update:[m
+ [m
+ ## Uninstallation[m
+ [m
+[31m-Connect to U1 over SSH, enter the extracted BMCU-Klipper directory matching the installed version and run:[m
+[32m+[m[32mConnect to U1 over SSH, enter the extracted BMCU-Klipper directory and run:[m
+ [m
+ ```sh[m
+[31m-./uninstall[m
+[32m+[m[32msh ./uninstall[m
+ ```[m
+ [m
+ The uninstaller removes managed BMCU components from `printer.cfg`, Klipper modules, runtime, serial-port access and the U1 hook.[m
+[1mdiff --git a/scripts/bmcu_host_bootstrap.py b/scripts/bmcu_host_bootstrap.py[m
+[1mindex 01dabd7..de7fc9d 100644[m
+[1m--- a/scripts/bmcu_host_bootstrap.py[m
+[1m+++ b/scripts/bmcu_host_bootstrap.py[m
+[36m@@ -19,8 +19,14 @@[m [mimport sys[m
+ import tempfile[m
+ import time[m
+ [m
+[32m+[m[32m_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))[m
+[32m+[m[32m_EXTRAS = os.path.join(_ROOT, 'klippy', 'extras')[m
+[32m+[m[32mif _EXTRAS not in sys.path:[m
+[32m+[m[32m    sys.path.insert(0, _EXTRAS)[m
+[32m+[m[32mfrom bmcu_core.release import PACKAGE_VERSION[m
+[32m+[m
+ PRODUCT = 'BMCU-Klipper'[m
+[31m-VERSION = '1.0.0'[m
+[32m+[m[32mVERSION = PACKAGE_VERSION[m
+ MODULES = ('bmcu.py', 'bmcu_core', 'bmcu_panel.py')[m
+ MAX_JSON = 1024 * 1024[m
+ MAX_CONFIG = 16 * 1024 * 1024[m
+[1mdiff --git a/scripts/bmcu_platform.py b/scripts/bmcu_platform.py[m
+[1mindex d0c9a8d..b55c8f0 100644[m
+[1m--- a/scripts/bmcu_platform.py[m
+[1m+++ b/scripts/bmcu_platform.py[m
+[36m@@ -853,7 +853,7 @@[m [mdef query_printer_idle(url: str, timeout: float = 3.0) -> tuple[bool, str]:[m
+     except (TypeError, ValueError, RuntimeError) as exc:[m
+         return False, "Moonraker query blocked: %s" % exc[m
+     endpoint = base + "/printer/objects/query?print_stats"[m
+[31m-    request = urllib.request.Request(endpoint, headers={"User-Agent": "BMCU-Installer/1.0.0"})[m
+[32m+[m[32m    request = urllib.request.Request(endpoint, headers={"User-Agent": "BMCU-Installer"})[m
+     try:[m
+ [m
+         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))[m
+[1mdiff --git a/scripts/bmcu_update.py b/scripts/bmcu_update.py[m
+[1mindex 1c494a3..193679a 100644[m
+[1m--- a/scripts/bmcu_update.py[m
+[1m+++ b/scripts/bmcu_update.py[m
+[36m@@ -25,9 +25,16 @@[m [mfrom pathlib import Path[m
+ _SCRIPT_DIR = str(Path(__file__).resolve().parent)[m
+ if _SCRIPT_DIR not in sys.path:[m
+     sys.path.insert(0, _SCRIPT_DIR)[m
+[32m+[m[32m_ROOT = str(Path(__file__).resolve().parents[1])[m
+[32m+[m[32m_EXTRAS = str(Path(_ROOT) / 'klippy' / 'extras')[m
+[32m+[m[32mif _EXTRAS not in sys.path:[m
+[32m+[m[32m    sys.path.insert(0, _EXTRAS)[m
+ [m
+[32m+[m[32mfrom bmcu_core.release import PACKAGE_VERSION[m
+ from bmcu_isp import FLASH_SIZE, flash_image[m
+ [m
+[32m+[m[32mUSER_AGENT = 'BMCU-Klipper-Updater/%s' % PACKAGE_VERSION[m
+[32m+[m
+ APP_SIZE = 60 * 1024[m
+ MAX_RAW_FIRMWARE = FLASH_SIZE[m
+ NVM_SIZE = 4 * 1024[m
+[36m@@ -192,7 +199,7 @@[m [mdef _validate_final_scheme(initial_url, final_url, label):[m
+ [m
+ def _http_bytes(url, maximum, timeout, label):[m
+     request = urllib.request.Request([m
+[31m-        url, headers={'User-Agent': 'BMCU-Klipper-Updater/1.0.0'})[m
+[32m+[m[32m        url, headers={'User-Agent': USER_AGENT})[m
+     try:[m
+         response = urllib.request.urlopen(request, timeout=timeout)[m
+     except urllib.error.HTTPError as exc:[m
+[36m@@ -333,7 +340,7 @@[m [mdef moonraker_gcode(moonraker, script, timeout=20):[m
+         url, data=data, headers={[m
+             'Content-Type': 'application/json',[m
+             'Accept': 'application/json',[m
+[31m-            'User-Agent': 'BMCU-Klipper-Updater/1.0.0',[m
+[32m+[m[32m            'User-Agent': USER_AGENT,[m
+         }, method='POST')[m
+     try:[m
+         with urllib.request.urlopen(request, timeout=timeout) as response:[m
+[36m@@ -435,7 +442,7 @@[m [mdef raw_flash_guard_release(args, devices):[m
+ [m
+ def printer_is_idle(moonraker, timeout=5):[m
+     url = moonraker.rstrip('/') + '/printer/objects/query?print_stats'[m
+[31m-    request = urllib.request.Request(url, headers={'User-Agent': 'BMCU-Klipper-Updater/1.0.0'})[m
+[32m+[m[32m    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})[m
+     with urllib.request.urlopen(request, timeout=timeout) as response:[m
+         raw = response.read(MAX_MOONRAKER_RESPONSE + 1)[m
+     if len(raw) > MAX_MOONRAKER_RESPONSE:[m
+[36m@@ -513,7 +520,7 @@[m [mdef moonraker_bmcu_status(moonraker, timeout=5):[m
+     url = moonraker.rstrip('/') + '/printer/objects/query?bmcu'[m
+     request = urllib.request.Request(url, headers={[m
+         'Accept': 'application/json',[m
+[31m-        'User-Agent': 'BMCU-Klipper-Updater/1.0.0',[m
+[32m+[m[32m        'User-Agent': USER_AGENT,[m
+     })[m
+     with urllib.request.urlopen(request, timeout=timeout) as response:[m
+         raw = response.read(MAX_MOONRAKER_RESPONSE + 1)[m
+[1mdiff --git a/scripts/install.py b/scripts/install.py[m
+[1mindex abf7768..237e0ea 100644[m
+[1m--- a/scripts/install.py[m
+[1m+++ b/scripts/install.py[m
+[36m@@ -25,7 +25,14 @@[m [mimport types[m
+ [m
+ sys.dont_write_bytecode = True[m
+ [m
+[31m-PRODUCT_VERSION = '1.0.0'[m
+[32m+[m[32mPRODUCT = 'BMCU-Klipper'[m
+[32m+[m[32mPRODUCT_VERSION = None[m
+[32m+[m[32mOWNERSHIP_MARKER = PRODUCT[m
+[32m+[m[32mOWNER_RE = re.compile([m
+[32m+[m[32m    r'^%s(?: [0-9]+\.[0-9]+\.[0-9]+)?$' % re.escape(PRODUCT))[m
+[32m+[m[32mMANAGED_HEADER_RE = re.compile([m
+[32m+[m[32m    (r'(?m)^# Managed by %s(?: [0-9]+\.[0-9]+\.[0-9]+)?(?:\.| -)' %[m
+[32m+[m[32m     re.escape(PRODUCT)).encode('ascii'))[m
+ BEGIN = '# BEGIN BMCU-KLIPPER AUTO-INCLUDE'[m
+ END = '# END BMCU-KLIPPER AUTO-INCLUDE'[m
+ INCLUDES = ([m
+[36m@@ -46,7 +53,9 @@[m [mU1_RUNNER = '/oem/bmcu-klipper/run-host-bootstrap.py'[m
+ U1_RUNNER_MARKER = '/oem/bmcu-klipper/.managed-by-bmcu'[m
+ U1_SERIAL_RULE_DIR = '/etc/udev/rules.d'[m
+ U1_SERIAL_RULE = '/etc/udev/rules.d/99-bmcu-klipper.rules'[m
+[31m-U1_SERIAL_RULE_MARKER = '# Managed by BMCU-Klipper 1.0.0 - Snapmaker U1 CH340 access'[m
+[32m+[m[32mU1_SERIAL_RULE_LABEL = 'Snapmaker U1 CH340 access'[m
+[32m+[m[32mU1_SERIAL_RULE_MARKER = '# Managed by %s - %s' % ([m
+[32m+[m[32m    OWNERSHIP_MARKER, U1_SERIAL_RULE_LABEL)[m
+ U1_SERIAL_VENDOR = '1a86'[m
+ U1_SERIAL_PRODUCTS = ('5523', '7522', '7523', '7584', '55d4')[m
+ U1_SERVICE_BEGIN = '# BEGIN BMCU-KLIPPER SERVICE-HOOKS'[m
+[36m@@ -156,6 +165,34 @@[m [mdef snapshot_bytes(snapshot, relative):[m
+     except KeyError:[m
+         raise InstallError('package file is missing: %s' % key)[m
+ [m
+[32m+[m[32mdef release_versions_from_snapshot(snapshot):[m
+[32m+[m[32m    data = snapshot_bytes(snapshot, 'version')[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        text = data.decode('utf-8')[m
+[32m+[m[32m    except UnicodeDecodeError:[m
+[32m+[m[32m        raise InstallError('version file is not valid UTF-8')[m
+[32m+[m[32m    result = {}[m
+[32m+[m[32m    pattern = r'(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})'[m
+[32m+[m[32m    for raw in text.splitlines():[m
+[32m+[m[32m        line = raw.strip()[m
+[32m+[m[32m        if not line or line.startswith('#'):[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        if '=' in line:[m
+[32m+[m[32m            key, value = line.split('=', 1)[m
+[32m+[m[32m        elif ':' in line:[m
+[32m+[m[32m            key, value = line.split(':', 1)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        key, value = key.strip().lower(), value.strip().lower()[m
+[32m+[m[32m        if key not in ('package', 'firmware'):[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        if not re.fullmatch(pattern, value):[m
+[32m+[m[32m            raise InstallError('invalid %s version' % key)[m
+[32m+[m[32m        result[key] = value[m
+[32m+[m[32m    if 'package' not in result or 'firmware' not in result:[m
+[32m+[m[32m        raise InstallError('version file is incomplete')[m
+[32m+[m[32m    return result[m
+[32m+[m
+ def write_snapshot_file(snapshot, relative, destination, mode):[m
+     data = snapshot_bytes(snapshot, relative)[m
+     parent = os.path.dirname(destination)[m
+[36m@@ -602,7 +639,7 @@[m [mdef run_as_user(cmd, user, uid, gid, check=False, env=None, timeout=120):[m
+ [m
+ def query_json(url, timeout=3.0):[m
+     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))[m
+[31m-    request = urllib.request.Request(url, headers={'User-Agent': 'BMCU-Installer/1.0.0'})[m
+[32m+[m[32m    request = urllib.request.Request(url, headers={'User-Agent': 'BMCU-Installer/%s' % PRODUCT_VERSION})[m
+     with opener.open(request, timeout=timeout) as response:[m
+         raw = response.read(1024 * 1024 + 1)[m
+     if len(raw) > 1024 * 1024:[m
+[36m@@ -1663,6 +1700,22 @@[m [mdef ensure_root_directory(path, mode=0o755):[m
+ def shell_quote(value):[m
+     return "'" + str(value).replace("'", "'\\''") + "'"[m
+ [m
+[32m+[m[32mdef ownership_value_matches(value):[m
+[32m+[m[32m    return OWNER_RE.fullmatch(str(value or '')) is not None[m
+[32m+[m
+[32m+[m[32mdef ownership_marker_matches(data):[m
+[32m+[m[32m    if not isinstance(data, (bytes, bytearray)):[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    return ownership_value_matches([m
+[32m+[m[32m        bytes(data).decode('utf-8', 'replace').strip())[m
+[32m+[m
+[32m+[m[32mdef u1_serial_rule_marker_matches(first_line):[m
+[32m+[m[32m    prefix = '# Managed by '[m
+[32m+[m[32m    suffix = ' - ' + U1_SERIAL_RULE_LABEL[m
+[32m+[m[32m    if not first_line.startswith(prefix) or not first_line.endswith(suffix):[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    return ownership_value_matches(first_line[len(prefix):-len(suffix)])[m
+[32m+[m
+ def u1_serial_rule_bytes(target_group):[m
+     group = str(target_group or '').strip()[m
+     if not re.match(r'^[A-Za-z_][A-Za-z0-9_.-]*$', group):[m
+[36m@@ -1680,7 +1733,8 @@[m [mdef managed_u1_serial_rule(data):[m
+         text = bytes(data).decode('utf-8')[m
+     except UnicodeDecodeError:[m
+         return False[m
+[31m-    return (text.startswith(U1_SERIAL_RULE_MARKER + '\n') and[m
+[32m+[m[32m    first_line = text.splitlines()[0] if text.splitlines() else ''[m
+[32m+[m[32m    return (u1_serial_rule_marker_matches(first_line) and[m
+             'MODE="0660"' in text and[m
+             (('KERNEL=="ttyUSB*"' in text and 'KERNEL=="ttyCH343USB*"' in text) or[m
+              ('ATTRS{idVendor}=="%s"' % U1_SERIAL_VENDOR in text and[m
+[36m@@ -1722,7 +1776,7 @@[m [mdef u1_runner_bytes(target_user, uid, gid, target_python, metadata_path):[m
+     groups = supplementary_groups(target_user, gid)[m
+     home = pwd.getpwnam(target_user).pw_dir[m
+     text = """#!/usr/bin/python3[m
+[31m-# Managed by BMCU-Klipper 1.0.0. Generated root-owned privilege dropper.[m
+[32m+[m[32m# Managed by BMCU-Klipper. Generated root-owned privilege dropper.[m
+ import glob[m
+ import os[m
+ import stat[m
+[36m@@ -1805,7 +1859,7 @@[m [mos.execve([m
+ def u1_inline_block(system_python, runner_path, newline='\n'):[m
+     lines = [[m
+         U1_SERVICE_BEGIN,[m
+[31m-        '# Managed by BMCU-Klipper 1.0.0 - called only at each actual Klipper launch.',[m
+[32m+[m[32m        '# Managed by BMCU-Klipper - called only at each actual Klipper launch.',[m
+         '# The call sites are injected immediately before start-stop-daemon -S,',[m
+         '# after Snapmaker has powered and re-enumerated the U1 USB hardware.',[m
+         'bmcu_prepare_klipper_start()',[m
+[36m@@ -1828,7 +1882,7 @@[m [mdef managed_boot_hook(path):[m
+         data, _info = read_regular(path)[m
+     except (OSError, InstallError):[m
+         return False[m
+[31m-    return b'Managed by BMCU-Klipper 1.0.0' in data[:1024][m
+[32m+[m[32m    return MANAGED_HEADER_RE.search(data[:1024]) is not None[m
+ [m
+ def systemd_unit_name(service):[m
+     name = str((service or {}).get('name') or 'klipper')[m
+[36m@@ -1847,7 +1901,7 @@[m [mdef systemd_quote(value):[m
+ [m
+ def systemd_hook_bytes(target_python, metadata_path):[m
+     script = os.path.join(os.path.dirname(metadata_path), 'scripts', 'bmcu_host_bootstrap.py')[m
+[31m-    text = """# Managed by BMCU-Klipper 1.0.0 - repair persistent Klipper modules before Klipper starts.[m
+[32m+[m[32m    text = """# Managed by BMCU-Klipper - repair persistent Klipper modules before Klipper starts.[m
+ [Service][m
+ ExecStartPre=%s -I %s --repair --metadata %s --quiet[m
+ """ % ([m
+[36m@@ -1981,8 +2035,7 @@[m [mdef _managed_u1_runner_dir():[m
+         return False[m
+     if (marker_info.st_uid != 0 or marker_info.st_gid != 0 or[m
+             stat.S_IMODE(marker_info.st_mode) != 0o600 or[m
+[31m-            marker_data.decode('utf-8', 'replace').strip() !=[m
+[31m-            'BMCU-Klipper 1.0.0'):[m
+[32m+[m[32m            not ownership_marker_matches(marker_data)):[m
+         return False[m
+     if os.path.lexists(U1_RUNNER):[m
+         try:[m
+[36m@@ -2097,7 +2150,7 @@[m [mdef install_boot_repair(platform_id, service, target_user, uid, gid,[m
+             'runner_marker_previous_info': runner_marker_previous_info,[m
+             'runner_marker_previous_xattrs': runner_marker_previous_xattrs,[m
+             'runner_installed': runner_data,[m
+[31m-            'runner_marker_installed': b'BMCU-Klipper 1.0.0\n',[m
+[32m+[m[32m            'runner_marker_installed': (OWNERSHIP_MARKER + '\n').encode('utf-8'),[m
+             'serial_rule_supported': serial_rule_supported,[m
+             'serial_rule_previous': serial_rule_previous,[m
+             'serial_rule_previous_info': serial_rule_previous_info,[m
+[36m@@ -2154,7 +2207,7 @@[m [mdef install_boot_repair(platform_id, service, target_user, uid, gid,[m
+                 record['runner_dir_created'] = True[m
+             os.chown(U1_RUNNER_DIR, 0, 0)[m
+             os.chmod(U1_RUNNER_DIR, 0o700)[m
+[31m-            marker_data = b'BMCU-Klipper 1.0.0\n'[m
+[32m+[m[32m            marker_data = (OWNERSHIP_MARKER + '\n').encode('utf-8')[m
+             if runner_marker_previous is None:[m
+                 write_new_atomic(U1_RUNNER_MARKER, marker_data, 0o600)[m
+             else:[m
+[36m@@ -2496,7 +2549,7 @@[m [mdef populate_runtime(snapshot, runtime, installation):[m
+     write_snapshot_file(snapshot, 'version', os.path.join(runtime, 'version'), 0o640)[m
+     write_new_atomic([m
+         os.path.join(runtime, '.managed-by-bmcu'),[m
+[31m-        b'BMCU-Klipper\n', 0o640)[m
+[32m+[m[32m        (OWNERSHIP_MARKER + '\n').encode('utf-8'), 0o640)[m
+     metadata = (json.dumps([m
+         installation, indent=2, sort_keys=True) + '\n').encode('utf-8')[m
+     write_new_atomic([m
+[36m@@ -2595,8 +2648,7 @@[m [mdef load_managed_metadata(bmcu_dir):[m
+             'existing BMCU directory is not a managed BMCU-Klipper installation')[m
+     marker = os.path.join(bmcu_dir, 'runtime', '.managed-by-bmcu')[m
+     marker_data, _marker_info = read_regular(marker)[m
+[31m-    marker_value = marker_data.decode('utf-8', 'replace').strip()[m
+[31m-    if marker_value != 'BMCU-Klipper' and not marker_value.startswith('BMCU-Klipper '):[m
+[32m+[m[32m    if not ownership_marker_matches(marker_data):[m
+         raise InstallError([m
+             'existing BMCU installation has no valid ownership marker')[m
+     return value[m
+[36m@@ -2744,7 +2796,7 @@[m [mdef repair_existing(snapshot, plan, service, target_user, target_group, target_p[m
+         installation = dict(metadata)[m
+         boot_hook_path, boot_hook_type = planned_boot_hook(plan['platform_id'], service)[m
+         installation.update([m
+[31m-            product='BMCU-Klipper', version=PRODUCT_VERSION, schema=1,[m
+[32m+[m[32m            product=PRODUCT, version=PRODUCT_VERSION, schema=1,[m
+             klipper_dir=plan['klipper_dir'], config_dir=plan['config_dir'],[m
+             printer_cfg=printer_cfg, user=target_user, group=target_group,[m
+             python=os.path.realpath(target_python),[m
+[36m@@ -2870,7 +2922,7 @@[m [mdef repair_existing(snapshot, plan, service, target_user, target_group, target_p[m
+         shutil.rmtree(old_runtime)[m
+         assert_directory_identity(stage, stage_identity)[m
+         shutil.rmtree(stage)[m
+[31m-        print('\nBMCU-Klipper 1.0.0 host installation is ready and persistent.')[m
+[32m+[m[32m        print('\nBMCU-Klipper %s host installation is ready and persistent.' % PRODUCT_VERSION)[m
+         if panel_enabled:[m
+             print('Panel URL: %s' % panel_url(panel_port))[m
+             ip_url = panel_ip_url(panel_port)[m
+[36m@@ -2984,7 +3036,7 @@[m [mdef repair_existing(snapshot, plan, service, target_user, target_group, target_p[m
+         raise InstallError(message)[m
+ [m
+ def parser():[m
+[31m-    p = argparse.ArgumentParser(prog='BMCU-Klipper-1.0.0 installer')[m
+[32m+[m[32m    p = argparse.ArgumentParser(prog='BMCU-Klipper installer')[m
+     p.add_argument('--klipper-dir', default='')[m
+     p.add_argument('--config-dir', default='')[m
+     p.add_argument('--printer-cfg', default='')[m
+[36m@@ -3015,6 +3067,8 @@[m [mdef main():[m
+ [m
+     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))[m
+     snapshot = load_release_snapshot(package)[m
+[32m+[m[32m    global PRODUCT_VERSION[m
+[32m+[m[32m    PRODUCT_VERSION = release_versions_from_snapshot(snapshot)['package'][m
+     platform = load_package_module('bmcu_platform', snapshot, package)[m
+     print('Package integrity: %d files verified' % (len(snapshot) - 1))[m
+ [m
+[36m@@ -3047,7 +3101,7 @@[m [mdef main():[m
+     gid = grp.getgrnam(target_group).gr_gid[m
+     validate_root_run_installation(plan, target_python, uid)[m
+ [m
+[31m-    print('\n=== BMCU-Klipper 1.0.0 installation ===')[m
+[32m+[m[32m    print('\n=== BMCU-Klipper %s installation ===' % PRODUCT_VERSION)[m
+     print('Platform:       %s' % plan['platform_id'])[m
+     print('Klipper:        %s' % klipper_dir)[m
+     print('Configuration:  %s' % printer_cfg)[m
+[36m@@ -3111,7 +3165,7 @@[m [mdef main():[m
+         panel_token = os.urandom(32).hex()[m
+         boot_hook_path, boot_hook_type = planned_boot_hook(plan['platform_id'], service)[m
+         installation = dict([m
+[31m-            product='BMCU-Klipper', version=PRODUCT_VERSION, schema=1,[m
+[32m+[m[32m            product=PRODUCT, version=PRODUCT_VERSION, schema=1,[m
+             klipper_dir=klipper_dir, config_dir=config_dir,[m
+             printer_cfg=printer_cfg, user=target_user, group=target_group,[m
+             python=os.path.realpath(target_python),[m
+[36m@@ -3342,7 +3396,7 @@[m [mdef main():[m
+                 '; '.join(rollback_errors))[m
+         raise InstallError(message)[m
+ [m
+[31m-    print('\nInstallation complete: BMCU-Klipper 1.0.0')[m
+[32m+[m[32m    print('\nInstallation complete: BMCU-Klipper %s' % PRODUCT_VERSION)[m
+     print('Configuration: %s' % bmcu_dir)[m
+     if not args.no_panel:[m
+         print('Panel URL: %s' % panel_url(args.panel_port))[m
+[1mdiff --git a/scripts/uninstall.py b/scripts/uninstall.py[m
+[1mindex 1f28b7c..e44bead 100644[m
+[1m--- a/scripts/uninstall.py[m
+[1m+++ b/scripts/uninstall.py[m
+[36m@@ -23,7 +23,13 @@[m [mimport types[m
+ sys.dont_write_bytecode = True[m
+ [m
+ PRODUCT = 'BMCU-Klipper'[m
+[31m-VERSION = '1.0.0'[m
+[32m+[m[32mVERSION = None[m
+[32m+[m[32mOWNERSHIP_MARKER = PRODUCT[m
+[32m+[m[32mOWNER_RE = re.compile([m
+[32m+[m[32m    r'^%s(?: [0-9]+\.[0-9]+\.[0-9]+)?$' % re.escape(PRODUCT))[m
+[32m+[m[32mMANAGED_HEADER_RE = re.compile([m
+[32m+[m[32m    (r'(?m)^# Managed by %s(?: [0-9]+\.[0-9]+\.[0-9]+)?(?:\.| -)' %[m
+[32m+[m[32m     re.escape(PRODUCT)).encode('ascii'))[m
+ BEGIN = '# BEGIN BMCU-KLIPPER AUTO-INCLUDE'[m
+ END = '# END BMCU-KLIPPER AUTO-INCLUDE'[m
+ MODULES = ('bmcu.py', 'bmcu_core', 'bmcu_panel.py')[m
+[36m@@ -39,7 +45,9 @@[m [mU1_RUNNER = '/oem/bmcu-klipper/run-host-bootstrap.py'[m
+ U1_RUNNER_MARKER = '/oem/bmcu-klipper/.managed-by-bmcu'[m
+ U1_SERIAL_RULE_DIR = '/etc/udev/rules.d'[m
+ U1_SERIAL_RULE = '/etc/udev/rules.d/99-bmcu-klipper.rules'[m
+[31m-U1_SERIAL_RULE_MARKER = '# Managed by BMCU-Klipper 1.0.0 - Snapmaker U1 CH340 access'[m
+[32m+[m[32mU1_SERIAL_RULE_LABEL = 'Snapmaker U1 CH340 access'[m
+[32m+[m[32mU1_SERIAL_RULE_MARKER = '# Managed by %s - %s' % ([m
+[32m+[m[32m    OWNERSHIP_MARKER, U1_SERIAL_RULE_LABEL)[m
+ U1_SERIAL_VENDOR = '1a86'[m
+ U1_SERIAL_PRODUCTS = ('5523', '7522', '7523', '7584', '55d4')[m
+ U1_PERSISTENCE_MARKER = '/oem/.debug'[m
+[36m@@ -49,7 +57,7 @@[m [mMAX_RELEASE_BYTES = 64 * 1024 * 1024[m
+ UNINSTALL_BACKUP_RETENTION = 0[m
+ UNINSTALL_BACKUP_RE = re.compile([m
+     r'^bmcu-uninstalled-\d{8}-\d{6}-\d+$')[m
+[31m-UNINSTALL_MARKER = 'BMCU-Klipper 1.0.0\n'[m
+[32m+[m[32mUNINSTALL_BACKUP_MARKER = OWNERSHIP_MARKER + '\n'[m
+ INCLUDE_RE = re.compile([m
+     r'^\s*\[\s*include\s+([^\]]+)\]\s*(?:#.*)?$', re.IGNORECASE)[m
+ [m
+[36m@@ -137,6 +145,36 @@[m [mdef load_package_module(name, snapshot, package):[m
+         raise[m
+     return module[m
+ [m
+[32m+[m[32mdef release_versions_from_snapshot(snapshot):[m
+[32m+[m[32m    data = snapshot.get('version')[m
+[32m+[m[32m    if data is None:[m
+[32m+[m[32m        raise UninstallError('package file is missing: version')[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        text = data.decode('utf-8')[m
+[32m+[m[32m    except UnicodeDecodeError:[m
+[32m+[m[32m        raise UninstallError('version file is not valid UTF-8')[m
+[32m+[m[32m    result = {}[m
+[32m+[m[32m    pattern = r'(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})'[m
+[32m+[m[32m    for raw in text.splitlines():[m
+[32m+[m[32m        line = raw.strip()[m
+[32m+[m[32m        if not line or line.startswith('#'):[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        if '=' in line:[m
+[32m+[m[32m            key, value = line.split('=', 1)[m
+[32m+[m[32m        elif ':' in line:[m
+[32m+[m[32m            key, value = line.split(':', 1)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        key, value = key.strip().lower(), value.strip().lower()[m
+[32m+[m[32m        if key not in ('package', 'firmware'):[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        if not re.fullmatch(pattern, value):[m
+[32m+[m[32m            raise UninstallError('invalid %s version' % key)[m
+[32m+[m[32m        result[key] = value[m
+[32m+[m[32m    if 'package' not in result or 'firmware' not in result:[m
+[32m+[m[32m        raise UninstallError('version file is incomplete')[m
+[32m+[m[32m    return result[m
+[32m+[m
+ def read_regular(path, limit=MAX_FILE):[m
+     flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)[m
+     nofollow = getattr(os, 'O_NOFOLLOW', 0)[m
+[36m@@ -338,7 +376,7 @@[m [mdef restore_removed_regular(path, data, info, xattrs=None):[m
+ def query_json(url, timeout=3.0):[m
+     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))[m
+     request = urllib.request.Request([m
+[31m-        url, headers={'User-Agent': 'BMCU-Uninstaller/1.0.0'})[m
+[32m+[m[32m        url, headers={'User-Agent': 'BMCU-Uninstaller/%s' % VERSION})[m
+     with opener.open(request, timeout=timeout) as response:[m
+         raw = response.read(MAX_JSON + 1)[m
+     if len(raw) > MAX_JSON:[m
+[36m@@ -608,6 +646,28 @@[m [mdef start_service_strict(service, klipper_dir, printer_cfg):[m
+         raise UninstallError('refusing to start a second Klipper process')[m
+     run(service_command(service, 'start'))[m
+ [m
+[32m+[m[32mdef ownership_value_matches(value):[m
+[32m+[m[32m    return OWNER_RE.fullmatch(str(value or '')) is not None[m
+[32m+[m
+[32m+[m[32mdef ownership_marker_matches(data):[m
+[32m+[m[32m    if not isinstance(data, (bytes, bytearray)):[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    return ownership_value_matches([m
+[32m+[m[32m        bytes(data).decode('utf-8', 'replace').strip())[m
+[32m+[m
+[32m+[m[32mdef uninstall_backup_marker_matches(data):[m
+[32m+[m[32m    if not isinstance(data, (bytes, bytearray)):[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    first_line = bytes(data).decode('utf-8', 'replace').splitlines()[m
+[32m+[m[32m    return bool(first_line) and ownership_value_matches(first_line[0])[m
+[32m+[m
+[32m+[m[32mdef u1_serial_rule_marker_matches(first_line):[m
+[32m+[m[32m    prefix = '# Managed by '[m
+[32m+[m[32m    suffix = ' - ' + U1_SERIAL_RULE_LABEL[m
+[32m+[m[32m    if not first_line.startswith(prefix) or not first_line.endswith(suffix):[m
+[32m+[m[32m        return False[m
+[32m+[m[32m    return ownership_value_matches(first_line[len(prefix):-len(suffix)])[m
+[32m+[m
+ def managed_boot_hook(path):[m
+     if not os.path.lexists(path):[m
+         return False[m
+[36m@@ -615,7 +675,7 @@[m [mdef managed_boot_hook(path):[m
+         data, _info = read_regular(path, MAX_FILE)[m
+     except (OSError, UninstallError):[m
+         return False[m
+[31m-    return b'Managed by BMCU-Klipper 1.0.0' in data[:1024][m
+[32m+[m[32m    return MANAGED_HEADER_RE.search(data[:1024]) is not None[m
+ [m
+ def systemd_unit_name(service):[m
+     name = str((service or {}).get('name') or 'klipper')[m
+[36m@@ -739,7 +799,8 @@[m [mdef managed_u1_serial_rule(data):[m
+         text = bytes(data).decode('utf-8')[m
+     except UnicodeDecodeError:[m
+         return False[m
+[31m-    return (text.startswith(U1_SERIAL_RULE_MARKER + '\n') and[m
+[32m+[m[32m    first_line = text.splitlines()[0] if text.splitlines() else ''[m
+[32m+[m[32m    return (u1_serial_rule_marker_matches(first_line) and[m
+             'MODE="0660"' in text and[m
+             (('KERNEL=="ttyUSB*"' in text and 'KERNEL=="ttyCH343USB*"' in text) or[m
+              ('ATTRS{idVendor}=="%s"' % U1_SERIAL_VENDOR in text and[m
+[36m@@ -867,7 +928,7 @@[m [mdef u1_integration_snapshot(platform_id, primary_boot_hook=None):[m
+                 'Snapmaker U1 runner directory contains unexpected files')[m
+         marker_data, marker_info = read_regular(U1_RUNNER_MARKER, MAX_JSON)[m
+         runner_data, runner_info = read_regular(U1_RUNNER, MAX_FILE)[m
+[31m-        if marker_data.decode('utf-8', 'replace').strip() != 'BMCU-Klipper 1.0.0':[m
+[32m+[m[32m        if not ownership_marker_matches(marker_data):[m
+             raise UninstallError('Snapmaker U1 runner directory is not BMCU-owned')[m
+         if (marker_info.st_uid != 0 or marker_info.st_gid != 0 or[m
+                 runner_info.st_uid != 0 or runner_info.st_gid != 0 or[m
+[36m@@ -1227,7 +1288,7 @@[m [mdef add_bmcu_include(original, config_dir, bmcu_dir):[m
+     return cleaned[:index] + block + cleaned[index:][m
+ [m
+ def parser():[m
+[31m-    value = argparse.ArgumentParser(prog='BMCU-Klipper-1.0.0 uninstaller')[m
+[32m+[m[32m    value = argparse.ArgumentParser(prog='BMCU-Klipper uninstaller')[m
+     value.add_argument('--klipper-dir', default='')[m
+     value.add_argument('--config-dir', default='')[m
+     value.add_argument('--printer-cfg', default='')[m
+[36m@@ -1278,11 +1339,11 @@[m [mdef validate_metadata(metadata, config_dir, printer_cfg, klipper_dir, service=No[m
+     if metadata is None:[m
+         return[m
+     product = metadata.get('product')[m
+[31m-    version = metadata.get('version')[m
+     if product not in (None, PRODUCT):[m
+         raise UninstallError('installation metadata belongs to another product')[m
+[31m-    if version not in (None, VERSION):[m
+[31m-        raise UninstallError('installation metadata belongs to another version')[m
+[32m+[m[32m    schema = metadata.get('schema')[m
+[32m+[m[32m    if schema not in (None, 1):[m
+[32m+[m[32m        raise UninstallError('installation metadata uses an unsupported schema')[m
+     for key, detected in ([m
+         ('config_dir', config_dir),[m
+         ('printer_cfg', printer_cfg),[m
+[36m@@ -1346,14 +1407,14 @@[m [mdef validate_ownership(bmcu_dir, runtime, metadata):[m
+         if not os.path.lexists(marker):[m
+             continue[m
+         data, _info = read_regular(marker, MAX_JSON)[m
+[31m-        if data.decode('utf-8', 'replace').strip() != 'BMCU-Klipper 1.0.0':[m
+[32m+[m[32m        if not ownership_marker_matches(data):[m
+             raise UninstallError('unexpected BMCU ownership marker: %s' % marker)[m
+         owned = True[m
+     if metadata is not None:[m
+         owned = True[m
+     if not owned:[m
+         raise UninstallError([m
+[31m-            'BMCU directory has no BMCU-Klipper 1.0.0 ownership marker')[m
+[32m+[m[32m            'BMCU directory has no BMCU-Klipper ownership marker')[m
+ [m
+ def module_snapshot(klipper_dir, bmcu_dir):[m
+     extras = os.path.join(klipper_dir, 'klippy', 'extras')[m
+[36m@@ -1475,7 +1536,7 @@[m [mdef managed_uninstall_backup(path):[m
+         bmcu_info = os.lstat(bmcu)[m
+     except (OSError, UninstallError):[m
+         return False[m
+[31m-    if not marker_data.startswith(UNINSTALL_MARKER.encode('utf-8')):[m
+[32m+[m[32m    if not uninstall_backup_marker_matches(marker_data):[m
+         return False[m
+     if marker_info.st_uid != 0 or stat.S_IMODE(marker_info.st_mode) & 0o022:[m
+         return False[m
+[36m@@ -1539,7 +1600,7 @@[m [mdef cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,[m
+         u1_snapshot.get('runner_present')))[m
+     if not (cleaned_cfg != original_cfg or has_links or state_exists or[m
+             has_boot_hook or has_u1):[m
+[31m-        print('BMCU-Klipper 1.0.0 is already removed; nothing to do.')[m
+[32m+[m[32m        print('BMCU-Klipper %s is already removed; nothing to do.' % VERSION)[m
+         return 0[m
+ [m
+     host_state = 'unavailable'[m
+[36m@@ -1607,7 +1668,7 @@[m [mdef cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,[m
+         pids = wait_single_klippy(klipper_dir, printer_cfg)[m
+         if len(pids) != 1:[m
+             raise UninstallError('expected one Klipper process after cleanup, found %d' % len(pids))[m
+[31m-        print('BMCU-Klipper 1.0.0 residual host state removed safely.')[m
+[32m+[m[32m        print('BMCU-Klipper %s residual host state removed safely.' % VERSION)[m
+         print('Removed printer.cfg references: %d' % removed_references)[m
+         print('Removed Klipper module links: %d' % len(removed_links))[m
+         return 0[m
+[36m@@ -1827,6 +1888,8 @@[m [mdef main():[m
+ [m
+     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))[m
+     snapshot = load_release_snapshot(package)[m
+[32m+[m[32m    global VERSION[m
+[32m+[m[32m    VERSION = release_versions_from_snapshot(snapshot)['package'][m
+     platform = load_package_module('bmcu_platform', snapshot, package)[m
+     moonraker_gcode = load_package_module('moonraker_gcode', snapshot, package)[m
+     print('Package integrity: %d files verified' % (len(snapshot) - 1))[m
+[36m@@ -2033,7 +2096,8 @@[m [mdef main():[m
+         assert_directory_identity(backup_bmcu, backup_bmcu_identity)[m
+         marker_path = os.path.join(backup, 'UNINSTALL.txt')[m
+         marker_text = ([m
+[31m-            UNINSTALL_MARKER +[m
+[32m+[m[32m            UNINSTALL_BACKUP_MARKER +[m
+[32m+[m[32m            'Package version: %s\n' % VERSION +[m
+             'Removed printer.cfg references: %d\n' % removed_references +[m
+             'Removed Klipper module links: %d\n' % len(removed_links) +[m
+             'Removed BMCU boot repair hook: %s\n' %[m
+[36m@@ -2077,7 +2141,7 @@[m [mdef main():[m
+             pruned_backups = [][m
+             cleanup_warning = str(exc)[m
+ [m
+[31m-        print('BMCU-Klipper 1.0.0 removed safely.')[m
+[32m+[m[32m        print('BMCU-Klipper %s removed safely.' % VERSION)[m
+         if marker_removed:[m
+             print('Removed package-created Snapmaker persistence marker: %s' %[m
+                   U1_PERSISTENCE_MARKER)[m
+[1mdiff --git a/version b/version[m
+[1mindex 876985c..a00b8d8 100644[m
+[1m--- a/version[m
+[1m+++ b/version[m
+[36m@@ -1,2 +1,2 @@[m
+[31m-package=1.0.0[m
+[32m+[m[32mpackage=1.0.1[m
+ firmware=1.0.0[m
+[1mdiff --git a/web/bmcu_panel_server.py b/web/bmcu_panel_server.py[m
+[1mindex e35baa8..9814926 100644[m
+[1m--- a/web/bmcu_panel_server.py[m
+[1m+++ b/web/bmcu_panel_server.py[m
+[36m@@ -44,10 +44,15 @@[m [mHTTP_CONNECTION_TIMEOUT = 15.0[m
+ MAX_PANEL_GCODE = 40 * 1024[m
+ MAX_ORCA_TEMPLATE_BYTES = 512 * 1024[m
+ DIAGNOSTICS_EXPORT_TIMEOUT = 180.0[m
+[31m-PACKAGE_VERSION = '1.0.0'[m
+[31m-REQUIRED_FIRMWARE_VERSION = '1.0.0'[m
+ REMOTE_VERSION_URL = 'https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/version'[m
+ MAX_VERSION_BYTES = 4096[m
+[32m+[m[32m_RUNTIME_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))[m
+[32m+[m[32m_EXTRAS = os.path.join(_RUNTIME_ROOT, 'klippy', 'extras')[m
+[32m+[m[32mif _EXTRAS not in sys.path:[m
+[32m+[m[32m    sys.path.insert(0, _EXTRAS)[m
+[32m+[m[32mfrom bmcu_core.release import ([m
+[32m+[m[32m    PACKAGE_VERSION, REQUIRED_FIRMWARE_TEXT, parse_release_versions)[m
+[32m+[m[32mREQUIRED_FIRMWARE_VERSION = REQUIRED_FIRMWARE_TEXT[m
+ ALLOWED_PANEL_COMMANDS = {[m
+     'BMCU_APPLY_PRESET',[m
+     'BMCU_CALIBRATE',[m
+[36m@@ -89,51 +94,14 @@[m [mNO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirect())[m
+ def _reject_json_constant(value):[m
+     raise ValueError('non-standard JSON number: %s' % value)[m
+ [m
+[31m-def _parse_release_versions(text):[m
+[31m-    result = {}[m
+[31m-    for raw in text.splitlines():[m
+[31m-        line = raw.strip()[m
+[31m-        if not line or line.startswith('#'):[m
+[31m-            continue[m
+[31m-        if '=' in line:[m
+[31m-            key, value = line.split('=', 1)[m
+[31m-        elif ':' in line:[m
+[31m-            key, value = line.split(':', 1)[m
+[31m-        else:[m
+[31m-            continue[m
+[31m-        key, value = key.strip().lower(), value.strip()[m
+[31m-        if key not in ('package', 'firmware'):[m
+[31m-            continue[m
+[31m-        parts = value.split('.')[m
+[31m-        if len(parts) != 3 or any(not part.isdigit() for part in parts):[m
+[31m-            raise ValueError('invalid %s version' % key)[m
+[31m-        result[key] = value[m
+[31m-    if 'package' not in result or 'firmware' not in result:[m
+[31m-        raise ValueError('remote version file is incomplete')[m
+[31m-    return result[m
+[31m-[m
+[31m-def _local_release_versions():[m
+[31m-    path = pathlib.Path(__file__).resolve().parent.parent / 'version'[m
+[31m-    data = path.read_bytes()[m
+[31m-    if len(data) > MAX_VERSION_BYTES:[m
+[31m-        raise ValueError('local version file is too large')[m
+[31m-    return _parse_release_versions(data.decode('utf-8'))[m
+[31m-[m
+[31m-try:[m
+[31m-    _LOCAL_VERSIONS = _local_release_versions()[m
+[31m-    PACKAGE_VERSION = _LOCAL_VERSIONS['package'][m
+[31m-    REQUIRED_FIRMWARE_VERSION = _LOCAL_VERSIONS['firmware'][m
+[31m-except Exception:[m
+[31m-    pass[m
+[31m-[m
+ def _remote_release_versions():[m
+     request = urllib.request.Request([m
+[31m-        REMOTE_VERSION_URL, headers={'User-Agent': 'BMCU-Klipper/1.0.0'})[m
+[32m+[m[32m        REMOTE_VERSION_URL, headers={'User-Agent': 'BMCU-Klipper/%s' % PACKAGE_VERSION})[m
+     with urllib.request.urlopen(request, timeout=6) as response:[m
+         data = response.read(MAX_VERSION_BYTES + 1)[m
+     if len(data) > MAX_VERSION_BYTES:[m
+         raise ValueError('remote version file is too large')[m
+[31m-    return _parse_release_versions(data.decode('utf-8'))[m
+[32m+[m[32m    return parse_release_versions(data.decode('utf-8'))[m
+ [m
+ def validate_moonraker_url(value):[m
+     raw = str(value or '')[m
+[36m@@ -1399,7 +1367,7 @@[m [mclass UpdateJobs:[m
+                 self._safe_remove_upload(firmware_path, upload_info or {})[m
+ [m
+ class PanelHandler(http.server.SimpleHTTPRequestHandler):[m
+[31m-    server_version = 'BMCUPanel/1.0.0'[m
+[32m+[m[32m    server_version = 'BMCUPanel/%s' % PACKAGE_VERSION[m
+     moonraker = 'http://127.0.0.1:7125'[m
+     jobs = None[m
+     package_build_id = 'unpackaged'[m
+[1mdiff --git a/web/panel.js b/web/panel.js[m
+[1mindex c37df0c..3c0caf9 100644[m
+[1m--- a/web/panel.js[m
+[1m+++ b/web/panel.js[m
+[36m@@ -39,7 +39,7 @@[m [mfunction orcaSlotLabel(tool, diagnostic = false) {[m
+ [m
+ function firmwareBlockReason(device) {[m
+   if (device?.firmware_compatible !== false) return '';[m
+[31m-  return String(device?.firmware_error || 'BMCU firmware 1.0.0 required').trim();[m
+[32m+[m[32m  return String(device?.firmware_error || 'Compatible BMCU firmware required').trim();[m
+ }[m
+ function syncLengthConversions() {[m
+   const sync = (sourceId, targetId) => {[m
+[36m@@ -101,11 +101,7 @@[m [mclass StateEngine {[m
+   constructor() {[m
+     this.state = {[m
+       status: null,[m
+[31m-      config: {[m
+[31m-        firmware_update_available: true,[m
+[31m-        package_version: '1.0.0',[m
+[31m-        package_build_id: 'unpackaged',[m
+[31m-      },[m
+[32m+[m[32m      config: {},[m
+       connection: 'starting',[m
+       lastUpdate: 0,[m
+     };[m
+[36m@@ -876,7 +872,7 @@[m [mfunction renderNotices() {[m
+     notices.push({[m
+       key: 'firmware-required', cls: 'warning',[m
+       title: 'BMCU firmware flash required',[m
+[31m-      copy: `BMCU motion, loading, unloading and refill are blocked. Required BMCU firmware: ${store.state.config.required_firmware_version || '1.0.0'}. Open Settings and flash the compatible firmware.`,[m
+[32m+[m[32m      copy: `BMCU motion, loading, unloading and refill are blocked. Required BMCU firmware: ${store.state.config.required_firmware_version || 'unknown'}. Open Settings and flash the compatible firmware.`,[m
+       action: ['open-firmware-settings', 'Open firmware settings'],[m
+     });[m
+   } else if (!devices().length && rawSerialCandidates().length) {[m
+[36m@@ -3042,17 +3038,19 @@[m [mfunction renderSettings() {[m
+     snapmaker_u1: 'Snapmaker U1',[m
+     generic: 'Generic Klipper',[m
+   };[m
+[31m-  const packageVersion = store.state.config.package_version || 'unknown';[m
+[32m+[m[32m  const packageVersion = store.state.config.package_version || '';[m
+   const remotePackage = ui.remoteVersions?.package || '';[m
+[31m-  const packageVersionText = remotePackage[m
+[31m-    ? (versionNewer(remotePackage, packageVersion)[m
+[31m-      ? `${packageVersion} - New version available: ${remotePackage}`[m
+[31m-      : `${packageVersion} - Up to date`)[m
+[31m-    : packageVersion;[m
+[32m+[m[32m  const packageVersionText = packageVersion[m
+[32m+[m[32m    ? (remotePackage[m
+[32m+[m[32m      ? (versionNewer(remotePackage, packageVersion)[m
+[32m+[m[32m        ? `${packageVersion} - New version available: ${remotePackage}`[m
+[32m+[m[32m        : `${packageVersion} - Up to date`)[m
+[32m+[m[32m      : packageVersion)[m
+[32m+[m[32m    : 'Unavailable';[m
+   const connectedFirmware = devices().map((device) => String(device.firmware || '')).filter(Boolean);[m
+   const firmwareVersion = connectedFirmware.length === 1[m
+     ? connectedFirmware[0][m
+[31m-    : (store.state.config.required_firmware_version || '1.0.0');[m
+[32m+[m[32m    : (store.state.config.required_firmware_version || 'unknown');[m
+   const remoteFirmware = ui.remoteVersions?.firmware || '';[m
+   const firmwareVersionText = remoteFirmware[m
+     ? (versionNewer(remoteFirmware, firmwareVersion)[m

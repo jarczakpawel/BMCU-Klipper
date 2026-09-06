@@ -39,7 +39,7 @@ function orcaSlotLabel(tool, diagnostic = false) {
 
 function firmwareBlockReason(device) {
   if (device?.firmware_compatible !== false) return '';
-  return String(device?.firmware_error || 'BMCU firmware 1.0.0 required').trim();
+  return String(device?.firmware_error || 'Compatible BMCU firmware required').trim();
 }
 function syncLengthConversions() {
   const sync = (sourceId, targetId) => {
@@ -101,11 +101,7 @@ class StateEngine {
   constructor() {
     this.state = {
       status: null,
-      config: {
-        firmware_update_available: true,
-        package_version: '1.0.0',
-        package_build_id: 'unpackaged',
-      },
+      config: {},
       connection: 'starting',
       lastUpdate: 0,
     };
@@ -876,7 +872,7 @@ function renderNotices() {
     notices.push({
       key: 'firmware-required', cls: 'warning',
       title: 'BMCU firmware flash required',
-      copy: `BMCU motion, loading, unloading and refill are blocked. Required BMCU firmware: ${store.state.config.required_firmware_version || '1.0.0'}. Open Settings and flash the compatible firmware.`,
+      copy: `BMCU motion, loading, unloading and refill are blocked. Required BMCU firmware: ${store.state.config.required_firmware_version || 'unknown'}. Open Settings and flash the compatible firmware.`,
       action: ['open-firmware-settings', 'Open firmware settings'],
     });
   } else if (!devices().length && rawSerialCandidates().length) {
@@ -3042,17 +3038,19 @@ function renderSettings() {
     snapmaker_u1: 'Snapmaker U1',
     generic: 'Generic Klipper',
   };
-  const packageVersion = store.state.config.package_version || 'unknown';
+  const packageVersion = store.state.config.package_version || '';
   const remotePackage = ui.remoteVersions?.package || '';
-  const packageVersionText = remotePackage
-    ? (versionNewer(remotePackage, packageVersion)
-      ? `${packageVersion} - New version available: ${remotePackage}`
-      : `${packageVersion} - Up to date`)
-    : packageVersion;
+  const packageVersionText = packageVersion
+    ? (remotePackage
+      ? (versionNewer(remotePackage, packageVersion)
+        ? `${packageVersion} - New version available: ${remotePackage}`
+        : `${packageVersion} - Up to date`)
+      : packageVersion)
+    : 'Unavailable';
   const connectedFirmware = devices().map((device) => String(device.firmware || '')).filter(Boolean);
   const firmwareVersion = connectedFirmware.length === 1
     ? connectedFirmware[0]
-    : (store.state.config.required_firmware_version || '1.0.0');
+    : (store.state.config.required_firmware_version || 'unknown');
   const remoteFirmware = ui.remoteVersions?.firmware || '';
   const firmwareVersionText = remoteFirmware
     ? (versionNewer(remoteFirmware, firmwareVersion)

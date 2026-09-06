@@ -23,7 +23,13 @@ import types
 sys.dont_write_bytecode = True
 
 PRODUCT = 'BMCU-Klipper'
-VERSION = '1.0.0'
+VERSION = None
+OWNERSHIP_MARKER = PRODUCT
+OWNER_RE = re.compile(
+    r'^%s(?: [0-9]+\.[0-9]+\.[0-9]+)?$' % re.escape(PRODUCT))
+MANAGED_HEADER_RE = re.compile(
+    (r'(?m)^# Managed by %s(?: [0-9]+\.[0-9]+\.[0-9]+)?(?:\.| -)' %
+     re.escape(PRODUCT)).encode('ascii'))
 BEGIN = '# BEGIN BMCU-KLIPPER AUTO-INCLUDE'
 END = '# END BMCU-KLIPPER AUTO-INCLUDE'
 MODULES = ('bmcu.py', 'bmcu_core', 'bmcu_panel.py')
@@ -39,7 +45,9 @@ U1_RUNNER = '/oem/bmcu-klipper/run-host-bootstrap.py'
 U1_RUNNER_MARKER = '/oem/bmcu-klipper/.managed-by-bmcu'
 U1_SERIAL_RULE_DIR = '/etc/udev/rules.d'
 U1_SERIAL_RULE = '/etc/udev/rules.d/99-bmcu-klipper.rules'
-U1_SERIAL_RULE_MARKER = '# Managed by BMCU-Klipper 1.0.0 - Snapmaker U1 CH340 access'
+U1_SERIAL_RULE_LABEL = 'Snapmaker U1 CH340 access'
+U1_SERIAL_RULE_MARKER = '# Managed by %s - %s' % (
+    OWNERSHIP_MARKER, U1_SERIAL_RULE_LABEL)
 U1_SERIAL_VENDOR = '1a86'
 U1_SERIAL_PRODUCTS = ('5523', '7522', '7523', '7584', '55d4')
 U1_PERSISTENCE_MARKER = '/oem/.debug'
@@ -49,7 +57,7 @@ MAX_RELEASE_BYTES = 64 * 1024 * 1024
 UNINSTALL_BACKUP_RETENTION = 0
 UNINSTALL_BACKUP_RE = re.compile(
     r'^bmcu-uninstalled-\d{8}-\d{6}-\d+$')
-UNINSTALL_MARKER = 'BMCU-Klipper 1.0.0\n'
+UNINSTALL_BACKUP_MARKER = OWNERSHIP_MARKER + '\n'
 INCLUDE_RE = re.compile(
     r'^\s*\[\s*include\s+([^\]]+)\]\s*(?:#.*)?$', re.IGNORECASE)
 
@@ -136,6 +144,36 @@ def load_package_module(name, snapshot, package):
         sys.modules.pop(name, None)
         raise
     return module
+
+def release_versions_from_snapshot(snapshot):
+    data = snapshot.get('version')
+    if data is None:
+        raise UninstallError('package file is missing: version')
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        raise UninstallError('version file is not valid UTF-8')
+    result = {}
+    pattern = r'(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})'
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            key, value = line.split('=', 1)
+        elif ':' in line:
+            key, value = line.split(':', 1)
+        else:
+            continue
+        key, value = key.strip().lower(), value.strip().lower()
+        if key not in ('package', 'firmware'):
+            continue
+        if not re.fullmatch(pattern, value):
+            raise UninstallError('invalid %s version' % key)
+        result[key] = value
+    if 'package' not in result or 'firmware' not in result:
+        raise UninstallError('version file is incomplete')
+    return result
 
 def read_regular(path, limit=MAX_FILE):
     flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0)
@@ -338,7 +376,7 @@ def restore_removed_regular(path, data, info, xattrs=None):
 def query_json(url, timeout=3.0):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     request = urllib.request.Request(
-        url, headers={'User-Agent': 'BMCU-Uninstaller/1.0.0'})
+        url, headers={'User-Agent': 'BMCU-Uninstaller/%s' % VERSION})
     with opener.open(request, timeout=timeout) as response:
         raw = response.read(MAX_JSON + 1)
     if len(raw) > MAX_JSON:
@@ -608,6 +646,28 @@ def start_service_strict(service, klipper_dir, printer_cfg):
         raise UninstallError('refusing to start a second Klipper process')
     run(service_command(service, 'start'))
 
+def ownership_value_matches(value):
+    return OWNER_RE.fullmatch(str(value or '')) is not None
+
+def ownership_marker_matches(data):
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    return ownership_value_matches(
+        bytes(data).decode('utf-8', 'replace').strip())
+
+def uninstall_backup_marker_matches(data):
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    first_line = bytes(data).decode('utf-8', 'replace').splitlines()
+    return bool(first_line) and ownership_value_matches(first_line[0])
+
+def u1_serial_rule_marker_matches(first_line):
+    prefix = '# Managed by '
+    suffix = ' - ' + U1_SERIAL_RULE_LABEL
+    if not first_line.startswith(prefix) or not first_line.endswith(suffix):
+        return False
+    return ownership_value_matches(first_line[len(prefix):-len(suffix)])
+
 def managed_boot_hook(path):
     if not os.path.lexists(path):
         return False
@@ -615,7 +675,7 @@ def managed_boot_hook(path):
         data, _info = read_regular(path, MAX_FILE)
     except (OSError, UninstallError):
         return False
-    return b'Managed by BMCU-Klipper 1.0.0' in data[:1024]
+    return MANAGED_HEADER_RE.search(data[:1024]) is not None
 
 def systemd_unit_name(service):
     name = str((service or {}).get('name') or 'klipper')
@@ -739,7 +799,8 @@ def managed_u1_serial_rule(data):
         text = bytes(data).decode('utf-8')
     except UnicodeDecodeError:
         return False
-    return (text.startswith(U1_SERIAL_RULE_MARKER + '\n') and
+    first_line = text.splitlines()[0] if text.splitlines() else ''
+    return (u1_serial_rule_marker_matches(first_line) and
             'MODE="0660"' in text and
             (('KERNEL=="ttyUSB*"' in text and 'KERNEL=="ttyCH343USB*"' in text) or
              ('ATTRS{idVendor}=="%s"' % U1_SERIAL_VENDOR in text and
@@ -867,7 +928,7 @@ def u1_integration_snapshot(platform_id, primary_boot_hook=None):
                 'Snapmaker U1 runner directory contains unexpected files')
         marker_data, marker_info = read_regular(U1_RUNNER_MARKER, MAX_JSON)
         runner_data, runner_info = read_regular(U1_RUNNER, MAX_FILE)
-        if marker_data.decode('utf-8', 'replace').strip() != 'BMCU-Klipper 1.0.0':
+        if not ownership_marker_matches(marker_data):
             raise UninstallError('Snapmaker U1 runner directory is not BMCU-owned')
         if (marker_info.st_uid != 0 or marker_info.st_gid != 0 or
                 runner_info.st_uid != 0 or runner_info.st_gid != 0 or
@@ -1227,7 +1288,7 @@ def add_bmcu_include(original, config_dir, bmcu_dir):
     return cleaned[:index] + block + cleaned[index:]
 
 def parser():
-    value = argparse.ArgumentParser(prog='BMCU-Klipper-1.0.0 uninstaller')
+    value = argparse.ArgumentParser(prog='BMCU-Klipper uninstaller')
     value.add_argument('--klipper-dir', default='')
     value.add_argument('--config-dir', default='')
     value.add_argument('--printer-cfg', default='')
@@ -1278,11 +1339,11 @@ def validate_metadata(metadata, config_dir, printer_cfg, klipper_dir, service=No
     if metadata is None:
         return
     product = metadata.get('product')
-    version = metadata.get('version')
     if product not in (None, PRODUCT):
         raise UninstallError('installation metadata belongs to another product')
-    if version not in (None, VERSION):
-        raise UninstallError('installation metadata belongs to another version')
+    schema = metadata.get('schema')
+    if schema not in (None, 1):
+        raise UninstallError('installation metadata uses an unsupported schema')
     for key, detected in (
         ('config_dir', config_dir),
         ('printer_cfg', printer_cfg),
@@ -1346,14 +1407,14 @@ def validate_ownership(bmcu_dir, runtime, metadata):
         if not os.path.lexists(marker):
             continue
         data, _info = read_regular(marker, MAX_JSON)
-        if data.decode('utf-8', 'replace').strip() != 'BMCU-Klipper 1.0.0':
+        if not ownership_marker_matches(data):
             raise UninstallError('unexpected BMCU ownership marker: %s' % marker)
         owned = True
     if metadata is not None:
         owned = True
     if not owned:
         raise UninstallError(
-            'BMCU directory has no BMCU-Klipper 1.0.0 ownership marker')
+            'BMCU directory has no BMCU-Klipper ownership marker')
 
 def module_snapshot(klipper_dir, bmcu_dir):
     extras = os.path.join(klipper_dir, 'klippy', 'extras')
@@ -1475,7 +1536,7 @@ def managed_uninstall_backup(path):
         bmcu_info = os.lstat(bmcu)
     except (OSError, UninstallError):
         return False
-    if not marker_data.startswith(UNINSTALL_MARKER.encode('utf-8')):
+    if not uninstall_backup_marker_matches(marker_data):
         return False
     if marker_info.st_uid != 0 or stat.S_IMODE(marker_info.st_mode) & 0o022:
         return False
@@ -1539,7 +1600,7 @@ def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
         u1_snapshot.get('runner_present')))
     if not (cleaned_cfg != original_cfg or has_links or state_exists or
             has_boot_hook or has_u1):
-        print('BMCU-Klipper 1.0.0 is already removed; nothing to do.')
+        print('BMCU-Klipper %s is already removed; nothing to do.' % VERSION)
         return 0
 
     host_state = 'unavailable'
@@ -1607,7 +1668,7 @@ def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
         pids = wait_single_klippy(klipper_dir, printer_cfg)
         if len(pids) != 1:
             raise UninstallError('expected one Klipper process after cleanup, found %d' % len(pids))
-        print('BMCU-Klipper 1.0.0 residual host state removed safely.')
+        print('BMCU-Klipper %s residual host state removed safely.' % VERSION)
         print('Removed printer.cfg references: %d' % removed_references)
         print('Removed Klipper module links: %d' % len(removed_links))
         return 0
@@ -1827,6 +1888,8 @@ def main():
 
     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     snapshot = load_release_snapshot(package)
+    global VERSION
+    VERSION = release_versions_from_snapshot(snapshot)['package']
     platform = load_package_module('bmcu_platform', snapshot, package)
     moonraker_gcode = load_package_module('moonraker_gcode', snapshot, package)
     print('Package integrity: %d files verified' % (len(snapshot) - 1))
@@ -2033,7 +2096,8 @@ def main():
         assert_directory_identity(backup_bmcu, backup_bmcu_identity)
         marker_path = os.path.join(backup, 'UNINSTALL.txt')
         marker_text = (
-            UNINSTALL_MARKER +
+            UNINSTALL_BACKUP_MARKER +
+            'Package version: %s\n' % VERSION +
             'Removed printer.cfg references: %d\n' % removed_references +
             'Removed Klipper module links: %d\n' % len(removed_links) +
             'Removed BMCU boot repair hook: %s\n' %
@@ -2077,7 +2141,7 @@ def main():
             pruned_backups = []
             cleanup_warning = str(exc)
 
-        print('BMCU-Klipper 1.0.0 removed safely.')
+        print('BMCU-Klipper %s removed safely.' % VERSION)
         if marker_removed:
             print('Removed package-created Snapmaker persistence marker: %s' %
                   U1_PERSISTENCE_MARKER)
