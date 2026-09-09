@@ -189,11 +189,13 @@ class Link:
         if hello['channels'] != 4:
             raise RuntimeError('unsupported BMCU channel count %s' % hello['channels'])
         if (hello['protocol'] != protocol.PROTO_VERSION or
-                tuple(hello.get('firmware_tuple', (0, 0, 0))) !=
-                protocol.REQUIRED_FIRMWARE):
+                not protocol.firmware_is_compatible(
+                    hello.get('firmware_tuple', (0, 0, 0)))):
             raise RuntimeError(
-                'BMCU firmware does not match host %s; flash bundled firmware %s' %
-                (protocol.REQUIRED_FIRMWARE_TEXT,
+                'BMCU firmware is outside the supported %s..%s range; '
+                'flash bundled firmware %s' %
+                ('.'.join(str(part) for part in protocol.MIN_COMPATIBLE_FIRMWARE),
+                 protocol.REQUIRED_FIRMWARE_TEXT,
                  protocol.REQUIRED_FIRMWARE_TEXT))
         self.request(
             protocol.MSG_SESSION_CONFIRM,

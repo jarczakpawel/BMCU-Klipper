@@ -1303,13 +1303,12 @@ class AutoRefillController(object):
         op_id, arrival_policy = manager._start_endpoint_arrival_operation(
             device, channel, endpoint, maximum_mm, contact_pct, timeout_s)
         if arrival_policy.get('sensor_authoritative'):
-            arrival = manager._wait_u1_distance_bound_sendout(
+            arrival = manager._wait_sensor_arrival(
                 device, channel, endpoint, op_id, arrival_policy,
                 maximum_mm)
         else:
             arrival = manager._wait_feed_operation(
-                device, op_id, timeout_s + 2.0, endpoint, 'entry_sensor',
-                motion_latch=arrival_policy.get('motion_latch'))
+                device, op_id, timeout_s + 2.0, endpoint, 'entry_sensor')
         arrival = manager._resolve_endpoint_arrival_result(
             device, channel, endpoint, arrival, arrival_policy,
             timeout_s, allow_partial=False)
@@ -1393,8 +1392,7 @@ class AutoRefillController(object):
                 coil_capture_delta=signal_delta)
         if manager._u1_has_authoritative_entry_sensor(endpoint):
             capture_moved = 0.0
-            if not (arrival.get('sensor_triggered') or
-                    arrival.get('controller_contact')):
+            if not arrival.get('sensor_triggered'):
                 raise RefillError(
                     'replacement CAPTURE lacks prior Snapmaker arrival evidence')
         else:
@@ -1521,20 +1519,18 @@ class AutoRefillController(object):
             'contact_timeout', manager.contact_timeout) or manager.contact_timeout)
         timeout_s = self._effective_feed_timeout(
             device, maximum_mm, timeout_s)
-        if (not manager._u1_has_authoritative_entry_sensor(endpoint) and
-                endpoint.sensor_detected('entry_sensor') is True):
+        if endpoint.sensor_detected('entry_sensor') is True:
             raise RefillError(
                 'target endpoint %s already contains filament' % endpoint.name)
         op_id, arrival_policy = manager._start_endpoint_arrival_operation(
             device, channel, endpoint, maximum_mm, contact_pct, timeout_s)
         if arrival_policy.get('sensor_authoritative'):
-            arrival = manager._wait_u1_distance_bound_sendout(
+            arrival = manager._wait_sensor_arrival(
                 device, channel, endpoint, op_id, arrival_policy,
                 maximum_mm)
         else:
             arrival = manager._wait_feed_operation(
-                device, op_id, timeout_s + 2.0, endpoint, 'entry_sensor',
-                motion_latch=arrival_policy.get('motion_latch'))
+                device, op_id, timeout_s + 2.0, endpoint, 'entry_sensor')
         arrival = manager._resolve_endpoint_arrival_result(
             device, channel, endpoint, arrival, arrival_policy,
             timeout_s, allow_partial=False)
@@ -1592,8 +1588,7 @@ class AutoRefillController(object):
                 coil_bite_delta=signal_delta,
                 coil_after_bite=signal_end)
             arrival_confirmed = bool(
-                arrival.get('sensor_triggered') or
-                arrival.get('controller_contact'))
+                arrival.get('sensor_triggered'))
             bite_evidence = {
                 'attempt': 1,
                 'confirmation': 'u1_arrival_and_firmware_pressure',
@@ -1664,8 +1659,7 @@ class AutoRefillController(object):
                 coil_capture_delta=signal_delta)
         if manager._u1_has_authoritative_entry_sensor(endpoint):
             capture_moved = 0.0
-            if (not (arrival.get('sensor_triggered') or
-                     arrival.get('controller_contact')) or
+            if (not arrival.get('sensor_triggered') or
                     not isinstance(u1_pressure_evidence, dict)):
                 raise RefillError(
                     'replacement CAPTURE lacks prior Snapmaker arrival and '

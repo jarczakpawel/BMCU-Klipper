@@ -25,8 +25,13 @@ DEFAULT_BAUD = 115200
 MIN_BAUD = 9600
 MAX_BAUD = 2000000
 BMCU_CHANNELS = 4
-PROTO_VERSION = 1
-REQUIRED_FIRMWARE = (1, 0, 0)
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXTRAS = os.path.join(ROOT, 'klippy', 'extras')
+if EXTRAS not in sys.path:
+    sys.path.insert(0, EXTRAS)
+from bmcu_core import protocol as bmcu_protocol
+
+PROTO_VERSION = bmcu_protocol.PROTO_VERSION
 UID_HEX_LEN = 24
 HELLO_ACK = struct.Struct('<12sBBBBIIBB')
 
@@ -122,7 +127,7 @@ def parse_hello_identity(payload):
         return None
     uid, major, minor, patch, proto, _caps, session, channels, _profile = HELLO_ACK.unpack(payload)
     if (uid in (b'\x00' * 12, b'\xff' * 12) or
-            (major, minor, patch) != REQUIRED_FIRMWARE or
+            not bmcu_protocol.firmware_is_compatible((major, minor, patch)) or
             proto != PROTO_VERSION or session == 0 or
             channels != BMCU_CHANNELS):
         return None

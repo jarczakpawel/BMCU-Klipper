@@ -6,6 +6,18 @@ import struct
 from .release import REQUIRED_FIRMWARE, REQUIRED_FIRMWARE_TEXT
 
 PROTO_VERSION = 1
+MIN_COMPATIBLE_FIRMWARE = (1, 0, 0)
+
+
+def firmware_is_compatible(value):
+    try:
+        firmware = tuple(int(part) for part in value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        len(firmware) == 3 and
+        firmware[:2] == REQUIRED_FIRMWARE[:2] and
+        MIN_COMPATIBLE_FIRMWARE <= firmware <= REQUIRED_FIRMWARE)
 
 MSG_HELLO = 0x01
 MSG_PING = 0x02

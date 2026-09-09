@@ -198,6 +198,7 @@ def log_candidates(bmcu_dir, printer_data, moonraker):
         for name in names:
             if re.fullmatch(r'bmcu-transport-[A-Za-z0-9_.-]+\.log', name):
                 add(name[:-4], os.path.join(directory, name))
+    add('bmcu-update', os.path.join(bmcu_dir, 'update', 'last-update.jsonl'))
     return result
 
 

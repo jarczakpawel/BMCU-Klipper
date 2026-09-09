@@ -79,6 +79,7 @@ class TransportDaemon(object):
         self.internal_cmd = _INTERNAL_BASE
         self.internal_pending = {}
         self.session_id = 0
+        self.runtime_uid = ''
         self.session_ready = False
         self.hello_sent = False
         self.handshake_phase = 'idle'
@@ -190,17 +191,12 @@ class TransportDaemon(object):
             int(auto_cal.get('state', 0) or 0),
         )
 
-    def _write_status_file(self, force=False):
-        path = self.args.status_file
-        if not path:
-            return
-        now = time.monotonic()
-        if not force and now < self.status_file_due:
-            return
-        self.status_file_due = now + 0.50
-        value = {
+    def _transport_status(self):
+        return {
             'schema': 1, 'name': self.args.name, 'pid': os.getpid(),
             'online': bool(self.session_ready),
+            'serial_released': bool(self.serial_released),
+            'uid': self.runtime_uid,
             'serial_open': bool(self.serial is not None),
             'port': self.current_port or self.last_good_port or self.args.port,
             'expected_uid': self.args.expected_uid,
@@ -209,6 +205,16 @@ class TransportDaemon(object):
             'updated_at': time.time(),
             'status': self.latest_status_dict,
         }
+
+    def _write_status_file(self, force=False):
+        path = self.args.status_file
+        if not path:
+            return
+        now = time.monotonic()
+        if not force and now < self.status_file_due:
+            return
+        self.status_file_due = now + 0.50
+        value = self._transport_status()
         temporary = '%s.%d.tmp' % (path, os.getpid())
         try:
             with open(temporary, 'w') as stream:
@@ -267,17 +273,22 @@ class TransportDaemon(object):
                 self._queue_reliable(frame)
 
             return
+        self._append_client_frame(frame)
+
+    def _append_client_frame(self, frame):
+        if frame[4] == transport.OP_PACKET:
+            frame = bytearray(frame)
+            struct.pack_into('<I', frame, 9, self.client_seq)
+            self.client_seq = (self.client_seq + 1) & 0xffffffff
+            if self.client_seq == 0:
+                self.client_seq = 1
         self.client_tx.extend(frame)
 
     def _queue_packet_client(self, msg_type, seq, cmd_id, payload,
                              reliable=False, urgent=False, control=False):
 
-        client_seq = self.client_seq
-        self.client_seq = (self.client_seq + 1) & 0xffffffff
-        if self.client_seq == 0:
-            self.client_seq = 1
         self._queue_client(
-            transport.OP_PACKET, msg_type, client_seq, cmd_id, payload,
+            transport.OP_PACKET, msg_type, 0, cmd_id, payload,
             reliable=reliable, urgent=urgent, control=control)
 
     def _queue_link(self, online, error=''):
@@ -294,7 +305,7 @@ class TransportDaemon(object):
             frame = self.reliable[0]
             if len(self.client_tx) + len(frame) > _MAX_CLIENT_TX:
                 break
-            self.client_tx.extend(frame)
+            self._append_client_frame(frame)
             self.reliable.popleft()
         if include_status and self.latest_status is not None:
             msg_type, seq, cmd_id, payload = self.latest_status
@@ -558,6 +569,7 @@ class TransportDaemon(object):
         self.internal_pending.clear()
         self.external_pending.clear()
         self.operation_wire_by_client.clear()
+        self.reliable.clear()
         self.session_ready = False
         self.hello_sent = False
         self.handshake_phase = 'idle'
@@ -566,6 +578,7 @@ class TransportDaemon(object):
         self.heartbeat_cmd = 0
         self.heartbeat_sent_at = 0.0
         self.session_id = 0
+        self.runtime_uid = ''
         self.latest_hello = None
         self.latest_status = None
         self.latest_snapshot = None
@@ -601,6 +614,7 @@ class TransportDaemon(object):
             self.last_good_port = self.current_port
         self.heartbeat_cmd = 0
         self.heartbeat_sent_at = 0.0
+        self._queue_internal(protocol.MSG_UPDATE_CANCEL, b'', 'resume_update')
         self._queue_internal(protocol.MSG_GET_SNAPSHOT, b'', 'snapshot')
         self._queue_link(True)
         self._write_status_file(force=True)
@@ -727,6 +741,7 @@ class TransportDaemon(object):
             self._queue_link(
                 self.session_ready, '' if self.session_ready else
                 'BMCU transport is connecting')
+            self._flush_reliable(include_status=False)
             return
         if command == transport.CTRL_RESUME:
             self.client_paused = False
@@ -759,6 +774,7 @@ class TransportDaemon(object):
                 raise RuntimeError('UID mismatch expected=%s got=%s' %
                                    (self.args.expected_uid, hello['uid']))
             self.latest_hello = payload
+            self.runtime_uid = hello['uid']
             self.session_id = int(hello['session_id'])
             self.internal_pending.pop(cmd_id, None)
             for pending_cmd, pending_purpose in list(self.internal_pending.items()):
@@ -783,6 +799,15 @@ class TransportDaemon(object):
             return
         if purpose == 'orphan_abort' and msg_type in (
                 protocol.MSG_ACK, protocol.MSG_ERROR):
+            self.internal_pending.pop(cmd_id, None)
+            return
+        if purpose == 'resume_update' and msg_type in (
+                protocol.MSG_ACK, protocol.MSG_ERROR):
+            if msg_type != protocol.MSG_ACK or len(payload) != 7:
+                raise RuntimeError('could not leave firmware-update mode after reconnect')
+            echo, ok, error = struct.unpack('<IBH', payload)
+            if echo != cmd_id or not ok:
+                raise RuntimeError('firmware-update cancellation failed error=%d' % error)
             self.internal_pending.pop(cmd_id, None)
             return
         if purpose == 'snapshot' and msg_type == protocol.MSG_SNAPSHOT:
@@ -1037,7 +1062,14 @@ class TransportDaemon(object):
                         if item is self.listener:
                             self._accept_client()
                         elif item is self.control:
-                            self._handle_control(self.control.recv(64))
+                            data, address = self.control.recvfrom(64)
+                            self._handle_control(data)
+                            if address:
+                                reply = self._transport_status()
+                                reply.pop('status', None)
+                                reply['control'] = data[:1].decode('ascii')
+                                self.control.sendto(json.dumps(
+                                    reply, separators=(',', ':')).encode('utf-8'), address)
                         elif item is self.client:
                             self._read_client()
                         else:

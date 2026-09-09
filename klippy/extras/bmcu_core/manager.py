@@ -4,6 +4,7 @@ import binascii
 import copy
 import errno
 import hashlib
+import greenlet
 import json
 import logging
 import math
@@ -15,7 +16,7 @@ import tempfile
 from collections import deque
 from contextlib import contextmanager
 
-from . import compat, protocol, presets
+from . import compat, protocol, presets, transport
 from .release import PACKAGE_VERSION
 from .device import BMCUDevice
 from .endpoints import (create_endpoint, normalize_u1_material_name,
@@ -132,7 +133,7 @@ class BMCUManager(object):
         self.transport_retry_interval = finite_config_float(
             'transport_retry_interval', 5.00, minval=0.10, maxval=10.0)
         self.required_runtime_sync_timeout = finite_config_float(
-            'required_runtime_sync_timeout', 15.0, minval=2.0, maxval=60.0)
+            'required_runtime_sync_timeout', 30.0, minval=2.0, maxval=60.0)
         self.tx_queue_limit = config.getint('tx_queue_limit', 4096, minval=512, maxval=262144)
         if self.heartbeat_interval >= self.connection_timeout:
             raise config.error('heartbeat_interval must be lower than connection_timeout')
@@ -235,6 +236,7 @@ class BMCUManager(object):
         self.active_operations = {}
 
         self._required_transport_users = 0
+        self._control_plane_requests = 0
 
         self.loaded_tools = {}
         self.active_tool = -1
@@ -367,6 +369,7 @@ class BMCUManager(object):
 
         self._critical_motion_depth = 0
         self._critical_motion_active = False
+        self._critical_motion_pending = False
         self._critical_motion_started_at = 0.0
         self._critical_motion_entries = 0
         self._critical_motion_total_s = 0.0
@@ -375,6 +378,7 @@ class BMCUManager(object):
         self._critical_motion_release_timer = self.reactor.register_timer(
             self._release_critical_motion, self.reactor.NEVER)
         self._critical_motion_reasons = []
+        self._critical_motion_owners = {}
         self._pending_device_status = {}
         self._status_reconcile_coalesced = 0
         self._background_busy_deferrals = 0
@@ -1633,9 +1637,7 @@ class BMCUManager(object):
                       'explicit U1 cancel with fully reconciled loaded routes')
 
     def _cmd_u1_cancel_wrapper(self, gcmd):
-
-        with self.printer_critical_section('u1_cancel_full_transaction'):
-            return self._cmd_u1_cancel_wrapper_quiesced(gcmd)
+        return self._cmd_u1_cancel_wrapper_quiesced(gcmd)
 
     def _cmd_u1_cancel_wrapper_quiesced(self, gcmd):
         original = self._u1_cancel_original
@@ -1658,11 +1660,12 @@ class BMCUManager(object):
                 if endpoint is not None and endpoint.driver == 'snapmaker_u1':
                     reconcile_endpoints.add(endpoint.name)
         background_error = None
-        if explicit_ui_cancel and self._u1_background_jobs:
+        if self._u1_background_jobs:
             try:
 
                 self._cancel_u1_background_jobs(
-                    'explicit U1 cancel', wait=True)
+                    ('explicit U1 cancel' if explicit_ui_cancel else
+                     'U1 cancel'), wait=True)
             except Exception as exc:
                 background_error = exc
                 self._record_error(
@@ -1712,7 +1715,8 @@ class BMCUManager(object):
         else:
             logging.warning('BMCU skipped automatic U1 cancel unload: %s', reason)
         try:
-            return original(gcmd)
+            with self.printer_critical_section('u1_cancel_stock_transaction'):
+                return original(gcmd)
         finally:
             try:
                 if explicit_ui_cancel:
@@ -1722,41 +1726,90 @@ class BMCUManager(object):
             finally:
                 self._u1_cancel_requested = False
 
+    def _control_plane_request_enter(self):
+        if self._critical_motion_owners.get(greenlet.getcurrent(), 0):
+            raise BMCUError(
+                'BMCU communication was requested inside printer-critical motion')
+        while (self._critical_control_plane_blocked() and
+               not self._klippy_disconnecting):
+            self.reactor.pause(self.reactor.monotonic() + 0.050)
+        if self._klippy_disconnecting:
+            return False
+        self._control_plane_requests += 1
+        return True
+
+    def _control_plane_request_leave(self):
+        self._control_plane_requests = max(
+            0, self._control_plane_requests - 1)
+
+    def _critical_control_plane_blocked(self):
+        return bool(
+            self._critical_motion_pending or
+            self._critical_motion_active or
+            self._critical_motion_depth)
+
+    def _wait_background_control_plane(self, cancel_check=None,
+                                       poll_interval=0.050):
+        cancel_requested = False
+        while self._critical_control_plane_blocked():
+            if callable(cancel_check) and cancel_check():
+                cancel_requested = True
+            if self._klippy_disconnecting:
+                raise BMCUError(
+                    'Klipper disconnected while waiting for printer motion')
+            self.reactor.pause(
+                self.reactor.monotonic() + max(0.010, float(poll_interval)))
+        if callable(cancel_check) and cancel_check():
+            cancel_requested = True
+        return cancel_requested
+
     def _enter_critical_motion(self, reason='printer_motion'):
         reason = str(reason or 'printer_motion')
+        while self._critical_motion_pending and not self._klippy_disconnecting:
+            self.reactor.pause(self.reactor.monotonic() + 0.010)
+        if self._klippy_disconnecting:
+            raise BMCUError('Klipper disconnected before printer motion')
+        if not self._critical_motion_active:
+            self._critical_motion_pending = True
+            try:
+                while self._control_plane_requests and not self._klippy_disconnecting:
+                    self.reactor.pause(self.reactor.monotonic() + 0.010)
+                if self._klippy_disconnecting:
+                    raise BMCUError('Klipper disconnected before printer motion')
+                if isinstance(self._status_cache, dict):
+                    self._critical_status_fallback = self._status_cache
+                self._critical_motion_active = True
+                self._critical_motion_entries += 1
+                self._critical_motion_started_at = self.reactor.monotonic()
+                self.reactor.update_timer(self._deferred_task_timer, self.reactor.NEVER)
+                self.reactor.update_timer(self._timer, self.reactor.NEVER)
+                for device in self.devices:
+                    try:
+                        device.set_reactor_quiesced(True)
+                    except Exception:
+                        self._critical_motion_errors += 1
+                        try:
+                            device.close()
+                        except Exception:
+                            pass
+            except Exception:
+                self._release_critical_motion(self.reactor.monotonic())
+                raise
+            finally:
+                self._critical_motion_pending = False
+        self.reactor.update_timer(self._critical_motion_release_timer, self.reactor.NEVER)
         self._critical_motion_depth += 1
         self._critical_motion_reasons.append(reason)
-        try:
-            self.reactor.update_timer(
-                self._critical_motion_release_timer, self.reactor.NEVER)
-        except Exception:
-            self._critical_motion_errors += 1
-        if self._critical_motion_active:
-            return
-
-        if isinstance(self._status_cache, dict):
-            self._critical_status_fallback = self._status_cache
-        self._critical_motion_active = True
-        self._critical_motion_entries += 1
-        self._critical_motion_started_at = self.reactor.monotonic()
-
-        try:
-            self.reactor.update_timer(
-                self._deferred_task_timer, self.reactor.NEVER)
-            self.reactor.update_timer(self._timer, self.reactor.NEVER)
-        except Exception:
-            self._critical_motion_errors += 1
-        for device in self.devices:
-            try:
-                device.set_reactor_quiesced(True)
-            except Exception:
-                self._critical_motion_errors += 1
-                try:
-                    device.close()
-                except Exception:
-                    pass
+        owner = greenlet.getcurrent()
+        self._critical_motion_owners[owner] = self._critical_motion_owners.get(owner, 0) + 1
 
     def _leave_critical_motion(self, reason='printer_motion'):
+        owner = greenlet.getcurrent()
+        depth = self._critical_motion_owners.get(owner, 0)
+        if depth > 1:
+            self._critical_motion_owners[owner] = depth - 1
+        else:
+            self._critical_motion_owners.pop(owner, None)
         if self._critical_motion_reasons:
             self._critical_motion_reasons.pop()
         if self._critical_motion_depth > 0:
@@ -1872,7 +1925,7 @@ class BMCUManager(object):
             return True
 
     def _printer_background_busy(self, eventtime=None):
-        if self._critical_motion_active or self._klippy_disconnecting:
+        if self._critical_control_plane_blocked() or self._klippy_disconnecting:
             return True
 
         if self._required_transport_users > 0 or self.active_operations:
@@ -2164,6 +2217,9 @@ class BMCUManager(object):
             logging.exception('BMCU could not disable manager timer on disconnect')
         self._critical_motion_active = False
         self._critical_motion_depth = 0
+        self._critical_motion_pending = False
+        self._critical_motion_owners.clear()
+        self._control_plane_requests = 0
         self._u1_lease_callback_scheduled = False
         self._status_cache = None
         self._deferred_tasks.clear()
@@ -2621,7 +2677,10 @@ class BMCUManager(object):
                 'selected_mask': int(auto_cal.get('selected_mask', 0)),
             }
         elif self.active_operations.get(device.name, {}).get('type') == protocol.OP_BUFFER_CALIBRATION:
-            if int(current.get('active_op_type', 0)) != protocol.OP_BUFFER_CALIBRATION:
+            active_op_type = int(current.get('active_op_type', 0))
+            active_op_state = int(current.get('active_op_state', protocol.OP_STATE_IDLE))
+            if (active_op_type != protocol.OP_BUFFER_CALIBRATION or
+                    active_op_state != protocol.OP_STATE_RUNNING):
                 self.active_operations.pop(device.name, None)
                 if device.name in self._calibration_policy_suspended:
                     self._queue_deferred_task(
@@ -3072,7 +3131,9 @@ class BMCUManager(object):
             'deferred_task_overflows': int(self._deferred_task_overflows),
             'deferred_task_depth': len(self._deferred_tasks),
             'critical_motion_active': bool(self._critical_motion_active),
+            'critical_motion_pending': bool(self._critical_motion_pending),
             'critical_motion_depth': int(self._critical_motion_depth),
+            'control_plane_requests': int(self._control_plane_requests),
             'critical_motion_entries': int(self._critical_motion_entries),
             'critical_motion_total_s': float(self._critical_motion_total_s),
             'critical_motion_status_hits': int(
@@ -3461,6 +3522,7 @@ class BMCUManager(object):
                 channels.append(metadata)
             devices.append({
                 'name': device.name, 'uid': device.uid, 'port': device.port,
+                'transport_socket': device.socket_path,
                 'connected': device.connected, 'ready': device.ready,
                 'runtime_configured': device.runtime_configured,
                 'update_suspended': bool(device.suspended),
@@ -7268,11 +7330,9 @@ class BMCUManager(object):
 
         arrival_evidence = (arrival_evidence
                             if isinstance(arrival_evidence, dict) else {})
-        if not bool(arrival_evidence.get('sensor_triggered') or
-                    arrival_evidence.get('controller_contact')):
+        if not arrival_evidence.get('sensor_triggered'):
             raise BMCUError(
-                'U1_LOAD_PRESSURE_NOT_READY: no Head motion or configured '
-                'buffer-contact arrival evidence')
+                'U1_LOAD_PRESSURE_NOT_READY: no Head entry-sensor confirmation')
         try:
             buffer_pct = int(device.status['buffer_pct'][channel])
             motion = int(device.status['motion'][channel])
@@ -7299,38 +7359,39 @@ class BMCUManager(object):
             timeout_s, parked_precharge=False):
 
         timeout_ms = int(float(timeout_s) * 1000.0)
+        sensor_authoritative = bool(
+            endpoint is not None and
+            str(endpoint.get('entry_sensor', '') or '').strip())
+        if (endpoint is not None and endpoint.driver == 'snapmaker_u1' and
+                not sensor_authoritative):
+            raise BMCUError('U1_ENTRY_SENSOR_REQUIRED: configure the Head entry sensor')
         if self._u1_has_authoritative_entry_sensor(endpoint):
             if not parked_precharge:
                 endpoint.verify_selected()
-
-            target_pct = int(contact_pct)
-
-            operation_timeout_ms = timeout_ms if parked_precharge else 300000
-            op_id = device.start_feed_to_contact(
-                channel, maximum_mm, target_pct, operation_timeout_ms)
-            motion_latch = None
-            if not parked_precharge:
-
-                try:
-                    motion_latch = endpoint.arm_entry_motion_latch(
-                        reason='selected-Head SEND_OUT arrival')
-                except Exception as exc:
-                    logging.warning(
-                        'BMCU could not arm read-only U1 Head phase latch on %s; '
-                        'SEND_OUT will use configured contact only: %s',
-                        endpoint.name, exc)
-                    motion_latch = None
+            endpoint.require_entry_sensor_snapshot(timeout=1.25, expected=False)
+        elif sensor_authoritative:
+            if endpoint.sensor_detected('entry_sensor') is not False:
+                raise BMCUError(
+                    'ENTRY_SENSOR_NOT_CLEAR: configured arrival sensor must '
+                    'confirm an empty entry before SEND_OUT')
+        if sensor_authoritative:
+            target_pct = int(contact_pct) if parked_precharge else 98
+            deadline = self.reactor.monotonic() + timeout_s + 2.0
+            start = (device.start_feed_to_contact if parked_precharge
+                     else device.start_feed_distance)
+            op_id = start(
+                channel, maximum_mm, target_pct, timeout_ms)
             return op_id, {
-                'sensor_authoritative': not bool(parked_precharge),
-                'contact_authoritative': not bool(parked_precharge),
-                'motion_latch': motion_latch,
+                'sensor_authoritative': True,
+                'contact_authoritative': False,
                 'precharge_buffer_pct': target_pct,
                 'contact_pct': target_pct,
-                'operation_timeout_ms': operation_timeout_ms,
+                'operation_timeout_ms': timeout_ms,
+                'deadline': deadline,
                 'parked_precharge': bool(parked_precharge),
                 'operation': ('u1_parked_neutral_precharge'
                               if parked_precharge else
-                              'u1_selected_sensor_search'),
+                              'feed_to_endpoint_sensor'),
             }
         op_id = device.start_feed_to_contact(
             channel, maximum_mm, contact_pct, timeout_ms)
@@ -7354,26 +7415,32 @@ class BMCUManager(object):
             return result
 
         result['sensor_authoritative'] = True
-        if result.get('sensor_triggered'):
+        result['controller_contact'] = False
+        if result.get('cancel_requested'):
+            result['ok'] = False
+            return result
+        if result.get('ok') and result.get('sensor_triggered'):
             result.update({
                 'ok': True,
-                'reason': 'endpoint_motion',
+                'reason': 'endpoint_sensor',
                 'sensor_triggered': True,
             })
             return result
 
         reason = str(result.get('reason', '') or '')
-        if result.get('cancel_requested'):
-            return result
         if (reason == 'aborted' and
                 result.get('foreground_handoff_requested')):
             return result
-        if reason != 'contact':
+        parked_precharge = bool(policy.get('parked_precharge'))
+        if not (allow_partial and parked_precharge and reason == 'contact'):
+            result['ok'] = False
+            if reason in ('target', 'contact', 'none'):
+                result['reason'] = 'entry_sensor_not_triggered'
             return result
-        snapshot = endpoint.entry_sensor_snapshot()
         if (not result.get('ok') or
                 int(result.get('state', -1)) != protocol.OP_STATE_DONE or
                 int(result.get('channel', -1)) != int(channel)):
+            result['ok'] = False
             return result
 
         device.set_motion(channel, protocol.MOTION_IDLE)
@@ -7400,45 +7467,46 @@ class BMCUManager(object):
                 (int(present), int(connected), int(encoder_ok), motion,
                  buffer_pct, controller_faults, int(nvm_fault), route_state))
 
-        parked_precharge = bool(
-            isinstance(policy, dict) and policy.get('parked_precharge'))
-        if allow_partial and parked_precharge:
-            precharge_pct = int(policy.get(
-                'precharge_buffer_pct', buffer_pct))
-            result.update({
-                'ok': True,
-                'reason': 'sensor_precharge_neutral',
-                'sensor_precharge_hold': False,
-                'sensor_precharge_neutral': True,
-                'partial': True,
-                'precharge_buffer_pct': precharge_pct,
-                'observed_buffer_pct': buffer_pct,
-                'target_selected_at_precharge': False,
-            })
-            logging.info(
-                'BMCU Snapmaker %s parked precharge ended neutral IDLE at '
-                '%d%%; selected Head will start a separate read-only-sensor '
-                'plus configured-contact SEND_OUT', endpoint.name, buffer_pct)
-            return result
-
+        precharge_pct = int(policy.get('precharge_buffer_pct', buffer_pct))
         result.update({
             'ok': True,
-            'reason': 'u1_configured_buffer_contact',
-            'sensor_triggered': False,
-            'controller_contact': True,
+            'reason': 'sensor_precharge_neutral',
+            'sensor_precharge_hold': False,
+            'sensor_precharge_neutral': True,
+            'partial': True,
+            'precharge_buffer_pct': precharge_pct,
             'observed_buffer_pct': buffer_pct,
-            'sensor_snapshot': snapshot,
+            'target_selected_at_precharge': False,
         })
         logging.info(
-            'BMCU Snapmaker %s selected-Head SEND_OUT reached configured '
-            'buffer contact at %d%%; continuing to BEFORE_ON_USE',
+            'BMCU Snapmaker %s parked precharge ended neutral IDLE at '
+            '%d%%; selected Head will continue to its entry sensor',
             endpoint.name, buffer_pct)
         return result
 
-    def _wait_unload_buffer_ready(self, device, channel, timeout=4.0):
+    def _wait_unload_buffer_ready(self, device, channel, timeout=4.0,
+                                  pause_for_critical=False,
+                                  cancel_check=None):
         deadline = self.reactor.monotonic() + max(0.5, float(timeout))
         next_poll = 0.0
         while True:
+            cancel_requested = bool(
+                callable(cancel_check) and cancel_check())
+            if (pause_for_critical and
+                    self._critical_control_plane_blocked()):
+                before = self.reactor.monotonic()
+                cancel_requested = bool(
+                    self._wait_background_control_plane(
+                        cancel_check=cancel_check) or cancel_requested)
+                deadline += max(
+                    0.0, self.reactor.monotonic() - before)
+            if cancel_requested:
+                try:
+                    device.stop_all()
+                except Exception:
+                    pass
+                raise BMCUError(
+                    'UNLOAD_BUFFER_CANCELLED: operation was cancelled')
             if not device.connected:
                 raise BMCUError('DEVICE_OFFLINE during unload release')
             buffer_pct = int(device.status['buffer_pct'][channel])
@@ -7481,19 +7549,27 @@ class BMCUManager(object):
                 raise BMCUError('PULLBACK_METER_INVALID: start position is invalid')
             if not math.isfinite(start_m):
                 raise BMCUError('PULLBACK_METER_INVALID: start position is not finite')
+        if pause_for_critical:
+            self._wait_background_control_plane(cancel_check=cancel_check)
+        device.refresh()
         while True:
-            if callable(cancel_check) and cancel_check():
+            cancel_requested = bool(
+                callable(cancel_check) and cancel_check())
+            if (pause_for_critical and
+                    self._critical_control_plane_blocked()):
+                before = self.reactor.monotonic()
+                cancel_requested = bool(
+                    self._wait_background_control_plane(
+                        cancel_check=cancel_check,
+                        poll_interval=poll_interval) or cancel_requested)
+                deadline += max(
+                    0.0, self.reactor.monotonic() - before)
+            if cancel_requested:
                 try:
                     device.stop_all()
                 except Exception:
                     pass
                 raise BMCUError('PULLBACK_CANCELLED: operation was cancelled')
-            if pause_for_critical and self._critical_motion_active:
-                before = self.reactor.monotonic()
-                self.reactor.pause(before + poll_interval)
-                deadline += max(
-                    0.0, self.reactor.monotonic() - before)
-                continue
             if not device.connected:
                 raise BMCUError('DEVICE_OFFLINE during BMCU pullback')
             motion = int(device.status['motion'][channel])
@@ -7562,7 +7638,7 @@ class BMCUManager(object):
     def _wait_feed_operation(self, device, op_id, timeout, endpoint=None,
                              sensor_role='', poll_interval=None,
                              pause_for_critical=False,
-                             interrupt_check=None, motion_latch=None):
+                             interrupt_check=None, cancel_check=None):
         if poll_interval is None:
             poll_interval = (0.100 if endpoint is not None and sensor_role
                              else 0.250)
@@ -7594,13 +7670,23 @@ class BMCUManager(object):
                 result['reason'] = 'cancelled'
             return result
 
-        while (deadline is None or self.reactor.monotonic() < deadline):
-            if self._u1_cancel_requested and not cancel_requested:
+        while True:
+            if (self._u1_cancel_requested or
+                    (callable(cancel_check) and cancel_check())):
                 cancel_requested = True
-                completed_result = (
-                    device.last_op
-                    if device.last_op and device.last_op.get('op_id') == op_id
-                    else None)
+            if (pause_for_critical and
+                    self._critical_control_plane_blocked()):
+                before = self.reactor.monotonic()
+                if self._wait_background_control_plane(
+                        cancel_check=lambda: bool(
+                            self._u1_cancel_requested or
+                            (callable(cancel_check) and cancel_check())),
+                        poll_interval=poll_interval):
+                    cancel_requested = True
+                if deadline is not None:
+                    deadline += max(
+                        0.0, self.reactor.monotonic() - before)
+            if cancel_requested:
                 if device.connected:
                     try:
                         device.abort_operation()
@@ -7611,6 +7697,10 @@ class BMCUManager(object):
                             logging.exception(
                                 'BMCU could not stop SEND_OUT after U1 UI cancel')
 
+                completed_result = (
+                    device.last_op
+                    if device.last_op and device.last_op.get('op_id') == op_id
+                    else None)
                 return finish(completed_result or {
                     'op_id': int(op_id),
                     'state': protocol.OP_STATE_ABORTED,
@@ -7618,12 +7708,6 @@ class BMCUManager(object):
                     'reason': 'cancelled',
                     'measured_mm': 0.0,
                 })
-            if pause_for_critical and self._critical_motion_active:
-                before = self.reactor.monotonic()
-                self.reactor.pause(before + poll_interval)
-                if deadline is not None:
-                    deadline += max(0.0, self.reactor.monotonic() - before)
-                continue
             completed_result = (
                 device.last_op
                 if device.last_op and device.last_op.get('op_id') == op_id
@@ -7637,19 +7721,11 @@ class BMCUManager(object):
                 if (endpoint.driver == 'snapmaker_u1' and
                         sensor_role in ('entry_sensor', 'motion_sensor')):
 
-                    if motion_latch is None:
-                        snapshot = None
-                        detected = False
-                    elif hasattr(endpoint, 'entry_motion_latch_status'):
-                        snapshot = endpoint.entry_motion_latch_status(
-                            motion_latch)
-                    else:
-                        raise BMCUError(
-                            'U1 motion-latch API is unavailable during SEND_OUT')
-                    if snapshot is not None and not snapshot.get('available'):
-                        detected = False
-                    elif snapshot is not None:
-                        detected = bool(snapshot.get('triggered'))
+                    snapshot = endpoint.entry_sensor_snapshot()
+                    detected = bool(
+                        snapshot.get('available') and
+                        snapshot.get('coherent') and
+                        snapshot.get('physical_detected') is True)
                 else:
                     detected = endpoint.sensor_detected(sensor_role) is True
 
@@ -7657,17 +7733,20 @@ class BMCUManager(object):
 
                 sensor_triggered = True
                 if (endpoint is not None and
-                        endpoint.driver == 'snapmaker_u1' and
-                        motion_latch is not None):
+                        endpoint.driver == 'snapmaker_u1'):
                     motion_evidence = dict(snapshot)
                 try:
                     device.abort_operation()
                 except Exception:
 
                     pass
+                if device.last_op and device.last_op.get('op_id') == op_id:
+                    completed_result = device.last_op
 
             if completed_result is not None:
                 return finish(completed_result)
+            if deadline is not None and now >= deadline:
+                break
 
             if (not sensor_triggered and not interrupted and
                     callable(interrupt_check)):
@@ -7700,86 +7779,22 @@ class BMCUManager(object):
             pass
         raise BMCUError('feed operation %d timed out' % op_id)
 
-    def _wait_u1_distance_bound_sendout(
+    def _wait_sensor_arrival(
             self, device, channel, endpoint, op_id, arrival_policy,
             maximum_mm, poll_interval=0.250, pause_for_critical=False,
-            interrupt_check=None):
+            interrupt_check=None, cancel_check=None):
 
-        try:
-            distance_limit = max(5.0, min(5000.0, float(maximum_mm)))
-        except (TypeError, ValueError, OverflowError):
-            distance_limit = 5000.0
-        policy = arrival_policy if isinstance(arrival_policy, dict) else {}
-        motion_latch = policy.get('motion_latch')
-        contact_pct = int(policy.get(
-            'contact_pct', self.contact_buffer_pct) or
-            self.contact_buffer_pct)
-        contact_pct = max(55, min(98, contact_pct))
-        total_mm = 0.0
-        segment_count = 0
-        current_op = int(op_id)
-
-        while True:
-            segment_count += 1
-            result = self._wait_feed_operation(
-                device, current_op, None, endpoint, 'entry_sensor',
-                poll_interval=poll_interval,
-                pause_for_critical=pause_for_critical,
-                interrupt_check=interrupt_check,
-                motion_latch=motion_latch)
-            result = dict(result or {})
-            try:
-                segment_mm = max(0.0, float(
-                    result.get('measured_mm', 0.0) or 0.0))
-            except (TypeError, ValueError, OverflowError):
-                segment_mm = 0.0
-            if not math.isfinite(segment_mm):
-                segment_mm = 0.0
-            total_mm = min(distance_limit, total_mm + segment_mm)
-            result['segment_measured_mm'] = segment_mm
-            result['measured_mm'] = total_mm
-            result['distance_limit_mm'] = distance_limit
-            result['segment_count'] = segment_count
-
-            if result.get('sensor_triggered'):
-                return result
-            if result.get('cancel_requested'):
-                return result
-            if result.get('foreground_handoff_requested'):
-                return result
-
-            reason = str(result.get('reason', '') or '')
-            if reason != 'timeout':
-                if total_mm >= distance_limit - 0.5 and not result.get('ok'):
-                    result['reason'] = 'distance_limit'
-                return result
-
-            remaining_mm = max(0.0, distance_limit - total_mm)
-            if remaining_mm <= 0.5:
-                result.update({'ok': False, 'reason': 'distance_limit'})
-                return result
-
-            if segment_mm <= 0.5:
-                result.update({'ok': False, 'reason': 'motion_stopped'})
-                return result
-
-            if motion_latch is not None:
-                snapshot = endpoint.entry_motion_latch_status(motion_latch)
-                if snapshot.get('triggered'):
-                    result.update({
-                        'ok': True,
-                        'reason': 'endpoint_sensor',
-                        'sensor_triggered': True,
-                        'motion_evidence': copy.deepcopy(snapshot),
-                    })
-                    return result
-
-            logging.info(
-                'BMCU continuing U1 SEND_OUT after firmware segment timeout: '
-                '%.1f/%.1f mm complete, %.1f mm remaining',
-                total_mm, distance_limit, remaining_mm)
-            current_op = device.start_feed_to_contact(
-                channel, remaining_mm, contact_pct, 300000)
+        timeout = max(0.0, float(arrival_policy['deadline']) -
+                      self.reactor.monotonic())
+        result = self._wait_feed_operation(
+            device, op_id, timeout, endpoint, 'entry_sensor',
+            poll_interval=poll_interval,
+            pause_for_critical=pause_for_critical,
+            interrupt_check=interrupt_check, cancel_check=cancel_check)
+        result = dict(result or {})
+        result['distance_limit_mm'] = float(maximum_mm)
+        result['segment_count'] = 1
+        return result
 
     def _record_error(self, code, device='', channel=-1, endpoint='', phase='', details='', evidence=None):
         self.last_error = {
@@ -8008,13 +8023,24 @@ class BMCUManager(object):
                 pending.get('phase', 'unknown'))
 
     def _stop_on_failure(self, device, endpoint, exc, phase, channel,
-                         pause_print=True, restore_sensors=True):
+                         pause_print=True, restore_sensors=True,
+                         wait_for_control_plane=False):
         preserve_hold = bool(getattr(exc, 'preserve_bmcu_hold', False))
         if not preserve_hold:
+            if (wait_for_control_plane and
+                    self._critical_control_plane_blocked()):
+                try:
+                    self._wait_background_control_plane(
+                        poll_interval=self._u1_background_poll_interval)
+                except Exception:
+                    logging.exception(
+                        'BMCU could not wait for printer motion before failure stop')
             try:
                 device.stop_all()
             except Exception:
-                pass
+                logging.exception(
+                    'BMCU could not stop %s after failure during %s',
+                    device.name, phase)
         else:
             logging.error(
                 'BMCU preserving firmware-local BEFORE_ON_USE pressure hold '
@@ -8594,22 +8620,29 @@ class BMCUManager(object):
         return None
 
     def _u1_background_controller_conflict(self, device_names, after_index,
-                                           before_index):
+                                           before_index, path_groups=()):
 
         names = set(str(name) for name in device_names if name)
-        if not names:
+        groups = set(path_groups)
+        if not names and not groups:
             return None
         start = max(0, int(after_index) + 1)
         stop = min(len(self._u1_toolchange_plan), int(before_index))
         for index in range(start, stop):
             tool = int(self._u1_toolchange_plan[index].get('tool', -1))
             route = self._u1_logical_route(tool)
-            if route is None or route.get('kind') != 'bmcu':
+            if route is None:
                 continue
             device = route.get('device')
-            if device is not None and device.name in names:
+            endpoint = route.get('endpoint')
+            if ((device is not None and device.name in names) or
+                    (endpoint is not None and
+                     endpoint.shared_path_group() in groups)):
                 return {'index': index, 'tool': tool,
-                        'device': device.name}
+                        'device': device.name if device is not None else 'native',
+                        'shared_path_group': (
+                            endpoint.shared_path_group() if endpoint is not None
+                            else '')}
         return None
 
     def _set_u1_background_phase(self, job, phase):
@@ -8648,11 +8681,16 @@ class BMCUManager(object):
         job['locked'] = False
 
     def _clear_ready_u1_background_job(self, endpoint_name, job, reason=''):
+        if self._u1_background_jobs.get(endpoint_name) is not job:
+            return
+        if job.get('foreground_consuming'):
+            self._u1_background_jobs.pop(endpoint_name, None)
+            return
         target_device = job.get('target_device')
         target_channel = job.get('target_channel')
         endpoint = job.get('endpoint')
-        if (job.get('state') in ('ready', 'partial') and target_device is not None and
-                target_channel is not None and endpoint is not None):
+        if (target_device is not None and target_channel is not None and
+                endpoint is not None):
             route_key = self._route_key(target_device, int(target_channel))
             staged = self.prestaged.get(route_key)
             if staged is not None:
@@ -8662,7 +8700,9 @@ class BMCUManager(object):
                     channel=int(target_channel))
                 try:
                     self._clear_prestage_locked(
-                        target_device, endpoint, staged)
+                        target_device, endpoint, staged,
+                        target_selected=bool(
+                            job.get('foreground_head_prefetched')))
                 finally:
                     self._unlock(target_device, endpoint)
         if (endpoint is not None and
@@ -8683,22 +8723,27 @@ class BMCUManager(object):
     def _cancel_u1_background_jobs(self, reason='', wait=True):
 
         reason = str(reason or 'cancelled')
-        for endpoint_name, job in list(self._u1_background_jobs.items()):
+        jobs = list(self._u1_background_jobs.items())
+        for _endpoint_name, job in jobs:
             job['cancelled'] = True
             job['cancel_reason'] = reason
+        if self._critical_control_plane_blocked():
+            self._wait_background_control_plane()
+        stopped = set()
+        for endpoint_name, job in jobs:
             state = str(job.get('state', '') or '')
-            if state in ('ready', 'partial', 'ready_native', 'handoff', 'done', 'error', 'cancelled'):
-                try:
-                    self._clear_ready_u1_background_job(
-                        endpoint_name, job, reason=reason)
-                except Exception:
-                    logging.exception(
-                        'BMCU could not clear cancelled Snapmaker background job on %s',
-                        endpoint_name)
+            worker_pending = bool(
+                job.get('worker_scheduled') and
+                not job.get('worker_finished'))
+            if (not worker_pending and
+                    state not in ('starting', 'running')):
                 continue
             for device in (job.get('source_device'), job.get('target_device')):
-                if device is None:
+                if device is None or device.name in stopped:
                     continue
+                stopped.add(device.name)
+                if self._critical_control_plane_blocked():
+                    self._wait_background_control_plane()
                 try:
                     device.stop_all()
                 except Exception:
@@ -8707,24 +8752,58 @@ class BMCUManager(object):
                         device.name)
         if not wait:
             return
-        deadline = self.reactor.monotonic() + max(
-            self.unload_timeout + self.contact_timeout + 5.0, 20.0)
-        while any(job.get('state') in ('starting', 'running')
-                  for job in self._u1_background_jobs.values()):
+        deadline = self.reactor.monotonic() + self._u1_background_wait_timeout(
+            job for _name, job in jobs)
+        while any(
+                self._u1_background_jobs.get(endpoint_name) is job and
+                (job.get('state') in ('starting', 'running') or
+                 (job.get('worker_scheduled') and
+                  not job.get('worker_finished')))
+                for endpoint_name, job in jobs):
             if self.reactor.monotonic() >= deadline:
                 raise BMCUError(
                     'timed out while cancelling Snapmaker background motion')
             self.reactor.pause(self.reactor.monotonic() + 0.05)
-        for endpoint_name, job in list(self._u1_background_jobs.items()):
-            if job.get('cancelled'):
-                self._clear_ready_u1_background_job(
-                    endpoint_name, job, reason=reason)
+        failures = []
+        for endpoint_name, job in jobs:
+            if (self._u1_background_jobs.get(endpoint_name) is job and
+                    job.get('cancelled')):
+                try:
+                    self._clear_ready_u1_background_job(
+                        endpoint_name, job, reason=reason)
+                except Exception as exc:
+                    failures.append('%s: %s' % (endpoint_name, exc))
+        if failures:
+            raise BMCUError('; '.join(failures))
+
+    def _u1_background_wait_timeout(self, jobs):
+        timeout = max(self.unload_timeout + self.contact_timeout + 10.0, 30.0)
+        for job in jobs:
+            endpoint = job.get('endpoint')
+            if endpoint is None:
+                continue
+            feed_timeout = float(endpoint.get(
+                'contact_timeout', self.contact_timeout) or self.contact_timeout)
+            device = job.get('target_device')
+            if device is not None:
+                feed_timeout = self._effective_feed_timeout(
+                    device, endpoint.get('max_route_mm', self.max_route_mm),
+                    feed_timeout)
+            ticket = job.get('parked_tip_tail') or {}
+            tail_time = float(ticket.get('post_marker_duration_s', 0.0) or 0.0)
+            park_time = float(endpoint.get('u1_prestage_park_timeout', 20.0) or 20.0)
+            timeout = max(timeout, self.unload_timeout + feed_timeout +
+                          tail_time + park_time + 10.0)
+        return timeout
 
     def _drain_u1_background_jobs(self, clear_ready=True):
-        deadline = self.reactor.monotonic() + max(
-            self.unload_timeout + self.contact_timeout + 10.0, 30.0)
-        while any(job.get('state') in ('starting', 'running')
-                  for job in self._u1_background_jobs.values()):
+        deadline = self.reactor.monotonic() + self._u1_background_wait_timeout(
+            self._u1_background_jobs.values())
+        while any(
+                job.get('state') in ('starting', 'running') or
+                (job.get('worker_scheduled') and
+                 not job.get('worker_finished'))
+                for job in self._u1_background_jobs.values()):
             if self.reactor.monotonic() >= deadline:
                 raise BMCUError(
                     'timed out waiting for Snapmaker background filament preparation')
@@ -8747,6 +8826,11 @@ class BMCUManager(object):
                                      operation_started_callback=None,
                                      target_selected=False):
         if callable(cancel_check) and cancel_check():
+            raise BMCUError('background prestage was cancelled before motion')
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
             raise BMCUError('background prestage was cancelled before motion')
         route_key = self._route_key(device, channel)
         self._check_automatic_ready(device, channel)
@@ -8819,6 +8903,11 @@ class BMCUManager(object):
         timeout_s = float(endpoint.get(
             'contact_timeout', self.contact_timeout) or self.contact_timeout)
         timeout_s = self._effective_feed_timeout(device, maximum_mm, timeout_s)
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            raise BMCUError('background prestage was cancelled before motion')
         op_id, arrival_policy = self._start_endpoint_arrival_operation(
             device, channel, endpoint, maximum_mm, contact_pct, timeout_s,
             parked_precharge=bool(
@@ -8834,13 +8923,14 @@ class BMCUManager(object):
                     'BMCU could not publish background prestage operation start; '
                     'continuing with the target Head parked')
         if arrival_policy.get('sensor_authoritative'):
-            result = self._wait_u1_distance_bound_sendout(
+            result = self._wait_sensor_arrival(
                 device, channel, endpoint, op_id, arrival_policy,
                 maximum_mm,
                 poll_interval=(self._u1_background_poll_interval
                                if background else 0.250),
                 pause_for_critical=bool(background),
-                interrupt_check=(handoff_check if background else None))
+                interrupt_check=(handoff_check if background else None),
+                cancel_check=cancel_check)
         else:
             result = self._wait_feed_operation(
                 device, op_id, timeout_s + 2.0, endpoint, 'entry_sensor',
@@ -8848,7 +8938,16 @@ class BMCUManager(object):
                                if background else None),
                 pause_for_critical=bool(background),
                 interrupt_check=(handoff_check if background else None),
-                motion_latch=arrival_policy.get('motion_latch'))
+                cancel_check=cancel_check)
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            try:
+                device.stop_all()
+            except Exception:
+                pass
+            raise BMCUError('background prestage was cancelled before commit')
         result = self._resolve_endpoint_arrival_result(
             device, channel, endpoint, result, arrival_policy,
             timeout_s, allow_partial=bool(background))
@@ -8860,8 +8959,7 @@ class BMCUManager(object):
             raise BMCUError('background prestage was cancelled before commit')
 
         entry_confirmed = (
-            bool(result.get('sensor_triggered') or
-                 result.get('controller_contact'))
+            bool(result.get('ok') and result.get('sensor_triggered'))
             if self._u1_has_authoritative_entry_sensor(endpoint) else
             endpoint.sensor_detected('entry_sensor') is True)
         interrupted = bool(result.get('foreground_handoff_requested'))
@@ -9003,7 +9101,7 @@ class BMCUManager(object):
                 self.reactor.pause(
                     self.reactor.monotonic() +
                     self._u1_background_poll_interval)
-            while (self._critical_motion_active and
+            while (self._critical_control_plane_blocked() and
                    not self._klippy_disconnecting and
                    not job.get('cancelled')):
                 self.reactor.pause(
@@ -9015,9 +9113,8 @@ class BMCUManager(object):
         try:
             self._u1_background_worker(eventtime, endpoint_name)
         finally:
-            current = self._u1_background_jobs.get(endpoint_name)
-            if current is not None:
-                current['worker_finished'] = True
+            if self._u1_background_jobs.get(endpoint_name) is job:
+                job['worker_finished'] = True
 
     def _u1_background_worker(self, eventtime, endpoint_name):
         job = self._u1_background_jobs.get(endpoint_name)
@@ -9098,7 +9195,8 @@ class BMCUManager(object):
                 self._start_delegated_u1_pullback_locked(
                     source_device, endpoint, source_channel, context,
                     require_park=bool(context.get('reconcile_requires_park')),
-                    cancel_check=lambda: bool(job.get('cancelled')))
+                    cancel_check=lambda: bool(job.get('cancelled')),
+                    background=True)
                 phase = 'BACKGROUND_PULLBACK'
                 self._set_u1_background_phase(job, phase)
 
@@ -9252,7 +9350,8 @@ class BMCUManager(object):
             job['error'] = str(exc)
             self._stop_on_failure(
                 failing_device, endpoint, exc, phase, failing_channel,
-                pause_print=False, restore_sensors=False)
+                pause_print=False, restore_sensors=False,
+                wait_for_control_plane=True)
             if not job.get('cancelled'):
                 logging.exception(
                     'BMCU Snapmaker background swap failed on %s; active print continues',
@@ -9364,6 +9463,13 @@ class BMCUManager(object):
                         'independently', endpoint.name)
                 job['source_lane_ready'] = bool(
                     context.get('park_confirmed_before_pullback'))
+            if not job.get('source_lane_ready'):
+                endpoint.park_selected_head_for_pullback()
+                context = job.get('unload_context')
+                if isinstance(context, dict):
+                    context['endpoint_released'] = True
+                    context['park_confirmed_before_pullback'] = True
+                job['source_lane_ready'] = True
             job['state'] = 'running'
             self._set_u1_background_phase(
                 job, 'BACKGROUND_PRESTAGE' if job.get('source_tail_prepared')
@@ -9500,6 +9606,11 @@ class BMCUManager(object):
                 'BMCU skipped optional background swap on %s because the current '
                 'tool requires the same controller', endpoint.name)
             return False
+        if endpoint.shared_path_group() == target_now['endpoint'].shared_path_group():
+            logging.info(
+                'BMCU skipped optional background swap on %s because the '
+                'current tool requires the same shared filament path', endpoint.name)
+            return False
         if any(name in self.active_operations for name in background_devices):
             logging.info(
                 'BMCU skipped optional background swap on %s because a '
@@ -9507,11 +9618,12 @@ class BMCUManager(object):
             return False
         conflict = self._u1_background_controller_conflict(
             background_devices, int(plan_index),
-            int(next_route.get('plan_index', len(self._u1_toolchange_plan))))
+            int(next_route.get('plan_index', len(self._u1_toolchange_plan))),
+            path_groups=(endpoint.shared_path_group(),))
         if conflict is not None:
             logging.info(
                 'BMCU skipped optional background swap on %s because T%d '
-                'needs controller %s first', endpoint.name,
+                'needs controller %s or its shared filament path first', endpoint.name,
                 int(conflict['tool']), conflict['device'])
             return False
 
@@ -9570,7 +9682,9 @@ class BMCUManager(object):
                 try:
                     self._clear_prestage_locked(
                         target_device, endpoint, staged,
-                        preserve_sensor_takeover=True)
+                        preserve_sensor_takeover=True,
+                        target_selected=bool(
+                            job.get('foreground_head_prefetched')))
                 finally:
                     self._unlock(target_device, endpoint)
         elif state not in ('ready_native', 'handoff'):
@@ -9643,6 +9757,7 @@ class BMCUManager(object):
             endpoint, temperature_profile, material=material)
         load_context_started = False
         selected = False
+        context['foreground_head_prefetch_in_progress'] = True
         try:
             endpoint.suspend_managed_sensors()
             endpoint.select()
@@ -9693,6 +9808,8 @@ class BMCUManager(object):
                         'BMCU could not restore speculative U1 prefetch temperature')
                 job['foreground_load_context_prepared'] = False
             raise
+        finally:
+            context['foreground_head_prefetch_in_progress'] = False
 
     def _wait_u1_background_for_route(
             self, route, gcmd=None, temperature_profile=None):
@@ -9721,8 +9838,7 @@ class BMCUManager(object):
                 'BMCU redirecting background work on %s to requested T%d',
                 endpoint.name, int(route.get('tool', -1)))
 
-        deadline = self.reactor.monotonic() + max(
-            self.unload_timeout + self.contact_timeout + 10.0, 30.0)
+        deadline = self.reactor.monotonic() + self._u1_background_wait_timeout([job])
         safe_wait_done = False
 
         def move_to_safe_wait_before_pause():
@@ -9740,8 +9856,10 @@ class BMCUManager(object):
                 raise BMCUError(message)
 
         while (job.get('state') in ('starting', 'running') or
-               (job.get('worker_started') and
+               (job.get('worker_scheduled') and
                 not job.get('worker_finished'))):
+            if self._u1_cancel_requested or job.get('cancelled'):
+                raise BMCUError('U1_BACKGROUND_WAIT_CANCELLED: %s' % endpoint.name)
             prefetch_ready = bool(
                 (job.get('phase') == 'BACKGROUND_PULLBACK' and
                  job.get('head_pick_safe')) or
@@ -9816,6 +9934,7 @@ class BMCUManager(object):
         job = self._u1_background_jobs.get(endpoint.name)
         if (job is not None and
                 self._u1_source_identity(route) == job.get('target_identity') and
+                (not job.get('worker_scheduled') or job.get('worker_finished')) and
                 job.get('state') in ('ready', 'partial', 'ready_native', 'handoff')):
             self._unlock_u1_background_job(job)
             self._u1_background_jobs.pop(endpoint.name, None)
@@ -10738,6 +10857,14 @@ class BMCUManager(object):
         load_completed = False
         load_temperature_finalized = False
         try:
+            if (endpoint.driver == 'snapmaker_u1' and
+                    isinstance(background_job, dict) and
+                    background_job.get('target_device') is device and
+                    int(background_job.get('target_channel', -1)) == channel):
+                if (background_job.get('worker_scheduled') and
+                        not background_job.get('worker_finished')):
+                    raise BMCUError('U1 background worker has not released the route')
+                background_job['foreground_consuming'] = True
             staged_record = self.prestaged.get(route_key)
 
             staged_for_target = bool(
@@ -10827,6 +10954,10 @@ class BMCUManager(object):
             else:
                 endpoint.select()
                 endpoint.verify_selected()
+            if endpoint.driver == 'snapmaker_u1':
+                staged = self.prestaged.get(route_key)
+                if isinstance(staged, dict):
+                    staged['target_selected'] = True
             capture_projection = getattr(
                 endpoint, 'capture_active_filament_state', None)
             if callable(capture_projection):
@@ -10879,6 +11010,20 @@ class BMCUManager(object):
                 except (TypeError, ValueError, OverflowError):
                     arrival_preexisting_mm = 0.0
             entry_before = endpoint.sensor_detected('entry_sensor')
+            configured_entry_sensor = str(
+                endpoint.get('entry_sensor', '') or '').strip()
+            if configured_entry_sensor and is_prestaged:
+                if self._u1_has_authoritative_entry_sensor(endpoint):
+                    entry_before = endpoint.require_entry_sensor_snapshot().get(
+                        'physical_detected')
+                staged_record['at_entry'] = entry_before is True
+                staged_record['partial'] = entry_before is not True
+                if entry_before is True:
+                    staged_record['result'] = dict(
+                        staged_record.get('result', {}),
+                        ok=True, sensor_triggered=True,
+                        controller_contact=False,
+                        reason='owned_prestage_at_entry')
             partial_prestage = bool(
                 is_prestaged and staged_record.get('partial') and
                 not staged_record.get('at_entry'))
@@ -10906,10 +11051,10 @@ class BMCUManager(object):
             contact_pct = self._device_loading_handoff_pct(
                 device, endpoint)
             if partial_prestage and not staged_at_entry:
-                if self._u1_has_authoritative_entry_sensor(endpoint):
+                if configured_entry_sensor:
                     logging.info(
                         'BMCU continuing partial T%d prestage on selected %s: '
-                        'already %.1f mm, remaining read-only-sensor/contact '
+                        'already %.1f mm, remaining entry-sensor '
                         'search %.1f mm',
                         int(tool), endpoint.name, max(0.0, staged_distance),
                         float(maximum_mm))
@@ -10955,14 +11100,8 @@ class BMCUManager(object):
                         if staged_at_entry else
                         'detached_follower_already_at_entry'),
                 })
-                if (staged_at_entry and
-                        not (arrival.get('sensor_triggered') or
-                             arrival.get('controller_contact'))):
-
-                    arrival['controller_contact'] = True
             else:
-                if (entry_before is True and not is_prestaged and
-                        not self._u1_has_authoritative_entry_sensor(endpoint)):
+                if entry_before is True and not is_prestaged:
                     raise BMCUError(
                         'RESIDUAL_FILAMENT: entry sensor is already active before load')
                 target_motion_started = True
@@ -10977,7 +11116,7 @@ class BMCUManager(object):
                             'arrival search')
                     logging.info(
                         'BMCU continuing partial T%d prestage on selected %s '
-                        'with a separate read-only-sensor/contact SEND_OUT',
+                        'with a separate SEND_OUT arrival search',
                         int(tool), endpoint.name)
 
                 device.refresh()
@@ -10995,14 +11134,13 @@ class BMCUManager(object):
                     phase = 'ARRIVAL_SEARCH'
                     self._set_phase(device, phase)
                 if arrival_policy.get('sensor_authoritative'):
-                    arrival = self._wait_u1_distance_bound_sendout(
+                    arrival = self._wait_sensor_arrival(
                         device, channel, endpoint, op_id, arrival_policy,
                         maximum_mm, poll_interval=0.050)
                 else:
                     arrival = self._wait_feed_operation(
                         device, op_id, timeout_s + 2.0, endpoint,
-                        'entry_sensor',
-                        motion_latch=arrival_policy.get('motion_latch'))
+                        'entry_sensor')
                 arrival = self._resolve_endpoint_arrival_result(
                     device, channel, endpoint, arrival, arrival_policy,
                     timeout_s, allow_partial=False)
@@ -11043,12 +11181,11 @@ class BMCUManager(object):
                     raise BMCUError('ENDPOINT_NOT_REACHED: %s after %.1f mm' %
                                     (arrival.get('reason'),
                                      arrival.get('measured_mm', 0.0)))
-                if (self._u1_has_authoritative_entry_sensor(endpoint) and
-                        not (arrival.get('sensor_triggered') or
-                             arrival.get('controller_contact'))):
+                if (configured_entry_sensor and
+                        not arrival.get('sensor_triggered')):
                     raise BMCUError(
                         'ENDPOINT_NOT_REACHED: %s stopped after %.1f mm at '
-                        '%d%% buffer without Head motion or configured contact' %
+                        '%d%% buffer without entry-sensor confirmation' %
                         (arrival.get('reason'),
                          float(arrival.get('measured_mm', 0.0) or 0.0),
                          int(device.status['buffer_pct'][channel])))
@@ -11066,8 +11203,6 @@ class BMCUManager(object):
                     staged_record['buffer_pct'] = int(
                         device.status['buffer_pct'][channel])
                     staged_record['result'] = dict(arrival)
-                configured_entry_sensor = str(
-                    endpoint.get('entry_sensor', '') or '').strip()
                 if (not self._u1_has_authoritative_entry_sensor(endpoint) and
                         configured_entry_sensor and
                         endpoint.sensor_detected('entry_sensor') is not True):
@@ -11115,6 +11250,8 @@ class BMCUManager(object):
             if not generic_contract:
                 phase = 'BITE'
                 self._set_phase(device, phase)
+                if endpoint.driver == 'snapmaker_u1':
+                    self._drop_prestage_record(route_key, release_sensor=False)
             bite_ok = False
             bite_evidence = {}
 
@@ -11171,8 +11308,7 @@ class BMCUManager(object):
                     except (TypeError, ValueError, KeyError, IndexError):
                         buffer_after_bite = -1
                     arrival_confirmed = bool(
-                        arrival.get('sensor_triggered') or
-                        arrival.get('controller_contact'))
+                        arrival.get('sensor_triggered'))
                     bite_evidence = {
                         'attempt': 1,
                         'confirmation': 'u1_arrival_and_firmware_pressure',
@@ -11283,8 +11419,7 @@ class BMCUManager(object):
                 if u1_readonly_path:
 
                     capture_moved = 0.0
-                    if (not (arrival.get('sensor_triggered') or
-                             arrival.get('controller_contact')) or
+                    if (not arrival.get('sensor_triggered') or
                             not isinstance(u1_pressure_evidence, dict)):
                         raise BMCUError(
                             'CAPTURE_FAILED: Snapmaker route lacks prior arrival and '
@@ -11570,7 +11705,7 @@ class BMCUManager(object):
 
     def _start_delegated_u1_pullback_locked(
             self, device, endpoint, channel, context, require_park=False,
-            cancel_check=None):
+            cancel_check=None, background=False):
 
         if context.get('pullback_started'):
             return context
@@ -11602,6 +11737,11 @@ class BMCUManager(object):
                 int(endpoint.get('head_index', -1)) + 1, channel + 1)
         if callable(cancel_check) and cancel_check():
             raise BMCUError('BMCU pullback was cancelled before start')
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            raise BMCUError('BMCU pullback was cancelled before start')
 
         if not context.get('before_pullback_started'):
 
@@ -11614,13 +11754,33 @@ class BMCUManager(object):
             device.set_motion(channel, protocol.MOTION_BEFORE_PULL_BACK)
             context['before_pullback_started'] = True
             self.reactor.pause(self.reactor.monotonic() + 0.2)
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            try:
+                device.stop_all()
+            except Exception:
+                pass
+            raise BMCUError('BMCU pullback was cancelled before motion')
         device.refresh()
         buffer_pct = int(device.status['buffer_pct'][channel])
         if not (5 < buffer_pct < 95):
             buffer_pct = self._wait_unload_buffer_ready(
-                device, channel, timeout=4.0)
+                device, channel, timeout=4.0,
+                pause_for_critical=bool(background),
+                cancel_check=cancel_check)
         context['release_buffer_pct'] = buffer_pct
 
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            try:
+                device.stop_all()
+            except Exception:
+                pass
+            raise BMCUError('BMCU pullback was cancelled before motion')
         if callable(cancel_check) and cancel_check():
             try:
                 device.stop_all()
@@ -11880,12 +12040,21 @@ class BMCUManager(object):
             pullback['encoder_mm'] = prior_encoder_mm + final_encoder_mm
             pullback['segments_mm'] = list(
                 context.get('pullback_segments', [])) + [final_encoder_mm]
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            raise BMCUError('BMCU pullback was cancelled before commit')
         if callable(cancel_check) and cancel_check():
             raise BMCUError('BMCU pullback was cancelled before commit')
         device.refresh()
 
         phase = 'VERIFY_SOURCE_STATE'
         self._set_phase(device, phase)
+        while context.get('foreground_head_prefetch_in_progress'):
+            if callable(cancel_check) and cancel_check():
+                raise BMCUError('BMCU pullback was cancelled during Head pickup')
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
         buffer_pct = device.status['buffer_pct'][channel]
         if (not delegated_u1_pullback and
                 (buffer_pct <= 3 or buffer_pct >= 97)):
@@ -11947,6 +12116,11 @@ class BMCUManager(object):
             if entry_detected is True:
                 raise BMCUError(
                     'ENDPOINT_NOT_CLEARED: entry sensor remains active after pullback')
+        if (background and
+                self._wait_background_control_plane(
+                    cancel_check=cancel_check,
+                    poll_interval=self._u1_background_poll_interval)):
+            raise BMCUError('BMCU pullback was cancelled before EMPTY commit')
         if callable(cancel_check) and cancel_check():
             raise BMCUError('BMCU pullback was cancelled before EMPTY commit')
         device.mark_unloaded(channel)
@@ -12112,7 +12286,8 @@ class BMCUManager(object):
                 endpoint, 'manual unload confirmed BMCU route EMPTY')
 
     def _clear_prestage_locked(self, device, endpoint, staged,
-                               preserve_sensor_takeover=False):
+                               preserve_sensor_takeover=False,
+                               target_selected=False):
         channel = int(staged.get('channel', -1))
         self._arm_u1_persistent_hold(
             endpoint, device, channel, 'clear prestaged BMCU route')
@@ -12125,20 +12300,35 @@ class BMCUManager(object):
         self._set_phase(device, phase)
         try:
             if endpoint.driver == 'snapmaker_u1':
-                endpoint.verify_parked_for_prestage()
+                allow_selected = bool(
+                    target_selected or staged.get('target_selected'))
+                target_selected = False
+                try:
+                    endpoint.verify_parked_for_prestage()
+                except Exception:
+                    if not allow_selected:
+                        raise
+                    endpoint.verify_selected()
+                    target_selected = True
                 logging.info(
-                    'BMCU Snapmaker Head %d PARKED confirmation accepted '
+                    'BMCU Snapmaker Head %d %s confirmation accepted '
                     'before clearing prestaged Channel %d',
-                    int(endpoint.get('head_index', -1)) + 1, channel + 1)
+                    int(endpoint.get('head_index', -1)) + 1,
+                    'SELECTED' if target_selected else 'PARKED', channel + 1)
             device.set_motion(channel, protocol.MOTION_PULL_BACK)
-            self._wait(
-                device,
-                lambda: device.status['motion'][channel] == protocol.MOTION_IDLE,
-                self.unload_timeout, 'PRESTAGE_CLEAR_TIMEOUT',
-                'prestaged filament did not return to Channel park')
-            if endpoint.sensor_detected('entry_sensor') is True:
+            self._wait_pullback_safe(
+                device, channel, self.unload_timeout,
+                allow_transient_buffer_extremes=(
+                    endpoint.driver == 'snapmaker_u1'))
+            if endpoint.driver == 'snapmaker_u1':
+                endpoint.require_entry_sensor_snapshot(expected=False)
+            elif endpoint.sensor_detected('entry_sensor') is True:
                 raise BMCUError(
                     'PRESTAGE_NOT_CLEARED: entry sensor remains active')
+            device.mark_unloaded(channel)
+            device.refresh()
+            if self._route_states_from_status(device.status)[channel] != protocol.ROUTE_EMPTY:
+                raise BMCUError('PRESTAGE_NOT_CLEARED: route did not commit EMPTY')
             self._drop_prestage_record(
                 route_key, release_sensor=not preserve_sensor_takeover)
         except Exception:
@@ -12331,6 +12521,8 @@ class BMCUManager(object):
         gcmd.respond_info('BMCU status refreshed')
 
     def cmd_STOP(self, gcmd):
+        if self._u1_background_jobs:
+            self._cancel_u1_background_jobs('BMCU_STOP', wait=False)
         for device in self.devices:
             if device.ready:
                 device.stop_all()
@@ -13849,12 +14041,12 @@ class BMCUManager(object):
             target_route = self._u1_logical_route(tool) \
                 if is_snapmaker else None
             if is_snapmaker and target_route is not None:
+                background_endpoint = self._prepare_u1_background_transition(
+                    tool, plan_index, gcmd=gcmd)
+
                 self._wait_u1_background_for_route(
                     target_route, gcmd=gcmd,
                     temperature_profile=temperature_profile)
-
-                background_endpoint = self._prepare_u1_background_transition(
-                    tool, plan_index, gcmd=gcmd)
 
             per_print = (self.print_tools.get(str(tool))
                          if self.print_map_active else None)
@@ -13908,15 +14100,15 @@ class BMCUManager(object):
 
                 self._release_u1_background_worker(background_endpoint)
         except Exception as exc:
-            if background_endpoint:
-
+            if is_snapmaker and self._u1_background_jobs:
                 try:
-                    self._release_u1_background_worker(background_endpoint)
+                    self._cancel_u1_background_jobs(
+                        'foreground T%d toolchange failed: %s' % (tool, exc),
+                        wait=True)
                 except Exception:
                     logging.exception(
-                        'BMCU could not release parked-head cleanup on %s '
-                        'after foreground toolchange failure',
-                        background_endpoint)
+                        'BMCU could not stop Snapmaker background work after '
+                        'foreground toolchange failure')
             self._record_error(
                 ('SNAPMAKER_TOOL_CHANGE_FAILED' if is_snapmaker else
                  'GENERIC_TOOL_CHANGE_FAILED'),
@@ -14820,6 +15012,15 @@ class BMCUManager(object):
             self.gcode.run_script_from_command(
                 'SM_PRINT_PREEXTRUDE_FILAMENT INDEX=%d' % tool)
         except Exception as exc:
+            if self._u1_background_jobs:
+                try:
+                    self._cancel_u1_background_jobs(
+                        'foreground T%d pre-extrude failed: %s' % (tool, exc),
+                        wait=True)
+                except Exception:
+                    logging.exception(
+                        'BMCU could not stop Snapmaker background work after '
+                        'pre-extrude failure')
             raise gcmd.error(
                 'Snapmaker U1 pre-extrude failed for T%d: %s' % (tool, exc))
 
@@ -15469,6 +15670,14 @@ class BMCUManager(object):
                     'configured firmware_update_power_pin %s does not exist' %
                     configured)
             return ''
+        live = transport.control_request(
+            device.control_path, transport.CTRL_STATUS, pause=self.reactor.pause)
+        if live.get('name') != device.name or not live.get('serial_released'):
+            raise BMCUError('BMCU serial release is not confirmed before motor power-off')
+        port = os.path.realpath(str(live.get('port') or ''))
+        before = os.stat(port)
+        if not stat.S_ISCHR(before.st_mode):
+            raise BMCUError('BMCU runtime serial device is unavailable before motor power-off')
         current = output.get_status(self.reactor.monotonic()).get('value', 1.0)
         try:
             current = float(current)
@@ -15483,7 +15692,9 @@ class BMCUManager(object):
                 self.reactor.monotonic() +
                 self.firmware_update_power_settle_time)
 
-            if device.port and not os.path.exists(device.port):
+            after = os.stat(port)
+            if ((before.st_rdev, before.st_dev, before.st_ino) !=
+                    (after.st_rdev, after.st_dev, after.st_ino)):
                 raise BMCUError(
                     'output_pin %s removed the BMCU serial device; it does not isolate only motor power' %
                     name)
@@ -15520,6 +15731,9 @@ class BMCUManager(object):
             raise BMCUError('invalid firmware-update export token')
         if not device.ready or not device.runtime_configured or device.suspended:
             raise BMCUError('%s is not ready for NVM export' % device.name)
+        if (self._print_state() in ('printing', 'paused', 'pause') or
+                self.active_operations):
+            raise BMCUError('Finish printing and BMCU operations before NVM export')
         update_prepared = False
         try:
 
@@ -15556,25 +15770,72 @@ class BMCUManager(object):
             expected_crc = None
             offset = 0
             while offset < 4096:
-                amount = min(224, 4096 - offset)
-                result = device.nvm_read(offset, amount)
-                if (int(result.get('offset', -1)) != offset or
-                        int(result.get('length', -1)) != amount):
-                    raise BMCUError(
-                        'invalid NVM export chunk at offset %d' % offset)
-                chunk = bytes(result.get('data', b''))
-                if len(chunk) != amount:
-                    raise BMCUError(
-                        'short NVM export chunk at offset %d' % offset)
-                total_crc = int(
-                    result.get('total_crc', -1)) & 0xffffffff
-                if expected_crc is None:
-                    expected_crc = total_crc
-                elif total_crc != expected_crc:
-                    raise BMCUError(
-                        'NVM changed during export; retry the update')
-                payload.extend(chunk)
-                offset += amount
+                chunks = []
+                cursor = offset
+                while cursor < 4096 and len(chunks) < 4:
+                    amount = min(224, 4096 - cursor)
+                    chunks.append((cursor, amount))
+                    cursor += amount
+                try:
+                    results = device.nvm_read_batch(chunks, timeout=15.0)
+                except Exception as batch_exc:
+                    if 'NVM batch timeout' not in str(batch_exc):
+                        raise BMCUError(
+                            'batched NVM read failed at offset=%d: %s' %
+                            (offset, batch_exc))
+                    logging.warning(
+                        'BMCU %s batched NVM read timed out at offset=%d; '
+                        'falling back to bounded single-chunk reads: %s',
+                        device.name, offset, batch_exc)
+                    results = []
+                    for chunk_offset, amount in chunks:
+                        result = None
+                        for attempt in range(1, 4):
+                            try:
+                                result = device.nvm_read(
+                                    chunk_offset, amount, timeout=15.0)
+                                break
+                            except Exception as exc:
+                                timeout_error = (
+                                    'request timeout type=0x61' in str(exc))
+                                if not timeout_error or attempt >= 3:
+                                    raise BMCUError(
+                                        'NVM read offset=%d length=%d: %s' %
+                                        (chunk_offset, amount, exc))
+                                logging.warning(
+                                    'BMCU %s NVM read timeout at offset=%d '
+                                    'length=%d; retry %d/3',
+                                    device.name, chunk_offset, amount,
+                                    attempt + 1)
+                                self.reactor.pause(
+                                    self.reactor.monotonic() + 0.050 * attempt)
+                        if result is None:
+                            raise BMCUError(
+                                'NVM read offset=%d length=%d produced no result' %
+                                (chunk_offset, amount))
+                        results.append(result)
+                if len(results) != len(chunks):
+                    raise BMCUError('incomplete batched NVM export response')
+                for (chunk_offset, amount), result in zip(chunks, results):
+                    if (int(result.get('offset', -1)) != chunk_offset or
+                            int(result.get('length', -1)) != amount):
+                        raise BMCUError(
+                            'invalid NVM export chunk at offset %d' %
+                            chunk_offset)
+                    chunk = bytes(result.get('data', b''))
+                    if len(chunk) != amount:
+                        raise BMCUError(
+                            'short NVM export chunk at offset %d' %
+                            chunk_offset)
+                    total_crc = int(
+                        result.get('total_crc', -1)) & 0xffffffff
+                    if expected_crc is None:
+                        expected_crc = total_crc
+                    elif total_crc != expected_crc:
+                        raise BMCUError(
+                            'NVM changed during export; retry the update')
+                    payload.extend(chunk)
+                offset = cursor
             actual_crc = binascii.crc32(payload) & 0xffffffff
             if expected_crc is None or actual_crc != expected_crc:
                 raise BMCUError('NVM export CRC mismatch')
@@ -15666,8 +15927,8 @@ class BMCUManager(object):
                     'printer is %s; serial flash guard is unavailable' % print_state)
             if self.active_operations:
                 raise gcmd.error('BMCU operation is active; stop it before firmware flash')
-            if not device.suspended:
-                device.suspend_for_update('serial_flash_guard')
+            device.suspend_for_update(
+                device.suspend_reason if device.suspended else 'serial_flash_guard')
             gcmd.respond_info('%s serial transport quiesced for raw firmware flash' % device.name)
             return
         if action == 'UNQUIESCE':
@@ -15706,6 +15967,7 @@ class BMCUManager(object):
         if action != 'PREPARE':
             raise gcmd.error('ACTION must be EXPORT, PREPARE, CANCEL, RESUME, QUIESCE, UNQUIESCE or STATUS')
         if device.suspended:
+            device.suspend_for_update(device.suspend_reason)
             gcmd.respond_info('%s serial port is already released for firmware update' % device.name)
             return
         print_state = self._print_state()

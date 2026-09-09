@@ -5,7 +5,7 @@
 #define BMCU_PROTO_VER 1u
 #define BMCU_FW_MAJOR 1u
 #define BMCU_FW_MINOR 0u
-#define BMCU_FW_PATCH 0u
+#define BMCU_FW_PATCH 1u
 
 #define MSG_HELLO               0x01u
 #define MSG_PING                0x02u

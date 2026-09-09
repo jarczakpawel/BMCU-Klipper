@@ -950,7 +950,7 @@ class Endpoint(object):
                 return True
         return False
 
-    def _run(self, script, wait_moves=True):
+    def _run(self, script, wait_moves=True, printer_priority=False):
         if not script:
             return
 
@@ -962,7 +962,7 @@ class Endpoint(object):
             if toolhead is not None:
                 toolhead.wait_moves()
 
-        critical = self._script_requires_printer_priority(script)
+        critical = printer_priority or self._script_requires_printer_priority(script)
         guard = getattr(self.manager, 'printer_critical_section', None)
         if critical and callable(guard):
             with guard('endpoint:%s' % self.name):
@@ -1145,7 +1145,7 @@ class Endpoint(object):
         script = '%s ENDPOINT=%s MATERIAL=%s REASON=%s' % (
             command, self._gcode_param(self.name),
             self._gcode_param(material), self._gcode_param(reason))
-        self._run(script)
+        self._run(script, printer_priority=True)
 
     def prepare_load(self, material=''):
         if self.driver == 'generic_single_extruder':
@@ -1654,7 +1654,6 @@ class SnapmakerU1Endpoint(Endpoint):
         self._entry_sensor_last_advanced_host = None
         self._entry_sensor_state_signature = None
         self._entry_sensor_state_revision = 0
-        self._entry_motion_latch_generation = 0
         self._native_empty_projection = False
 
     _FEEDER_MAP = {
@@ -1840,7 +1839,8 @@ class SnapmakerU1Endpoint(Endpoint):
                 adc_timestamp = float(adc_timestamp)
                 adc_initialized = bool(adc_timestamp > 0.0)
 
-                adc_age = max(0.0, now - adc_timestamp)
+                adc_now = mcu_adc.get_mcu().estimated_print_time(now)
+                adc_age = max(0.0, adc_now - adc_timestamp)
             except Exception:
                 adc_value = adc_timestamp = adc_age = None
                 adc_initialized = False
@@ -1851,18 +1851,22 @@ class SnapmakerU1Endpoint(Endpoint):
             adc_candidate = bool(candidate is not None)
             try:
                 debounce_age = max(
-                    0.0, now - float(getattr(backend, 'last_debouncetime')))
+                    0.0, adc_timestamp - float(
+                        getattr(backend, 'last_debouncetime')))
             except (TypeError, ValueError, OverflowError, AttributeError):
                 debounce_age = None
 
             adc_stable = bool(
-                adc_initialized and adc_candidate == adc_detected and
+                adc_initialized and adc_age is not None and adc_age <= 1.0 and
+                adc_candidate == adc_detected and
                 (debounce_age is None or debounce_age >= 0.025))
 
         if backend is not None:
             physical = adc_detected if adc_stable else None
             if not adc_initialized:
                 source = 'adc_uninitialized'
+            elif adc_age is None or adc_age > 1.0:
+                source = 'adc_stale'
             elif not adc_stable:
                 source = 'adc_debouncing'
             else:
@@ -1903,7 +1907,7 @@ class SnapmakerU1Endpoint(Endpoint):
             'adc_value': adc_value,
             'adc_timestamp': adc_timestamp,
             'sample_age': adc_age,
-            'sample_age_diagnostic_only': True,
+            'sample_age_diagnostic_only': False,
             'debounce_age': debounce_age,
             'observation_revision': observation_revision,
             'state_revision': state_revision,
@@ -1948,11 +1952,13 @@ class SnapmakerU1Endpoint(Endpoint):
         result['stream_probe_supported'] = True
         return result
 
-    def require_entry_sensor_snapshot(self, timeout=1.25):
+    def require_entry_sensor_snapshot(self, timeout=1.25, expected=None):
 
         deadline = self.manager.reactor.monotonic() + max(0.0, float(timeout))
         last = self.entry_sensor_snapshot()
-        while (last.get('adc_available') and not last.get('available') and
+        while ((not last.get('available') or
+                (expected is not None and
+                 last.get('physical_detected') is not expected)) and
                self.manager.reactor.monotonic() < deadline):
             now = self.manager.reactor.monotonic()
             self.manager.reactor.pause(min(deadline, now + 0.05))
@@ -1971,64 +1977,13 @@ class SnapmakerU1Endpoint(Endpoint):
             raise EndpointError(
                 'U1_ENTRY_SENSOR_UNAVAILABLE: %s has no physical sensor state' %
                 (last.get('sensor') or self.name))
-        return last
-
-    def arm_entry_motion_latch(self, reason=''):
-
-        snapshot = self.require_entry_sensor_snapshot(timeout=1.25)
-        if not snapshot.get('adc_available'):
+        if (expected is not None and
+                last.get('physical_detected') is not expected):
             raise EndpointError(
-                'U1 motion sensor has no readable stock ADC backend')
-        self._entry_motion_latch_generation += 1
-        token = {
-            'generation': self._entry_motion_latch_generation,
-            'sensor': snapshot.get('sensor'),
-            'backend_id': int(snapshot.get('adc_backend_id', 0) or 0),
-            'state_revision': int(snapshot.get('state_revision', 0) or 0),
-            'accepted_phase': snapshot.get('physical_detected'),
-            'callback_phase': snapshot.get('callback_detected'),
-            'adc_timestamp': snapshot.get('adc_timestamp'),
-            'armed_at': self.manager.reactor.monotonic(),
-            'reason': str(reason or '')[:120],
-        }
-        logging.info(
-            'BMCU armed read-only U1 SEND_OUT phase latch %s generation=%d '
-            'phase=%s (%s)', snapshot.get('sensor') or self.name,
-            token['generation'], token.get('accepted_phase'),
-            token.get('reason') or 'arrival')
-        return token
-
-    def entry_motion_latch_status(self, token):
-
-        if not isinstance(token, dict):
-            raise EndpointError('invalid U1 motion-latch token')
-        snapshot = self.entry_sensor_snapshot()
-        if not snapshot.get('available') or not snapshot.get('coherent'):
-            result = dict(snapshot)
-            result.update({'triggered': False, 'backend_changed': False,
-                           'event_advanced': False})
-            return result
-        expected_backend = int(token.get('backend_id', 0) or 0)
-        current_backend = int(snapshot.get('adc_backend_id', 0) or 0)
-        backend_changed = bool(
-            expected_backend and current_backend != expected_backend)
-        baseline_revision = int(token.get('state_revision', 0) or 0)
-        state_advanced = bool(
-            int(snapshot.get('state_revision', 0) or 0) > baseline_revision)
-        phase_changed = bool(
-            snapshot.get('physical_detected') != token.get('accepted_phase'))
-        result = dict(snapshot)
-        result.update({
-            'triggered': bool(
-                not backend_changed and state_advanced and phase_changed),
-            'backend_changed': backend_changed,
-            'event_advanced': state_advanced,
-            'accepted_phase_changed': phase_changed,
-            'latch_generation': token.get('generation'),
-            'latch_reason': token.get('reason', ''),
-            'read_only_observer': True,
-        })
-        return result
+                'U1_ENTRY_SENSOR_MISMATCH: %s expected=%s detected=%s' %
+                (last.get('sensor') or self.name, expected,
+                 last.get('physical_detected')))
+        return last
 
     def synchronize_entry_sensor_cache(self, expected, reason=''):
 
@@ -2150,21 +2105,19 @@ class SnapmakerU1Endpoint(Endpoint):
         else:
             self.verify_selected()
 
-        verified = self.synchronize_entry_sensor_cache(
-            False, reason='BMCU firmware completed signed pullback')
+        verified = self.require_entry_sensor_snapshot(expected=False)
         return {
             'sensor': verified.get('sensor'),
             'detected': False,
             'motion_sensor_source': verified.get('source'),
-            'final_motion_phase': verified.get('motion_phase'),
+            'physical_detected': verified.get('physical_detected'),
             'adc_value': verified.get('adc_value'),
             'sample_age': verified.get('sample_age'),
             'measured_mm': measured_mm,
             'required_park': bool(require_park),
             'reconciled': True,
-            'reconcile_basis': 'firmware_completed_signed_pullback',
-            'hardware_verified': False,
-            'motion_sensor_phase_ignored': True,
+            'reconcile_basis': 'completed_pullback_and_entry_sensor_clear',
+            'hardware_verified': True,
         }
 
     def commit_native_path_empty(self, sensor_snapshot=None,
@@ -2822,6 +2775,16 @@ class SnapmakerU1Endpoint(Endpoint):
         if task_key == main_type and task_soft is not None:
             soft = bool(task_soft)
 
+        nozzle = 0.4
+        extruder = self.printer.lookup_object(
+            str(self.get('extruder', 'extruder')), None)
+        heater = getattr(extruder, 'heater', None) if extruder is not None else None
+        if extruder is not None:
+            candidate_nozzle = _coerce_finite_float(
+                getattr(extruder, 'nozzle_diameter', nozzle))
+            if candidate_nozzle is not None and 0.05 <= candidate_nozzle <= 2.0:
+                nozzle = candidate_nozzle
+
         parameters = self.printer.lookup_object('filament_parameters', None)
         material_load_temp = _coerce_finite_float(
             self.get('u1_load_temp', 250.0) or 250.0)
@@ -2838,8 +2801,12 @@ class SnapmakerU1Endpoint(Endpoint):
                     parameters.get_load_temp(vendor, main_type, sub_type))
                 candidate_unload = _coerce_finite_float(
                     parameters.get_unload_temp(vendor, main_type, sub_type))
+                flow_temp = getattr(parameters, 'get_flow_temp', None)
                 candidate_flow = _coerce_finite_float(
-                    parameters.get_flow_temp(vendor, main_type, sub_type))
+                    flow_temp(vendor, main_type, sub_type)
+                    if callable(flow_temp) else parameters.get_print_temp(
+                        vendor, main_type, sub_type, nozzle,
+                        getattr(extruder, 'nozzle_volume_type', 'standard')))
                 if (candidate_load is None or candidate_unload is None or
                         candidate_flow is None or
                         not 0.0 <= candidate_load <= 350.0 or
@@ -2856,16 +2823,6 @@ class SnapmakerU1Endpoint(Endpoint):
             except Exception:
                 logging.exception(
                     'BMCU could not query U1 filament parameters; using safe defaults')
-
-        nozzle = 0.4
-        extruder = self.printer.lookup_object(
-            str(self.get('extruder', 'extruder')), None)
-        heater = getattr(extruder, 'heater', None) if extruder is not None else None
-        if extruder is not None:
-            candidate_nozzle = _coerce_finite_float(
-                getattr(extruder, 'nozzle_diameter', nozzle))
-            if candidate_nozzle is not None and 0.05 <= candidate_nozzle <= 2.0:
-                nozzle = candidate_nozzle
 
         safe_minimum = _coerce_finite_float(
             getattr(heater, 'min_extrude_temp', None))

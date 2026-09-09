@@ -182,11 +182,13 @@ class RuntimeClient:
         if self.hello['channels'] != 4:
             raise RuntimeError('unsupported BMCU channel count %s' % self.hello['channels'])
         if (self.hello['protocol'] != protocol.PROTO_VERSION or
-                tuple(self.hello.get('firmware_tuple', (0, 0, 0))) !=
-                protocol.REQUIRED_FIRMWARE):
+                not protocol.firmware_is_compatible(
+                    self.hello.get('firmware_tuple', (0, 0, 0)))):
             raise RuntimeError(
-                'BMCU firmware does not match host %s; flash bundled firmware %s' %
-                (protocol.REQUIRED_FIRMWARE_TEXT,
+                'BMCU firmware is outside the supported %s..%s range; '
+                'flash bundled firmware %s' %
+                ('.'.join(str(part) for part in protocol.MIN_COMPATIBLE_FIRMWARE),
+                 protocol.REQUIRED_FIRMWARE_TEXT,
                  protocol.REQUIRED_FIRMWARE_TEXT))
         self.request(protocol.MSG_SESSION_CONFIRM,
                      struct.pack('<I', int(self.hello['session_id']) & 0xFFFFFFFF),
@@ -212,16 +214,33 @@ class RuntimeClient:
     def cancel_update(self):
         return self.request(protocol.MSG_UPDATE_CANCEL, timeout=2.0)
 
-    def export_nvm(self, chunk_size: int = 224):
+    def export_nvm(self, chunk_size: int = 224, retries: int = 3):
         if chunk_size < 16 or chunk_size > 224:
             raise ValueError('chunk_size must be 16..224')
+        if retries < 1 or retries > 5:
+            raise ValueError('retries must be 1..5')
         self.prepare_update()
         image = bytearray(4096)
         expected_crc = None
         for offset in range(0, 4096, chunk_size):
             amount = min(chunk_size, 4096 - offset)
-            raw = self.request(protocol.MSG_NVM_READ, struct.pack('<HH', offset, amount),
-                               expected=(protocol.MSG_NVM_DATA,), timeout=3.0)
+            raw = None
+            for attempt in range(1, retries + 1):
+                try:
+                    raw = self.request(
+                        protocol.MSG_NVM_READ,
+                        struct.pack('<HH', offset, amount),
+                        expected=(protocol.MSG_NVM_DATA,), timeout=3.0)
+                    break
+                except TimeoutError:
+                    if attempt >= retries:
+                        raise TimeoutError(
+                            'runtime NVM read timeout offset=%d length=%d '
+                            'after %d attempt(s)' %
+                            (offset, amount, retries))
+                    time.sleep(0.050 * attempt)
+            if raw is None:
+                raise RuntimeError('NVM read produced no data at %d' % offset)
             item = protocol.parse_nvm_data(raw)
             if item['offset'] != offset or item['length'] != amount:
                 raise RuntimeError('NVM chunk mismatch at %d' % offset)
