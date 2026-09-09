@@ -1618,7 +1618,8 @@ function candidateMatchesPort(candidate, port) {
 }
 
 function managedUpdateDevices() {
-  return devices().filter(deviceReady);
+  return devices().filter((device) => Boolean(
+    device?.name && device?.uid && (device?.transport_port || device?.port)));
 }
 
 function rawSerialCandidates(mode = selectedFlashMode()) {
@@ -1647,13 +1648,18 @@ function rawSerialCandidates(mode = selectedFlashMode()) {
 
 function syncDeviceSelect(select) {
   if (ui.updateInProgress) return;
-  const options = managedUpdateDevices().map((device) => [device.name, `${deviceLabel(device)} - firmware ${device.firmware || 'unknown'}`]);
-  for (const candidate of rawSerialCandidates()) {
-    const identity = [candidate.usb_vid && candidate.usb_pid ? `${candidate.usb_vid}:${candidate.usb_pid}` : '', candidate.driver].filter(Boolean).join(' ');
-    const type = selectedFlashMode() === 'usb' ? 'USB-TTL' : 'TTL candidate';
-    options.push([`raw:${candidate.path}`, `${type} - unknown firmware${identity ? ` [${identity}]` : ''} - ${candidate.path}`]);
+  const mode = selectedFlashMode();
+  const managed = managedUpdateDevices();
+  const options = managed.map((device) => [device.name, `${deviceLabel(device)} - firmware ${device.firmware || 'unknown'}`]);
+  if (mode === 'ttl') {
+    options.unshift(['', 'None / unassigned']);
+  } else {
+    for (const candidate of rawSerialCandidates()) {
+      const identity = [candidate.usb_vid && candidate.usb_pid ? `${candidate.usb_vid}:${candidate.usb_pid}` : '', candidate.driver].filter(Boolean).join(' ');
+      options.push([`raw:${candidate.path}`, `USB-TTL - unknown firmware${identity ? ` [${identity}]` : ''} - ${candidate.path}`]);
+    }
   }
-  const empty = selectedFlashMode() === 'usb' ? 'No BMCU or USB-TTL adapter detected' : 'No BMCU or serial port detected';
+  const empty = mode === 'usb' ? 'No BMCU or USB-TTL adapter detected' : 'None / unassigned';
   syncSelectOptions(select, options.length ? options : [['', empty]]);
 }
 
@@ -1776,7 +1782,7 @@ function createTailTrackingSetting() {
     <div class="form-grid">
       <h4 class="generic-advanced-heading">Generic Klipper toolhead</h4>
       <label class="field"><span>Extruder object</span><select class="extruder-object"></select><small>Choose the printer-owned extruder detected by Klipper. BMCU never sends extruder moves or guesses hotend geometry for generic Klipper.</small></label>
-      <label class="field"><span>Loading arrival sensor</span><select class="entry-sensor"></select><small>Optional. If this sensor detects filament during Loading, SEND OUT stops and Toolhead preparation starts immediately. Without it, the buffer threshold ends Loading.</small></label>
+      <label class="field"><span>Loading arrival sensor</span><select class="entry-sensor"></select><small>When selected, this sensor must confirm filament arrival before Toolhead preparation starts. The buffer threshold confirms arrival only when no arrival sensor is selected.</small></label>
       <label class="field full"><span>Toolhead preparation macro</span><select class="toolhead-prepare-macro"></select><small><strong>Required.</strong> Choose one detected Klipper macro. Runs while BMCU is in <strong>Preparing / BEFORE_ON_USE</strong>, after SEND OUT reaches this toolhead. This one macro owns the complete toolhead-side load: heating, extruder capture, movement to the melt zone/nozzle and any seat/prime needed to be print-ready. BMCU waits for the macro to finish before switching to In use.</small></label>
       <label class="field full"><span>Before pullback macro</span><select class="before-pullback-macro"></select><small><strong>Required.</strong> Choose one detected Klipper macro. Runs while BMCU is in <strong>BEFORE_PULL_BACK</strong>. This one macro owns the complete toolhead-side unload: heating, tip-forming or cutting, retracting through the hotend and releasing the filament from the extruder. It must finish only when BMCU may safely perform the long PTFE pullback.</small></label>
       <p class="generic-note full">Both macros receive <code>ENDPOINT</code>, <code>MATERIAL</code> and <code>REASON</code> parameters. They may ignore parameters they do not need. BMCU never adds hidden extrusion distances, temperatures, purge moves or cutter logic around these macros.</p>
@@ -2893,7 +2899,7 @@ function createBmcuSettingsDevice() {
     <div class="section-head bmcu-settings-device-head"><div><h3></h3><p class="bmcu-settings-device-state"></p></div><span class="badge bmcu-settings-device-badge"></span></div>
     <section class="bmcu-tuning-grid">
       <div class="bmcu-tuning-card">
-        <div class="bmcu-settings-group-head"><strong>Loading -> preparation threshold</strong><small>Ends Loading at this buffer level. A toolhead arrival sensor can end Loading earlier.</small></div>
+        <div class="bmcu-settings-group-head"><strong>Loading -> preparation threshold</strong><small>Ends Loading when no arrival sensor is configured. With an arrival sensor, only that sensor confirms arrival. Preparation pressure remains independently controlled.</small></div>
         <div class="bmcu-handoff-slot"></div>
       </div>
       <div class="bmcu-tuning-card">
@@ -2926,8 +2932,13 @@ function updateBmcuSettingsDevice(node, device) {
   text(node.querySelector('.bmcu-settings-device-head h3'), deviceLabel(device));
   const ready = deviceReady(device);
   const state = node.querySelector('.bmcu-settings-device-state');
+  const actualFirmware = String(device.firmware || 'unknown');
+  const targetFirmware = firmwareTargetVersion();
+  const firmwareSuffix = ready && targetFirmware && versionNewer(targetFirmware, actualFirmware)
+    ? ` - Update available: ${targetFirmware}`
+    : '';
   text(state, ready
-    ? `Connected - firmware ${device.firmware || 'unknown'}`
+    ? `Connected - firmware ${actualFirmware}${firmwareSuffix}`
     : `Disconnected - ${device.port || 'last configured serial port'}`);
   const badge = node.querySelector('.bmcu-settings-device-badge');
   badge.className = `badge bmcu-settings-device-badge ${ready ? 'good' : 'bad'}`;
@@ -2962,10 +2973,39 @@ function versionNewer(remote, current) {
   return false;
 }
 
+function firmwareTargetVersion() {
+  const bundled = String(store.state.config.required_firmware_version || '');
+  const remote = String(ui.remoteVersions?.firmware || '');
+  if (!bundled) return remote;
+  if (!remote) return bundled;
+  return versionNewer(remote, bundled) ? remote : bundled;
+}
+
+function renderFirmwareVersionSummary() {
+  const node = $('firmwareVersionSummary');
+  if (!node) return;
+  const selected = selectedUpdateDevice();
+  const actual = selected && !selected.raw && selected.device
+    ? String(selected.device.firmware || 'unknown')
+    : 'unknown';
+  const bundled = String(store.state.config.required_firmware_version || 'unknown');
+  const online = String(ui.remoteVersions?.firmware || 'unavailable');
+  const selectedText = selected && !selected.raw ? `Selected BMCU: ${actual}` : 'Selected BMCU: unassigned';
+  text(node, `${selectedText} · Bundled firmware: ${bundled} · Published online firmware: ${online}`);
+  const onlineButton = $('updateOnline');
+  if (onlineButton) {
+    const remoteOlder = online !== 'unavailable' && bundled !== 'unknown' && versionNewer(bundled, online);
+    onlineButton.disabled = ui.firmwareUploadRunning || ui.updateInProgress || remoteOlder;
+    onlineButton.title = remoteOlder
+      ? `Published online firmware ${online} is older than bundled target ${bundled}; use Flash local file.`
+      : '';
+  }
+}
+
 function firmwareUpdateCount() {
-  const remote = ui.remoteVersions?.firmware;
-  if (!remote) return 0;
-  return devices().filter((device) => versionNewer(remote, device.firmware)).length;
+  const target = firmwareTargetVersion();
+  if (!target) return 0;
+  return devices().filter((device) => versionNewer(target, device.firmware)).length;
 }
 
 function renderReleaseStatus() {
@@ -2975,15 +3015,17 @@ function renderReleaseStatus() {
     setClass(node, 'hidden', false);
     node.className = 'release-status';
     text(label, 'Checking updates');
-  } else if (!ui.remoteVersions) {
-    setClass(node, 'hidden', true);
   } else {
-    const packageNew = versionNewer(
+    const packageNew = Boolean(ui.remoteVersions?.package) && versionNewer(
       ui.remoteVersions.package, store.state.config.package_version);
     const firmwareNew = firmwareUpdateCount() > 0;
-    setClass(node, 'hidden', false);
-    node.className = `release-status ready ${packageNew || firmwareNew ? 'warn' : 'good'}`;
-    text(label, packageNew || firmwareNew ? 'Update available' : 'Up to date');
+    if (!ui.remoteVersions && !firmwareNew) {
+      setClass(node, 'hidden', true);
+    } else {
+      setClass(node, 'hidden', false);
+      node.className = `release-status ready ${packageNew || firmwareNew ? 'warn' : 'good'}`;
+      text(label, packageNew || firmwareNew ? 'Update available' : 'Up to date');
+    }
   }
 
   const actions = $('packageUpdateActions');
@@ -3011,6 +3053,7 @@ async function checkReleaseVersions() {
   } finally {
     ui.versionChecking = false;
     renderReleaseStatus();
+    renderFirmwareVersionSummary();
     render();
   }
 }
@@ -3030,6 +3073,7 @@ function renderSettings() {
   syncDeviceSelect($('updateDevice'));
   syncUpdatePortOptions();
   syncFlashModeUI();
+  renderFirmwareVersionSummary();
   renderFirmwareSafetyDialog();
   renderCalibrationSafetyDialog();
   const ready = devices().filter(deviceReady).length;
@@ -3047,21 +3091,10 @@ function renderSettings() {
         : `${packageVersion} - Up to date`)
       : packageVersion)
     : 'Unavailable';
-  const connectedFirmware = devices().map((device) => String(device.firmware || '')).filter(Boolean);
-  const firmwareVersion = connectedFirmware.length === 1
-    ? connectedFirmware[0]
-    : (store.state.config.required_firmware_version || 'unknown');
-  const remoteFirmware = ui.remoteVersions?.firmware || '';
-  const firmwareVersionText = remoteFirmware
-    ? (versionNewer(remoteFirmware, firmwareVersion)
-      ? `${firmwareVersion} - New version available: ${remoteFirmware}`
-      : `${firmwareVersion} - Up to date`)
-    : firmwareVersion;
   const info = [
     ['Detected printer', topologyLabels[topology] || topology],
     ['Filament sensors', Array.isArray(printerInfo().filament_sensors) ? String(printerInfo().filament_sensors.length) : 'unknown'],
     ['Package version', packageVersionText],
-    ['BMCU firmware', firmwareVersionText],
     ['Connected BMCU', devices().length ? `${ready} of ${devices().length} ready` : 'Not detected'],
   ];
   syncKeyed($('systemInfo'), info, (item) => item[0], () => {
@@ -3714,15 +3747,26 @@ async function continueCalibration() {
 
 function selectedUpdateDevice() {
   const managed = managedUpdateDevices();
-  const value = $('updateDevice').value || managed[0]?.name || '';
+  const mode = selectedFlashMode();
+  const value = $('updateDevice').value || '';
   if (value.startsWith('raw:')) {
     const path = value.slice(4);
     const candidate = rawSerialCandidates().find((item) => item.path === path) || {path};
     return {name: 'raw_ch340', port: candidate.path || path, raw: true, candidate};
   }
-  const device = managed.find((item) => item.name === value) || managed[0] || {};
-  return {name: device.name || value || 'bmcu0',
-    port: device.transport_port || device.port || '', raw: false, device};
+  const device = managed.find((item) => item.name === value);
+  if (device) {
+    return {name: device.name,
+      port: device.transport_port || device.port || '', raw: false, device};
+  }
+  if (mode === 'ttl') {
+    const path = String($('updatePort')?.value || '');
+    const candidate = serialCandidates().find((item) => candidateMatchesPort(item, path)) || {path};
+    return {name: 'raw_ttl', port: candidate.path || path, raw: true, candidate};
+  }
+  const fallback = managed[0] || {};
+  return {name: fallback.name || 'bmcu0',
+    port: fallback.transport_port || fallback.port || '', raw: false, device: fallback};
 }
 
 function selectedFlashMode() {
@@ -3742,6 +3786,47 @@ function configuredSerialPorts() {
   return values;
 }
 
+function managedDeviceForSerialPort(port) {
+  const value = String(port || '');
+  if (!value) return null;
+  const candidates = serialCandidates();
+  const selectedCandidate = candidates.find((candidate) => candidateMatchesPort(candidate, value));
+  return managedUpdateDevices().find((device) => {
+    const devicePort = String(device.transport_port || device.port || '');
+    if (!devicePort) return false;
+    if (devicePort === value) return true;
+    if (!selectedCandidate) return false;
+    return candidateMatchesPort(selectedCandidate, devicePort);
+  }) || null;
+}
+
+function syncTtlDeviceFromPort() {
+  if (ui.updateInProgress || selectedFlashMode() !== 'ttl') return;
+  const deviceSelect = $('updateDevice');
+  const port = String($('updatePort')?.value || '');
+  const matched = managedDeviceForSerialPort(port);
+  const next = matched ? matched.name : '';
+  if (deviceSelect.value !== next) deviceSelect.value = next;
+  setClass($('unknownCh340Notice'), 'hidden', Boolean(matched) || !port);
+}
+
+function syncTtlPortFromDevice() {
+  if (ui.updateInProgress || selectedFlashMode() !== 'ttl') return;
+  const value = String($('updateDevice')?.value || '');
+  if (!value) {
+    $('updatePort').value = '';
+    setClass($('unknownCh340Notice'), 'hidden', true);
+    renderFirmwareVersionSummary();
+    return;
+  }
+  const device = managedUpdateDevices().find((item) => item.name === value);
+  if (!device) return;
+  const devicePort = String(device.transport_port || device.port || '');
+  const candidate = serialCandidates().find((item) => candidateMatchesPort(item, devicePort));
+  $('updatePort').value = candidate ? candidate.path : '';
+  setClass($('unknownCh340Notice'), 'hidden', true);
+}
+
 function syncUpdatePortOptions() {
   const select = $('updatePort');
   if (!select) return;
@@ -3759,20 +3844,29 @@ function syncUpdatePortOptions() {
   $('updateDevice').disabled = false;
   $('updatePortsRefresh').disabled = false;
   $('updateFileLocal').disabled = false;
-  $('updateUpload').disabled = ui.firmwareUploadRunning;
-  $('updateOnline').disabled = ui.firmwareUploadRunning;
+  $('updateUpload').disabled = ui.firmwareUploadRunning || ui.updateInProgress;
+  $('updateOnline').disabled = ui.firmwareUploadRunning || ui.updateInProgress;
+  renderFirmwareVersionSummary();
   for (const radio of qsa('input[name="updateMode"]')) radio.disabled = false;
   const options = configuredSerialPorts();
+  const previousPort = select.value;
   syncSelectOptions(select, options.length ? options : [['', 'No serial port detected']]);
   const mode = selectedFlashMode();
+  if (previousPort && options.some(([port]) => port === previousPort)) select.value = previousPort;
+  else if (mode === 'ttl') select.value = '';
   const device = selectedUpdateDevice();
-  if (device.raw && device.port && select.value !== device.port) select.value = device.port;
-  else if (device.port) {
-    const candidate = serialCandidates().find((item) => candidateMatchesPort(item, device.port));
-    if (candidate && select.value !== candidate.path) select.value = candidate.path;
+  if (mode === 'usb') {
+    if (device.raw && device.port && select.value !== device.port) select.value = device.port;
+    else if (device.port) {
+      const candidate = serialCandidates().find((item) => candidateMatchesPort(item, device.port));
+      select.value = candidate ? candidate.path : '';
+    }
+    select.disabled = Boolean(device.raw || device.port);
+    setClass($('unknownCh340Notice'), 'hidden', !device.raw);
+  } else {
+    select.disabled = false;
+    syncTtlDeviceFromPort();
   }
-  select.disabled = Boolean(device.raw || (mode === 'usb' && device.port));
-  setClass($('unknownCh340Notice'), 'hidden', !device.raw);
 }
 
 function syncFlashModeUI() {
@@ -3799,8 +3893,24 @@ async function refreshSerialPorts(notify = false) {
 }
 
 function updateMessage(message, error = false) {
-  text($('updateStatus'), message);
-  $('updateStatus').className = `update-status ${error ? 'bad' : ''}`;
+  const node = $('updateStatus');
+  const value = String(message || '')
+    .replace(/\bhold BOOT\b/gi, 'HOLD BOOT')
+    .replace(/\btap RESET\b/gi, 'PRESS RESET')
+    .replace(/\brelease BOOT\b/gi, 'RELEASE BOOT');
+  node.replaceChildren();
+  const parts = value.split(/\b(PRESS|HOLD|RELEASE|BOOT|RESET)\b/gi);
+  for (const part of parts) {
+    if (!part) continue;
+    if (/^(PRESS|HOLD|RELEASE|BOOT|RESET)$/i.test(part)) {
+      const strong = document.createElement('strong');
+      strong.textContent = part.toUpperCase();
+      node.appendChild(strong);
+    } else {
+      node.appendChild(document.createTextNode(part));
+    }
+  }
+  node.className = `update-status ${error ? 'bad' : ''}`;
 }
 
 function firmwareFlashRequest(online = false) {
@@ -4011,24 +4121,6 @@ async function continueFirmwareUpload() {
 
 async function beginFirmwareFlash(online = false) {
   if (ui.updateInProgress || ui.firmwareUploadRunning) return;
-  try {
-    const statusResponse = await fetch('/api/update/status', {cache: 'no-store'});
-    const status = await statusResponse.json();
-    if (!statusResponse.ok) throw new Error(status?.error?.message || `HTTP ${statusResponse.status}`);
-    if (status.recovery_required) {
-      ui.updateInProgress = true;
-      const response = await fetch('/api/update/recover', {method: 'POST'});
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload?.error?.message || `HTTP ${response.status}`);
-      updateMessage('Retrying the interrupted flash using the preserved image.');
-      pollUpdate(true);
-      return;
-    }
-  } catch (error) {
-    ui.updateInProgress = false;
-    updateMessage(error.message || String(error), true);
-    return;
-  }
   const request = firmwareFlashRequest(online);
   if (!request) return;
   ui.flashRestartRequested = false;
@@ -4061,11 +4153,11 @@ async function pollUpdate(force = false) {
       syncUpdatePortOptions();
       updateMessage(`${value.stage || 'Updating'} - ${value.percent || 0}%${value.message ? ` - ${value.message}` : ''}`);
       ui.updateTimer = setTimeout(() => pollUpdate(false), 900);
-    } else if (value.recovery_required) {
+    } else if (value.interrupted_flash && result.ok !== true) {
       ui.updateInProgress = false;
       ui.updatePort = '';
       syncUpdatePortOptions();
-      updateMessage('Previous flash was interrupted. Press Flash firmware to retry safely using the preserved image.', true);
+      updateMessage('Previous flash was interrupted. Start a fresh local or online flash; only preserved calibration NVM will be reused, never old firmware.', true);
     } else if (result.ok === true) {
       if (ui.updatePort) {
         ui.suppressUnknownPort = ui.updatePort;
@@ -4074,7 +4166,10 @@ async function pollUpdate(force = false) {
       ui.updateInProgress = false;
       ui.updatePort = '';
       syncUpdatePortOptions();
-      const message = result.message || 'Firmware update completed.';
+      const ttlResetPending = result.mode === 'ttl' && result.runtime_reconnect_pending === true;
+      const message = ttlResetPending
+        ? 'Firmware verified. PRESS RESET once on the BMCU to start the application.'
+        : (result.message || 'Firmware update completed.');
       updateMessage(message, Boolean(result.adoption_error));
       if (result.restart_required && !ui.flashRestartRequested) {
         ui.flashRestartRequested = true;
@@ -4579,7 +4674,15 @@ function bindEvents() {
     if (!$('flashSafetyDialog').open) ui.pendingFirmwareUpload = null;
   });
   $('updatePortsRefresh').addEventListener('click', () => refreshSerialPorts(true));
-  $('updateDevice').addEventListener('change', syncUpdatePortOptions);
+  $('updateDevice').addEventListener('change', () => {
+    if (selectedFlashMode() === 'ttl') syncTtlPortFromDevice();
+    renderFirmwareVersionSummary();
+    syncUpdatePortOptions();
+  });
+  $('updatePort').addEventListener('change', () => {
+    if (selectedFlashMode() === 'ttl') syncTtlDeviceFromPort();
+    renderFirmwareVersionSummary();
+  });
   $('openDiagnosticsExport').addEventListener('click', () => openDialog($('diagnosticsExportDialog')));
   $('diagnosticsSelectAll').addEventListener('click', () => setDiagnosticsSelection(true));
   $('diagnosticsSelectNone').addEventListener('click', () => setDiagnosticsSelection(false));

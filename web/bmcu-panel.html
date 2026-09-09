@@ -117,7 +117,7 @@
           <div id="flashDangerNotice" class="notice error compact"><span class="notice-icon">!</span><div><h3>Danger - firmware flashing can reprogram the wrong device</h3><p>Be extremely careful with every flash method. Selecting the wrong device or serial port can erase or reprogram another printer/controller device. The safest option is to flash the BMCU from a PC or phone with only the intended BMCU or adapter connected. When flashing from a printer: unplug the intended BMCU or adapter, refresh the serial-port list and confirm its port disappears; reconnect it, refresh again and confirm the same port returns. Continue only if you know exactly what you are doing and have positively identified the target. This applies to both USB and TTL.</p></div></div>
           <div class="flash-mode-grid" role="radiogroup" aria-label="Firmware flash method">
             <label class="flash-mode-card"><input type="radio" name="updateMode" value="usb" checked><span><strong>USB</strong><small>Built-in USB-UART connection. BOOT and RESET are controlled automatically through DTR/RTS. Do not press any buttons.</small></span></label>
-            <label class="flash-mode-card"><input type="radio" name="updateMode" value="ttl"><span><strong>TTL</strong><small>Expert mode. Manual BOOT/RESET and direct access to every detected serial port. When prompted, hold BOOT, tap RESET and release BOOT.</small></span></label>
+            <label class="flash-mode-card"><input type="radio" name="updateMode" value="ttl"><span><strong>TTL</strong><small>Expert mode. Manual BOOT/RESET and direct access to every detected serial port. A known serial port is linked to its BMCU connection automatically; unassigned ports show None. When prompted: HOLD BOOT, PRESS RESET, then RELEASE BOOT.</small></span></label>
           </div>
           <div id="unknownCh340Notice" class="notice error compact hidden"><span class="notice-icon">!</span><div><h3>Unknown serial device selected</h3><p>Do not trust the port name alone. Unplug the intended BMCU adapter and refresh - this exact port must disappear. Reconnect it and refresh again - the same port must return. If you cannot prove that, do not flash it.</p></div></div>
           <div class="update-pane firmware-flash-pane">
@@ -126,7 +126,7 @@
             <button id="updatePortsRefresh" class="button secondary" type="button">Refresh serial ports</button>
             <label class="field full"><span>Firmware .bin</span><input id="updateFileLocal" type="file" accept=".bin,application/octet-stream"></label>
             <p class="firmware-note">Online downloads the latest published firmware; local mode flashes the selected file as-is. Both use the same flasher. Application image: 1-61440 bytes. Complete image: exactly 65536 bytes.</p>
-            <div class="firmware-actions full"><button id="updateOnline" class="button primary" type="button">Download latest & flash</button><button id="updateUpload" class="button secondary" type="button">Flash local file</button></div>
+            <div id="firmwareVersionSummary" class="muted full"></div><div class="firmware-actions full"><button id="updateOnline" class="button primary" type="button">Download latest & flash</button><button id="updateUpload" class="button secondary" type="button">Flash local file</button></div>
           </div>
           <div id="updateStatus" class="update-status">No firmware flash is running.</div>
         </section>

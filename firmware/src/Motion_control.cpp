@@ -2834,6 +2834,14 @@ static void motor_motion_switch(uint64_t time_now)
                     filament_pull_back_meters[num] = A.filament[num].meters;
                 }
 
+                const float target = motion_control_pull_back_distance(num);
+                const float retracted = filament_pull_back_meters[num] - A.filament[num].meters;
+                if (retracted >= target)
+                {
+                    MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
+                    break;
+                }
+
                 MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_before_pull_back, 300, time_now);
                 break;
             }

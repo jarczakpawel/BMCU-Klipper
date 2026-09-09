@@ -437,29 +437,17 @@ def build_orca_bundle(root, bmcu_count, colors, host, tools=None):
     profile_path = 'printer/%s.json' % profile_name
     process_path = 'process/%s.json' % process_profile['name']
     filament_path = 'filament/%s.json' % filament_profile['name']
-    bundle = {
-        'bundle_id': '_BMCU_OrcaSlicer_Snapmaker_U1',
-        'bundle_type': 'printer config bundle',
-        'filament_config': [filament_path],
-        'printer_config': [profile_path],
-        'printer_preset_name': profile_name,
-        'process_config': [process_path],
-        'version': '00.00.00.00',
-    }
     profile_raw = (json.dumps(
         profile, ensure_ascii=False, indent='\t') + '\n').encode('utf-8')
     process_raw = (json.dumps(
         process_profile, ensure_ascii=False, indent='\t') + '\n').encode('utf-8')
     filament_raw = (json.dumps(
         filament_profile, ensure_ascii=False, indent='\t') + '\n').encode('utf-8')
-    bundle_raw = json.dumps(
-        bundle, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(profile_path, profile_raw)
         archive.writestr(process_path, process_raw)
         archive.writestr(filament_path, filament_raw)
-        archive.writestr('bundle_structure.json', bundle_raw)
     return output.getvalue(), profile_raw, tool_count
 
 def build_snapmaker_orca_bundle(root, bmcu_count, colors, host, tools=None):
@@ -815,19 +803,21 @@ class UpdateJobs:
             value = dict(self.status)
             value['logs'] = list(self.status['logs'])
             transaction = pathlib.Path(self.state_dir, 'transaction.json')
-            value['recovery_required'] = False
-            value['recovery_phase'] = ''
+            value['interrupted_flash'] = False
+            value['interrupted_phase'] = ''
             if transaction.is_file() and not transaction.is_symlink():
                 try:
                     journal = json.loads(
                         read_limited_text(transaction, MAX_TRANSACTION_BYTES),
                         parse_constant=_reject_json_constant)
-                    value['recovery_required'] = bool(
-                        journal.get('recovery_required'))
-                    value['recovery_phase'] = str(journal.get('phase', ''))[:64]
+                    value['interrupted_flash'] = bool(
+                        journal.get('erase_started') or
+                        journal.get('recovery_required') is True or
+                        str(journal.get('phase') or '') == 'erase_started')
+                    value['interrupted_phase'] = str(journal.get('phase', ''))[:64]
                 except Exception:
-                    value['recovery_required'] = True
-                    value['recovery_phase'] = 'invalid_journal'
+                    value['interrupted_flash'] = True
+                    value['interrupted_phase'] = 'invalid_journal'
             return value
 
     def _append_log(self, level, message, job_id=None):
@@ -923,13 +913,13 @@ class UpdateJobs:
     def start(self, command, port='', mode='usb', variant='universal', device='bmcu0',
               firmware='', upload=None, raw_port=False, erase_nvm=False,
               replace_nvm=False, confirm_flash_target=False, confirm_ttl_target=False):
-        if command not in ('update', 'recover'):
+        if command != 'update':
             raise ValueError('invalid update command')
         raw_port = bool(raw_port)
         upload_info = None
         firmware_path = ''
         if command == 'update':
-            port = validate_serial_port(port, require_device=True)
+            port = validate_serial_port(port, require_device=bool(raw_port or mode == 'ttl'))
             if mode not in ('usb', 'ttl'):
                 raise ValueError('invalid flash mode')
             if variant != 'universal':
@@ -1290,7 +1280,7 @@ class UpdateJobs:
             result_raw_port = bool(current_result.get('raw_port', raw_port))
             result_port = str(current_result.get('port') or port)
             result_mode = str(current_result.get('mode') or mode)
-            if (code == 0 and command in ('update', 'recover') and result_raw_port and
+            if (code == 0 and command == 'update' and result_raw_port and
                     current_result.get('ok') is True):
                 try:
                     adoption = self._adopt_raw_port(
@@ -1346,8 +1336,17 @@ class UpdateJobs:
                     self.status['running'] = False
                     self.status['finished_at'] = time.time()
                     if code == 0:
-                        self.status['percent'] = 100
-                        self.status['stage'] = 'done'
+                        result_now = self.status.get('result') or {}
+                        ttl_reset_pending = (
+                            str(result_now.get('mode') or mode) == 'ttl' and
+                            result_now.get('runtime_reconnect_pending') is True)
+                        if ttl_reset_pending:
+                            self.status['percent'] = 99
+                            self.status['stage'] = 'ttl-reset'
+                            self.status['message'] = 'Firmware verified - press RESET once on the BMCU to start the application'
+                        else:
+                            self.status['percent'] = 100
+                            self.status['stage'] = 'done'
         except Exception as exc:
             with self.lock:
                 same_job = self.status.get('job_id') == job_id
@@ -1872,18 +1871,6 @@ class PanelHandler(http.server.SimpleHTTPRequestHandler):
                     raise ValueError('unknown firmware restart field')
                 triggered = self.jobs.restart_klipper_once(str(value.get('job_id', '')))
                 self._json(200, {'ok': True, 'triggered': triggered})
-            except RuntimeError as exc:
-                self._json_error(409, exc)
-            except Exception as exc:
-                self._json_error(400, exc)
-            return True
-        if self.command == 'POST' and action == 'recover':
-            try:
-                if not self._same_origin_post():
-                    self._json_error(403, 'cross-origin firmware recovery is blocked')
-                    return True
-                job_id = self.jobs.start('recover')
-                self._json(202, {'ok': True, 'job_id': job_id})
             except RuntimeError as exc:
                 self._json_error(409, exc)
             except Exception as exc:

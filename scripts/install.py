@@ -774,7 +774,7 @@ def migrate_lightweight_bmcu_cfg(data):
         ('reactor_yield_interval', ('0.002',), '0.005'),
         ('manager_work_yield_interval', ('0.005',), '0.010'),
         ('critical_motion_release_delay', ('0.100',), '0.500'),
-        ('required_runtime_sync_timeout', ('8.0',), '15.0'),
+        ('required_runtime_sync_timeout', ('8.0', '15.0', '20.0'), '30.0'),
         ('sidecar_status_interval', ('0.50',), '1.00'),
         ('transport_retry_interval', ('0.50',), '5.00'),
     )
@@ -851,7 +851,7 @@ def migrate_lightweight_bmcu_cfg(data):
         ('critical_motion_release_delay', '0.500'),
         ('transport_min_buffer', '1.50'),
         ('transport_retry_interval', '5.00'),
-        ('required_runtime_sync_timeout', '15.0'),
+        ('required_runtime_sync_timeout', '30.0'),
     )
     missing = [('%s: %s' % item) for item in desired
                if not re.search(r'(?m)^\s*%s\s*:' % re.escape(item[0]), block)]

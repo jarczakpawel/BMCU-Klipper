@@ -13,6 +13,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import stat
 import sys
 import tempfile
@@ -26,12 +27,16 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 _ROOT = str(Path(__file__).resolve().parents[1])
+_BMCU_DIR = str(Path(__file__).resolve().parents[2])
 _EXTRAS = str(Path(_ROOT) / 'klippy' / 'extras')
 if _EXTRAS not in sys.path:
     sys.path.insert(0, _EXTRAS)
 
-from bmcu_core.release import PACKAGE_VERSION
+from bmcu_core.release import PACKAGE_VERSION, REQUIRED_FIRMWARE, REQUIRED_FIRMWARE_TEXT
+from bmcu_core import transport
 from bmcu_isp import FLASH_SIZE, flash_image
+from bmcu_runtime import RuntimeClient
+import bmcu_host_bootstrap as host_bootstrap
 
 USER_AGENT = 'BMCU-Klipper-Updater/%s' % PACKAGE_VERSION
 
@@ -61,12 +66,30 @@ class ReleaseUnavailable(RuntimeError):
 class Reporter:
     def __init__(self, json_lines=False):
         self.json_lines = bool(json_lines)
+        self.log_path = None
+        self._last_dense_progress = None
+
+    def set_log_path(self, path):
+        self.log_path = Path(path)
+        atomic_write(self.log_path, b'', 0o600)
 
     def emit(self, kind, **values):
         item = {'type': kind, 'time': dt.datetime.now(dt.timezone.utc).isoformat()}
         item.update(values)
+        encoded = json.dumps(item, separators=(',', ':'), sort_keys=True)
+        if self.log_path is not None:
+            flags = os.O_WRONLY | os.O_APPEND | getattr(os, 'O_CLOEXEC', 0)
+            flags |= getattr(os, 'O_NOFOLLOW', 0)
+            fd = os.open(str(self.log_path), flags)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                    raise RuntimeError('firmware update log is unsafe')
+                os.write(fd, (encoded + '\n').encode('utf-8'))
+            finally:
+                os.close(fd)
         if self.json_lines:
-            print(json.dumps(item, separators=(',', ':'), sort_keys=True), flush=True)
+            print(encoded, flush=True)
         else:
             if kind == 'progress':
                 print('[%3d%%] %-10s %s' % (item.get('percent', 0),
@@ -80,7 +103,17 @@ class Reporter:
         self.emit('log', level=level, message=str(message))
 
     def progress(self, percent, stage, message=''):
-        self.emit('progress', percent=int(percent), stage=str(stage), message=str(message))
+        percent = int(percent)
+        stage = str(stage)
+        message = str(message)
+        if stage in ('program', 'verify'):
+            key = (stage, percent)
+            if key == self._last_dense_progress:
+                return
+            self._last_dense_progress = key
+        else:
+            self._last_dense_progress = None
+        self.emit('progress', percent=percent, stage=stage, message=message)
 
 class UpdateLock:
     def __init__(self, path):
@@ -244,7 +277,14 @@ def remote_firmware_version():
 
 def download_online_firmware(cache_dir, reporter):
     version = remote_firmware_version()
-    reporter.log('INFO', 'Downloading BMCU firmware %s' % version)
+    remote_tuple = tuple(int(part) for part in version.split('.'))
+    if remote_tuple < REQUIRED_FIRMWARE:
+        raise ReleaseUnavailable(
+            'outdated',
+            'Published BMCU firmware %s is older than this package target %s; '
+            'publish the matching release or flash the bundled/local firmware instead' %
+            (version, REQUIRED_FIRMWARE_TEXT))
+    reporter.log('INFO', 'Downloading fresh published BMCU firmware %s' % version)
     firmware = _http_bytes(REMOTE_FIRMWARE_URL, APP_SIZE, 60, 'firmware')
     if not firmware:
         raise RuntimeError('online firmware is empty')
@@ -364,22 +404,15 @@ def moonraker_gcode(moonraker, script, timeout=20):
         raise RuntimeError('invalid Moonraker response')
     return value
 
-def managed_access_device(moonraker, device, action, recovery=False):
+def managed_access_device(moonraker, device, action):
     action = str(action).upper()
-    if action not in ('EXPORT', 'PREPARE', 'CANCEL', 'RESUME', 'QUIESCE', 'UNQUIESCE', 'STATUS'):
+    if action not in ('EXPORT', 'PREPARE', 'CANCEL', 'RESUME', 'DETACH', 'ATTACH', 'QUIESCE', 'UNQUIESCE', 'STATUS'):
         raise ValueError('invalid managed-access action')
     device = str(device or '')
     if not re.match(r'^[A-Za-z0-9_.-]{1,64}$', device):
         raise RuntimeError('invalid BMCU device name')
     script = 'BMCU_UPDATE_ACCESS DEVICE=%s ACTION=%s' % (device, action)
-    if action == 'PREPARE' and recovery:
-        script += ' RECOVERY=1'
     return moonraker_gcode(moonraker, script)
-
-def managed_access(args, action, recovery=False):
-    if getattr(args, 'raw_port', False):
-        raise RuntimeError('managed BMCU access is unavailable for a raw serial adapter')
-    return managed_access_device(args.moonraker, args.device, action, recovery)
 
 def configured_device_for_port(args, port_identity):
 
@@ -392,7 +425,7 @@ def configured_device_for_port(args, port_identity):
         if not isinstance(item, dict):
             continue
         name = str(item.get('name') or '')
-        port = str(item.get('port') or '')
+        port = str(item.get('transport_port') or item.get('port') or '')
         if not name or not port:
             continue
         try:
@@ -405,6 +438,146 @@ def configured_device_for_port(args, port_identity):
     if len(matches) > 1:
         raise RuntimeError('more than one configured BMCU claims the selected serial device')
     return matches[0] if matches else ''
+
+def managed_device_names(moonraker):
+    status = moonraker_bmcu_status(moonraker)
+    devices = status.get('devices')
+    if not isinstance(devices, list):
+        raise RuntimeError('BMCU status has no device list')
+    return sorted(set(
+        str(item.get('name') or '') for item in devices
+        if isinstance(item, dict) and str(item.get('name') or '')))
+
+def service_detach_devices(args, devices):
+    detached = []
+    try:
+        for name in devices:
+            managed_access_device(args.moonraker, name, 'DETACH')
+            detached.append(name)
+    except Exception:
+        for name in reversed(detached):
+            try:
+                managed_access_device(args.moonraker, name, 'ATTACH')
+            except Exception:
+                pass
+        raise
+    return detached
+
+def service_attach_devices(args, devices):
+    errors = []
+    for name in reversed(list(devices or [])):
+        try:
+            managed_access_device(args.moonraker, name, 'ATTACH')
+        except Exception as exc:
+            errors.append('%s: %s' % (name, exc))
+    if errors:
+        raise RuntimeError('could not reconnect BMCU runtime after firmware service: %s' % '; '.join(errors))
+
+def _host_transport_context():
+    metadata_path = os.path.join(_ROOT, 'INSTALLATION.json')
+    metadata = host_bootstrap.read_metadata(metadata_path)
+    return metadata_path, metadata, _BMCU_DIR
+
+def _sidecar_control_request(path, command, timeout=3.0):
+    command = bytes(command)
+    if len(command) != 1:
+        raise RuntimeError('invalid BMCU sidecar control command')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as connection:
+        connection.bind('')
+        connection.setblocking(False)
+        connection.sendto(command, path)
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            try:
+                data = connection.recv(4096)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('BMCU sidecar did not answer status request')
+                time.sleep(0.020)
+                continue
+            try:
+                value = json.loads(data.decode('utf-8'), parse_constant=_reject_json_constant)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise RuntimeError('invalid BMCU sidecar status response') from exc
+            if (not isinstance(value, dict) or
+                    value.get('control') != command.decode('ascii')):
+                raise RuntimeError('invalid BMCU sidecar status acknowledgement')
+            return value
+
+def stop_host_transports_except(keep=()):
+    keep = set(str(name) for name in keep if name)
+    _metadata_path, _metadata, bmcu_dir = _host_transport_context()
+    lock = host_bootstrap.acquire_lock(bmcu_dir)
+    try:
+        runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
+        record_path = os.path.join(bmcu_dir, 'transport-processes.json')
+        records = host_bootstrap._read_transport_records(record_path)
+        remaining = {}
+        stopped = 0
+        for name, record in records.items():
+            if name in keep:
+                remaining[name] = record
+                continue
+            if host_bootstrap._recorded_transport_alive(record, runtime):
+                host_bootstrap._stop_transport_record(record, runtime)
+                stopped += 1
+        if records != remaining:
+            host_bootstrap._atomic_transport_records(record_path, remaining)
+        return stopped
+    finally:
+        os.close(lock)
+
+def start_host_transports(preferred_device=None, preferred_online_timeout=0.0):
+    metadata_path, _metadata, _bmcu_dir = _host_transport_context()
+    return host_bootstrap.sync_transports(
+        metadata_path, preferred_name=preferred_device,
+        preferred_online_timeout=preferred_online_timeout)
+
+def live_host_transport_status(device):
+    device = str(device or '')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', device):
+        raise RuntimeError('invalid BMCU device name')
+    _metadata_path, _metadata, bmcu_dir = _host_transport_context()
+    record_path = os.path.join(bmcu_dir, 'transport-processes.json')
+    records = host_bootstrap._read_transport_records(record_path)
+    record = records.get(device)
+    if not isinstance(record, dict):
+        raise RuntimeError('no live host transport record for %s' % device)
+    runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
+    if not host_bootstrap._recorded_transport_alive(record, runtime):
+        raise RuntimeError('host transport process is not alive for %s' % device)
+    socket_path = str(record.get('socket') or '')
+    if not socket_path:
+        raise RuntimeError('host transport control socket is unavailable for %s' % device)
+    status = _sidecar_control_request(
+        socket_path + '.ctl', transport.CTRL_STATUS, timeout=3.0)
+    if str(status.get('name') or '') != device:
+        raise RuntimeError('host transport status belongs to another BMCU')
+    if int(status.get('pid', 0) or 0) != int(record.get('pid', 0) or 0):
+        raise RuntimeError('host transport process identity changed for %s' % device)
+    port = str(status.get('port') or '')
+    if not port.startswith('/dev/'):
+        raise RuntimeError('host transport did not publish a live serial port for %s' % device)
+    return status
+
+def restore_service_runtime(args, devices):
+    start_error = None
+    try:
+        start_host_transports()
+    except Exception as exc:
+        start_error = exc
+    attach_error = None
+    try:
+        service_attach_devices(args, devices)
+    except Exception as exc:
+        attach_error = exc
+    if start_error or attach_error:
+        values = []
+        if start_error:
+            values.append('transport restart: %s' % start_error)
+        if attach_error:
+            values.append('Klipper attach: %s' % attach_error)
+        raise RuntimeError('; '.join(values))
 
 def raw_flash_guard_acquire(args, exclude=()):
     excluded = set(str(value) for value in exclude if value)
@@ -496,6 +669,39 @@ def assert_frozen_serial_port(identity):
         raise RuntimeError('serial device changed during firmware update')
     return current
 
+def serial_port_holder_pids(identity):
+    """Return Linux PIDs that currently hold the same character device.
+
+    This is a second ownership check after the managed sidecar processes have
+    been stopped. Failure to inspect an unrelated /proc entry is ignored; a
+    positive match is never ignored.
+    """
+    proc = Path('/proc')
+    if not proc.is_dir():
+        return []
+    target_rdev = int(identity['rdev'])
+    holders = set()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        fd_dir = entry / 'fd'
+        try:
+            fds = list(fd_dir.iterdir())
+        except (OSError, PermissionError):
+            continue
+        for fd_path in fds:
+            try:
+                info = os.stat(str(fd_path))
+            except OSError:
+                continue
+            if stat.S_ISCHR(info.st_mode) and int(info.st_rdev) == target_rdev:
+                holders.add(pid)
+                break
+    return sorted(holders)
+
 def wait_serial_port_free(identity, timeout=5.0):
     deadline = time.monotonic() + float(timeout)
     flags = os.O_RDWR | getattr(os, 'O_NOCTTY', 0) | getattr(os, 'O_NONBLOCK', 0)
@@ -503,15 +709,20 @@ def wait_serial_port_free(identity, timeout=5.0):
     last = None
     while True:
         assert_frozen_serial_port(identity)
-        try:
-            fd = os.open(identity['resolved'], flags)
-        except OSError as exc:
-            last = exc
-            if exc.errno not in (errno.EBUSY, errno.EAGAIN, errno.EWOULDBLOCK):
-                raise RuntimeError('serial port could not be opened after release: %s' % exc)
+        holders = serial_port_holder_pids(identity)
+        if holders:
+            last = RuntimeError('serial device is still open by PID(s): %s' %
+                                ','.join(str(pid) for pid in holders))
         else:
-            os.close(fd)
-            return
+            try:
+                fd = os.open(identity['resolved'], flags)
+            except OSError as exc:
+                last = exc
+                if exc.errno not in (errno.EBUSY, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise RuntimeError('serial port could not be opened after release: %s' % exc)
+            else:
+                os.close(fd)
+                return
         if time.monotonic() >= deadline:
             raise RuntimeError('serial port remained busy after BMCU transport release: %s' % last)
         time.sleep(0.05)
@@ -551,6 +762,22 @@ def managed_device_status(args):
     item['uid'] = uid
     return item
 
+def managed_runtime_port(args, status=None):
+    item = managed_device_status(args) if status is None else status
+    if not item.get('connected') or not item.get('ready') or item.get('update_suspended'):
+        raise RuntimeError('%s is not ready for firmware access' % args.device)
+    socket_path = str(item.get('transport_socket') or '')
+    if not socket_path.startswith('/') or not socket_path.endswith('.sock'):
+        raise RuntimeError('BMCU runtime has no transport identity; restart Klipper after updating')
+    live = transport.control_request(socket_path + '.ctl', transport.CTRL_STATUS)
+    if (live.get('name') != args.device or
+            str(live.get('uid') or '').upper() != item['uid'] or
+            int(live.get('session_id', 0)) != int(item.get('session_id', 0)) or
+            not live.get('online') or not live.get('serial_open') or
+            live.get('serial_released')):
+        raise RuntimeError('BMCU serial identity changed; refresh the device before flashing')
+    return freeze_serial_port(str(live.get('port') or ''))
+
 def wait_managed_ready(args, runtime_uid, timeout=60.0):
     deadline = time.monotonic() + timeout
     last = ''
@@ -584,12 +811,29 @@ class Updater:
         self.reporter = reporter
         self.state_dir = prepare_private_directory(args.state_dir)
         self.cache_dir = prepare_private_directory(self.state_dir / 'cache')
-        self.recovery_dir = prepare_private_directory(self.state_dir / 'recovery')
+        self.preserved_dir = prepare_private_directory(self.state_dir / 'preserved')
         self.backup_dir = prepare_private_directory(self.state_dir / 'backups')
         self.export_dir = prepare_private_directory(self.state_dir / 'exports')
         self.transaction_file = self.state_dir / 'transaction.json'
         self.installed_file = self.state_dir / 'installed.json'
         self.identity_file = self.state_dir / 'identity_map.json'
+
+    def _isp_progress(self, percent, stage, message=''):
+        if self.args.mode == 'ttl' and str(stage) == 'done':
+            self.reporter.progress(
+                98, 'ttl-reset',
+                'Firmware verified - PRESS RESET once on the BMCU to start the application')
+            return
+        self.reporter.progress(percent, stage, message)
+
+    def _mapped_isp_progress(self, percent, stage, message=''):
+        mapped = 4 + int(percent) * 90 // 100
+        if self.args.mode == 'ttl' and str(stage) == 'done':
+            self.reporter.progress(
+                94, 'ttl-reset',
+                'Firmware verified - PRESS RESET once on the BMCU to start the application')
+            return
+        self.reporter.progress(mapped, stage, message)
 
     def fetch_release(self):
         if self.args.firmware:
@@ -608,13 +852,11 @@ class Updater:
 
     def _normalize_transaction(self, value):
         if not isinstance(value, dict):
-            raise RuntimeError('firmware recovery journal is invalid')
+            raise RuntimeError('firmware transaction journal is invalid')
         required = ('firmware_path', 'firmware', 'port', 'mode', 'raw_port')
         if not all(key in value for key in required):
             raise RuntimeError('unsupported firmware transaction journal')
         normalized = dict(value)
-        saved_port = normalized.get('port_identity')
-        normalized['legacy_recovery'] = not isinstance(saved_port, dict)
         normalized['schema'] = TRANSACTION_SCHEMA
         if value != normalized:
             self._record_transaction(normalized)
@@ -670,7 +912,7 @@ class Updater:
             moonraker_gcode(
                 self.args.moonraker,
                 'BMCU_UPDATE_ACCESS DEVICE=%s ACTION=EXPORT TOKEN=%s' %
-                (self.args.device, token), timeout=30)
+                (self.args.device, token), timeout=75)
             data = read_regular_file(binary, NVM_SIZE)
             meta = read_json_file(metadata, MAX_METADATA_BYTES)
             if meta.get('schema') != 1 or str(meta.get('uid', '')).upper() != runtime_uid:
@@ -687,6 +929,90 @@ class Updater:
             self._remove_file(binary)
             self._remove_file(metadata)
 
+    @staticmethod
+    def _is_managed_nvm_read_timeout(exc):
+        text = str(exc or '')
+        return ('NVM export failed:' in text and
+                'request timeout type=0x61' in text)
+
+    def _export_managed_nvm_direct(self, runtime_uid):
+        status = managed_device_status(self.args)
+        if status['uid'] != runtime_uid:
+            raise RuntimeError(
+                'managed BMCU UID changed before direct NVM export')
+        runtime_port = managed_runtime_port(self.args, status)
+        selected_port = freeze_serial_port(self.args.port)
+        if runtime_port['rdev'] != selected_port['rdev']:
+            raise RuntimeError(
+                'managed USB port changed before direct NVM export')
+
+        self.reporter.log(
+            'WARN',
+            'Klipper NVM export timed out after bounded retries; '
+            'switching to direct runtime NVM export on the verified live port')
+
+        stopped = stop_host_transports_except(())
+        if stopped:
+            self.reporter.log(
+                'INFO', 'Stopped target BMCU transport for direct NVM export')
+        assert_frozen_serial_port(runtime_port)
+        wait_serial_port_free(runtime_port, timeout=8.0)
+
+        client = RuntimeClient(
+            runtime_port['resolved'], baud=115200, timeout=4.0)
+        cancel_sent = False
+        session_ready = False
+        try:
+            client.open()
+            time.sleep(1.5)
+            try:
+                client.serial.reset_input_buffer()
+            except Exception:
+                pass
+            hello = client.handshake()
+            session_ready = True
+            direct_uid = str(hello.get('uid') or '').upper()
+            if direct_uid != runtime_uid:
+                raise RuntimeError(
+                    'direct NVM export opened a different BMCU UID %s' %
+                    (direct_uid or '<missing>'))
+            data, crc = client.export_nvm(chunk_size=224, retries=3)
+            if len(data) != NVM_SIZE:
+                raise RuntimeError(
+                    'direct BMCU NVM export must contain exactly 4096 bytes')
+            client.cancel_update()
+            cancel_sent = True
+        finally:
+            if client.serial is not None and session_ready and not cancel_sent:
+                try:
+                    client.cancel_update()
+                    cancel_sent = True
+                except Exception as exc:
+                    self.reporter.log(
+                        'ERROR',
+                        'Direct NVM export could not cancel update mode: %s' %
+                        exc)
+            client.close()
+
+        metadata = {
+            'schema': 1, 'uid': runtime_uid, 'size': len(data),
+            'crc32': '%08X' % (int(crc) & 0xffffffff),
+            'sha256': hashlib.sha256(data).hexdigest(),
+            'device': self.args.device,
+            'port': runtime_port['requested'],
+            'transport': 'direct-runtime-fallback',
+        }
+        verify_blob(data, {
+            'size': metadata['size'],
+            'sha256': metadata['sha256'],
+            'crc32': metadata['crc32'],
+        }, 'direct BMCU NVM export')
+        self.reporter.log(
+            'INFO',
+            'Direct runtime NVM export verified: 4096 bytes CRC32=%s SHA256=%s' %
+            (metadata['crc32'], metadata['sha256']))
+        return data, metadata
+
     def _backup_nvm(self, runtime_uid, data, metadata):
         timestamp = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
         directory = safe_backup_dir(self.backup_dir, runtime_uid, timestamp)
@@ -696,15 +1022,40 @@ class Updater:
         atomic_json(directory / 'metadata.json', record)
         return directory
 
-    def _prepare_image(self, source, runtime_uid):
+    def _prepare_image(self, source, runtime_uid, preserved_nvm=None, preserved_metadata=None):
         source = bytes(source)
         managed = not self.args.raw_port
         current_nvm = None
         backup_path = ''
 
-        if managed:
-            current_nvm, metadata = self._export_managed_nvm(runtime_uid)
-            backup_path = str(self._backup_nvm(runtime_uid, current_nvm, metadata))
+        if preserved_nvm is not None:
+            current_nvm = bytes(preserved_nvm)
+            if len(current_nvm) != NVM_SIZE:
+                raise RuntimeError('preserved calibration NVM must contain exactly 4096 bytes')
+            metadata = dict(preserved_metadata or {})
+            metadata.update({
+                'schema': 1, 'size': len(current_nvm),
+                'crc32': '%08X' % (binascii.crc32(current_nvm) & 0xffffffff),
+                'sha256': hashlib.sha256(current_nvm).hexdigest(),
+                'transport': 'interrupted-flash-nvm-salvage',
+            })
+            if runtime_uid:
+                metadata['uid'] = runtime_uid
+                backup_path = str(
+                    self._backup_nvm(runtime_uid, current_nvm, metadata))
+            self.reporter.log(
+                'INFO',
+                'Using preserved calibration NVM from the interrupted flash; firmware application bytes come from the newly selected/downloaded source')
+        elif managed:
+            try:
+                current_nvm, metadata = self._export_managed_nvm(runtime_uid)
+            except Exception as exc:
+                if not self._is_managed_nvm_read_timeout(exc):
+                    raise
+                current_nvm, metadata = self._export_managed_nvm_direct(
+                    runtime_uid)
+            backup_path = str(
+                self._backup_nvm(runtime_uid, current_nvm, metadata))
 
         if len(source) <= APP_SIZE:
             if self.args.replace_nvm:
@@ -712,7 +1063,7 @@ class Updater:
                     '--replace-nvm requires a complete 65536-byte image')
             if self.args.erase_nvm:
                 target_nvm = b'\xFF' * NVM_SIZE
-            elif managed:
+            elif managed or preserved_nvm is not None:
                 target_nvm = current_nvm
             else:
                 raise RuntimeError(
@@ -727,7 +1078,7 @@ class Updater:
             target_nvm = b'\xFF' * NVM_SIZE
         elif self.args.replace_nvm:
             target_nvm = source[APP_SIZE:]
-        elif managed:
+        elif managed or preserved_nvm is not None:
             target_nvm = current_nvm
         else:
             raise RuntimeError(
@@ -735,91 +1086,249 @@ class Updater:
                 'confirm replacement by the complete 65536-byte image')
         return source[:APP_SIZE] + target_nvm, backup_path, digest(target_nvm)
 
-    def _recovery_image_path(self, image):
-        return self.recovery_dir / ('%s.bin' % digest(image)['sha256'])
+    def _preserved_image_path(self, image):
+        return self.preserved_dir / ('%s.bin' % digest(image)['sha256'])
 
-    def _cancel_managed_before_erase(self):
+    def _cancel_managed_before_erase(self, device=None):
+        target = str(device or self.args.device or '')
         errors = []
         for action in ('CANCEL', 'RESUME'):
             try:
-                managed_access(self.args, action)
+                managed_access_device(self.args.moonraker, target, action)
                 self.reporter.log(
-                    'INFO', 'Firmware update mode cancelled and Klipper runtime restored')
+                    'INFO', 'Firmware update mode cancelled and Klipper runtime restored'
+                    if action == 'CANCEL' else
+                    'Serial reconnect scheduled; runtime readiness is not yet confirmed')
                 return True
             except Exception as exc:
                 errors.append('%s: %s' % (action, exc))
         self.reporter.log(
-            'ERROR', 'Could not cancel firmware update mode: %s' % '; '.join(errors))
+            'ERROR', 'Could not cancel firmware update mode for %s: %s' %
+            (target or '<unknown>', '; '.join(errors)))
         return False
 
     def _settle_previous_preparing_transaction(self):
         if not self.transaction_file.exists():
-            return
+            return None
         if self.transaction_file.is_symlink() or not self.transaction_file.is_file():
-            raise RuntimeError('firmware recovery journal is unsafe')
+            raise RuntimeError('firmware transaction journal is unsafe')
         transaction = self._normalize_transaction(
             read_json_file(self.transaction_file, MAX_TRANSACTION_BYTES))
-        if transaction.get('recovery_required') is True:
-            raise RuntimeError(
-                'an interrupted flash requires recovery before another update')
-        image_path = str(transaction.get('firmware_path') or '')
-        raw_port = bool(transaction.get('raw_port', False))
-        raw_managed_device = str(transaction.get('raw_managed_device') or '')
-        if not raw_port:
-            self.args.raw_port = False
-            self.args.port = str(transaction.get('port') or self.args.port)
-            self.args.device = str(transaction.get('device') or self.args.device)
-            self.args.mode = str(transaction.get('mode') or self.args.mode)
-            if not self._cancel_managed_before_erase():
+        image_path = Path(str(transaction.get('firmware_path') or ''))
+        previous_raw = bool(transaction.get('raw_port', False))
+        previous_device = str(transaction.get('device') or '')
+        previous_raw_managed = str(transaction.get('raw_managed_device') or '')
+        erase_started = bool(
+            transaction.get('erase_started') or
+            str(transaction.get('phase') or '') == 'erase_started' or
+            transaction.get('recovery_required') is True)
+
+        if erase_started:
+            full_image = read_regular_file(image_path, FLASH_SIZE)
+            if len(full_image) != FLASH_SIZE:
                 raise RuntimeError(
-                    'previous update stopped before erase but the managed port could not be restored')
-        elif raw_managed_device:
+                    'interrupted flash calibration image must be exactly 65536 bytes')
+            verify_blob(full_image, transaction.get('firmware'),
+                        'interrupted flash preserved image')
+            nvm = full_image[APP_SIZE:]
+            if len(nvm) != NVM_SIZE:
+                raise RuntimeError('interrupted flash calibration NVM is invalid')
+            expected_nvm = transaction.get('nvm')
+            if isinstance(expected_nvm, dict):
+                verify_blob(nvm, expected_nvm, 'interrupted flash calibration NVM')
+            if transaction.get('service_active') or transaction.get('service_devices'):
+                try:
+                    start_host_transports()
+                except Exception as exc:
+                    self.reporter.log(
+                        'WARNING',
+                        'Could not restore every transport before fresh retry: %s' % exc)
+            self.reporter.log(
+                'WARNING',
+                'Interrupted post-erase flash detected. The next update will use only the preserved 4096-byte calibration NVM; firmware application bytes will be freshly selected/downloaded.')
+            return {
+                'transaction': transaction,
+                'image_path': str(image_path),
+                'nvm': nvm,
+                'metadata': {
+                    'schema': 1,
+                    'uid': str(transaction.get('runtime_uid') or '').upper(),
+                    'size': len(nvm),
+                    'crc32': '%08X' % (binascii.crc32(nvm) & 0xffffffff),
+                    'sha256': hashlib.sha256(nvm).hexdigest(),
+                },
+            }
+
+        if transaction.get('service_active') or transaction.get('service_devices'):
+            start_host_transports()
+
+        if not previous_raw:
+            if not previous_device or not self._cancel_managed_before_erase(previous_device):
+                raise RuntimeError(
+                    'previous update stopped before erase but its managed BMCU could not be restored')
+        elif previous_raw_managed:
             managed_access_device(
-                self.args.moonraker, raw_managed_device, 'RESUME')
+                self.args.moonraker, previous_raw_managed, 'RESUME')
+
         self._clear_transaction()
         self._remove_file(image_path)
         self.reporter.log('INFO', 'Cleaned an interrupted pre-erase update transaction')
+        return None
+
+    @staticmethod
+    def _validate_interrupted_target(interrupted, args, port_identity, runtime_uid):
+        if not interrupted:
+            return
+        transaction = interrupted['transaction']
+        if bool(transaction.get('raw_port', False)) != bool(args.raw_port):
+            raise RuntimeError('interrupted flash belongs to a different target type')
+        if str(transaction.get('mode') or '') != str(args.mode or ''):
+            raise RuntimeError('interrupted flash belongs to a different bootloader mode')
+        if not args.raw_port:
+            if str(transaction.get('device') or '') != str(args.device or ''):
+                raise RuntimeError('interrupted flash belongs to a different BMCU connection')
+            saved_uid = str(transaction.get('runtime_uid') or '').upper()
+            if runtime_uid and saved_uid and runtime_uid != saved_uid:
+                raise RuntimeError('interrupted flash belongs to a different BMCU UID')
+        saved_port = transaction.get('port_identity')
+        if isinstance(saved_port, dict):
+            saved_requested = str(saved_port.get('requested') or transaction.get('port') or '')
+            if args.raw_port and saved_requested and str(port_identity.get('requested') or '') != saved_requested:
+                raise RuntimeError('interrupted raw flash belongs to a different serial port')
 
     def update(self):
-        self._settle_previous_preparing_transaction()
+        requested_port = str(self.args.port or '')
+        interrupted = self._settle_previous_preparing_transaction()
         idle, state = printer_is_idle(self.args.moonraker)
         if not idle:
             raise RuntimeError('printer state is %s; firmware flash is blocked' % state)
-        self.reporter.progress(0, 'prepare', 'Loading firmware file')
+        self.reporter.progress(0, 'prepare', 'Preparing firmware update - BMCU connections may briefly disconnect while calibration is backed up')
         label, _firmware_path, source, _artifact, _manifest = self.fetch_release()
-        port_identity = freeze_serial_port(self.args.port)
-        self.args.port = port_identity['resolved']
         managed = not self.args.raw_port
         runtime_uid = ''
-        managed_status = None
         raw_managed_device = ''
-        raw_guard_devices = []
+        service_devices = []
+        service_active = False
+        update_exported = False
+
         if managed:
-            managed_status = managed_device_status(self.args)
-            runtime_uid = managed_status['uid']
-            managed_port = freeze_serial_port(str(managed_status.get('port') or ''))
+            managed_status = None
+            try:
+                managed_status = managed_device_status(self.args)
+                runtime_uid = managed_status['uid']
+            except Exception:
+                previous = (interrupted or {}).get('transaction', {})
+                if (not interrupted or
+                        str(previous.get('device') or '') != str(self.args.device or '')):
+                    raise
+                runtime_uid = str(previous.get('runtime_uid') or '').upper()
+                if not runtime_uid:
+                    raise RuntimeError(
+                        'interrupted managed flash has no preserved runtime UID')
+                self.reporter.log(
+                    'WARNING',
+                    'BMCU runtime is unavailable after the interrupted flash; using the preserved target UID and final ISP UID gate for this fresh update')
             if self.args.mode == 'usb':
-                if managed_port['rdev'] != port_identity['rdev']:
-                    raise RuntimeError('USB update port does not belong to the selected BMCU')
-            elif not self.args.confirm_ttl_target:
-                raise RuntimeError('managed TTL flashing requires explicit --confirm-ttl-target')
+                if managed_status is not None:
+                    port_identity = managed_runtime_port(self.args, managed_status)
+                else:
+                    fallback_port = requested_port or str(
+                        interrupted['transaction'].get('port') or '')
+                    port_identity = freeze_serial_port(fallback_port)
+                if requested_port:
+                    try:
+                        requested_identity = freeze_serial_port(requested_port)
+                    except RuntimeError:
+                        requested_identity = None
+                    if (requested_identity is not None and
+                            requested_identity['rdev'] != port_identity['rdev']):
+                        raise RuntimeError(
+                            'selected serial port does not match the verified live BMCU transport')
+                self.args.port = port_identity['requested']
+                self.reporter.log(
+                    'INFO', 'Managed USB flash port selected from verified live sidecar: %s' %
+                    port_identity['requested'])
+            else:
+                if not self.args.confirm_ttl_target:
+                    raise RuntimeError(
+                        'managed TTL flashing requires explicit --confirm-ttl-target')
+                ttl_port = requested_port or str(self.args.port or '')
+                port_identity = freeze_serial_port(ttl_port)
+                if managed_status is not None:
+                    live_identity = managed_runtime_port(self.args, managed_status)
+                    if port_identity['rdev'] != live_identity['rdev']:
+                        raise RuntimeError(
+                            'selected TTL serial port does not belong to the selected BMCU connection')
+                self.args.port = port_identity['requested']
+                self.reporter.log(
+                    'INFO', 'Managed TTL port verified against selected BMCU live transport: %s' %
+                    port_identity['requested'])
+            service_devices = managed_device_names(self.args.moonraker)
+            if self.args.device not in service_devices:
+                service_devices.append(self.args.device)
+                service_devices.sort()
         else:
+            port_identity = freeze_serial_port(self.args.port)
+            self.args.port = port_identity['requested']
             raw_managed_device = configured_device_for_port(
                 self.args, port_identity)
             if self.args.mode == 'ttl' and not self.args.confirm_ttl_target:
                 raise RuntimeError('raw TTL flashing requires explicit --confirm-ttl-target')
+            try:
+                service_devices = managed_device_names(self.args.moonraker)
+            except Exception:
+                service_devices = []
 
-        recovery_path = None
+        self._validate_interrupted_target(
+            interrupted, self.args, port_identity, runtime_uid)
+        preserved_nvm = interrupted['nvm'] if interrupted else None
+        preserved_metadata = interrupted['metadata'] if interrupted else None
+        previous_image_path = interrupted['image_path'] if interrupted else ''
+
+        preserved_path = None
+        transaction = None
         try:
+            if managed:
+                self.reporter.progress(
+                    1, 'prepare',
+                    'Preparing BMCU - pausing other BMCU connections before calibration backup')
+                stopped = stop_host_transports_except((self.args.device,))
+                service_active = True
+                if stopped:
+                    self.reporter.log(
+                        'INFO',
+                        'Stopped %d non-target BMCU transport process(es) before NVM backup' %
+                        stopped)
+                else:
+                    self.reporter.log(
+                        'INFO', 'No non-target BMCU transport process was active before NVM backup')
+            else:
+                stopped = stop_host_transports_except(())
+                service_active = True
+                if stopped:
+                    self.reporter.log(
+                        'INFO',
+                        'Stopped %d BMCU transport process(es) before raw firmware flash' %
+                        stopped)
+
+            if managed:
+                self.reporter.progress(
+                    2, 'prepare',
+                    'Backing up BMCU calibration NVM - communication can pause briefly')
+            nvm_started = time.monotonic()
             full_image, backup_path, nvm_digest = self._prepare_image(
-                source, runtime_uid)
+                source, runtime_uid, preserved_nvm, preserved_metadata)
+            if managed:
+                self.reporter.log(
+                    'INFO', 'Calibration NVM preservation completed in %.3f s' %
+                    max(0.0, time.monotonic() - nvm_started))
+            update_exported = bool(managed and preserved_nvm is None)
             image_digest = digest(full_image)
-            recovery_path = self._recovery_image_path(full_image)
-            atomic_write(recovery_path, full_image, 0o600)
+            preserved_path = self._preserved_image_path(full_image)
+            atomic_write(preserved_path, full_image, 0o600)
             transaction = {
                 'schema': TRANSACTION_SCHEMA, 'phase': 'preparing',
-                'recovery_required': False,
-                'firmware_path': str(recovery_path),
+                'firmware_path': str(preserved_path),
                 'firmware': image_digest,
                 'source_firmware': digest(source), 'display_name': label,
                 'port': self.args.port, 'port_identity': port_identity,
@@ -828,19 +1337,34 @@ class Updater:
                 'runtime_uid': runtime_uid,
                 'raw_managed_device': raw_managed_device,
                 'raw_guard_devices': [],
+                'service_devices': list(service_devices),
+                'service_active': bool(service_active),
+                'service_mode': 'process_only',
                 'nvm': nvm_digest, 'nvm_backup': backup_path,
                 'erase_started': False,
-                'created_at': dt.datetime.now(
-                    dt.timezone.utc).isoformat(),
+                'created_at': dt.datetime.now(dt.timezone.utc).isoformat(),
             }
             self._record_transaction(transaction)
+            if previous_image_path and previous_image_path != str(preserved_path):
+                self._remove_file(previous_image_path)
         except Exception:
-
-            if managed:
+            restore_ok = True
+            if service_active:
+                try:
+                    start_host_transports()
+                    service_active = False
+                except Exception as restore_exc:
+                    restore_ok = False
+                    self.reporter.log(
+                        'ERROR', 'Could not restart BMCU transport processes: %s' %
+                        restore_exc)
+            if managed and restore_ok:
                 self._cancel_managed_before_erase()
-            if recovery_path is not None:
-                self._remove_file(recovery_path)
+            if (preserved_path is not None and
+                    str(preserved_path) != str(previous_image_path or '')):
+                self._remove_file(preserved_path)
             raise
+
         if self.args.erase_nvm:
             nvm_message = 'clean calibration NVM selected'
         elif self.args.replace_nvm:
@@ -849,36 +1373,22 @@ class Updater:
             nvm_message = 'verified calibration NVM preserved'
         self.reporter.progress(3, 'prepare', '%s ready - %s' % (label, nvm_message))
         erase_started = False
-        prepared_attempted = False
+        flash_verified = False
         known_identities = self._load_identity_map()
         expected_isp = known_identities.get(runtime_uid, '') if runtime_uid else ''
+        if runtime_uid and not expected_isp:
+            expected_isp = runtime_uid[:16]
         try:
             assert_frozen_serial_port(port_identity)
-            if managed:
-                prepared_attempted = True
-                managed_access(self.args, 'PREPARE')
-                transaction['phase'] = 'prepared'
-                self._record_transaction(transaction)
-                self.reporter.log('INFO', 'BMCU motors stopped and serial port released')
-            else:
-                if raw_managed_device:
-                    prepared_attempted = True
-                    managed_access_device(
-                        self.args.moonraker, raw_managed_device,
-                        'PREPARE', recovery=True)
-                    transaction['phase'] = 'raw_port_released'
-                    self._record_transaction(transaction)
-                    self.reporter.log(
-                        'INFO', 'Configured serial port released without using the old application firmware')
-                raw_guard_devices = raw_flash_guard_acquire(
-                    self.args, exclude=(raw_managed_device,))
-                transaction['raw_guard_devices'] = list(raw_guard_devices)
-                transaction['phase'] = 'raw_serial_guarded'
-                self._record_transaction(transaction)
-                if raw_guard_devices:
-                    self.reporter.log(
-                        'INFO', 'Paused BMCU UID fallback scanners while the raw serial target is flashed')
-                self.reporter.log('WARN', 'Raw port selected; all filament must be removed manually')
+
+            stopped = stop_host_transports_except(())
+            service_active = True
+            transaction['phase'] = 'isp_port_exclusive'
+            transaction['service_active'] = True
+            self._record_transaction(transaction)
+            self.reporter.log(
+                'INFO',
+                'BMCU transport processes stopped; target serial port is exclusive for direct WCH ISP')
 
             idle, state = printer_is_idle(self.args.moonraker)
             if not idle:
@@ -897,7 +1407,6 @@ class Updater:
                     raise RuntimeError('ISP UID does not match the selected BMCU')
                 erase_started = True
                 transaction['phase'] = 'erase_started'
-                transaction['recovery_required'] = True
                 transaction['erase_started'] = True
                 transaction['isp_uid'] = identity.uid_hex.upper()
                 transaction['erase_started_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -909,206 +1418,137 @@ class Updater:
                 self.args.port, full_image, mode=self.args.mode,
                 manual_timeout=self.args.manual_timeout,
                 log_callback=self.reporter.log,
-                progress_callback=lambda pct, stage, msg: self.reporter.progress(
-                    4 + pct * 90 // 100, stage, msg), before_erase=before_erase)
+                progress_callback=self._mapped_isp_progress, before_erase=before_erase,
+                expected_isp_uid=expected_isp)
+            flash_verified = True
+            erase_started = False
             if runtime_uid:
                 self._save_identity(runtime_uid, identity.uid_hex.upper())
             transaction['phase'] = 'flashed_verified'
             transaction['isp_uid'] = identity.uid_hex.upper()
+            transaction['erase_started'] = False
+            transaction['verified_at'] = dt.datetime.now(dt.timezone.utc).isoformat()
             self._record_transaction(transaction)
-            if managed:
-                self.reporter.progress(95, 'reconnect', 'Releasing the port back to Klipper')
-                managed_access(self.args, 'RESUME')
+
+            reconnect_started = time.monotonic()
+            if managed and self.args.mode == 'ttl':
+                self.reporter.log(
+                    'ACTION',
+                    'TTL firmware verified. PRESS RESET once now to start the BMCU application. Waiting for runtime reconnect...')
+                self.reporter.progress(
+                    95, 'ttl-reset',
+                    'Firmware verified - PRESS RESET once to start the BMCU application; waiting for reconnect')
+            else:
+                self.reporter.progress(95, 'reconnect', 'Restarting BMCU transport processes')
+
+            reconnect_error = None
+            try:
+                if managed:
+                    start_host_transports(
+                        preferred_device=self.args.device,
+                        preferred_online_timeout=(180.0 if self.args.mode == 'ttl' else 35.0))
+                else:
+                    start_host_transports()
+                service_active = False
+                transaction['service_active'] = False
                 transaction['phase'] = 'waiting_runtime'
                 self._record_transaction(transaction)
-                wait_managed_ready(self.args, runtime_uid, 60.0)
-            elif raw_managed_device:
-                self.reporter.progress(
-                    95, 'register',
-                    'Keeping the configured port released while the panel registers the new runtime')
-                transaction['phase'] = 'raw_flash_waiting_registration'
-                self._record_transaction(transaction)
+                if managed:
+                    wait_managed_ready(
+                        self.args, runtime_uid,
+                        180.0 if self.args.mode == 'ttl' else 75.0)
+                self.reporter.log(
+                    'INFO', 'BMCU runtime reconnect completed in %.3f s' %
+                    max(0.0, time.monotonic() - reconnect_started))
+            except Exception as runtime_exc:
+                reconnect_error = runtime_exc
+                self.reporter.log(
+                    'WARNING',
+                    'Firmware is already flashed and verified, but BMCU runtime reconnect is still pending: %s' %
+                    runtime_exc)
+                try:
+                    start_host_transports()
+                    service_active = False
+                except Exception as restart_exc:
+                    self.reporter.log(
+                        'WARNING', 'Could not finish restarting all BMCU transports after verified flash: %s' %
+                        restart_exc)
+
             installed = {
                 'schema': 1, 'updated_at': dt.datetime.now(dt.timezone.utc).isoformat(),
                 'display_name': label, 'mode': self.args.mode, 'port': self.args.port,
                 'raw_port': bool(self.args.raw_port), 'runtime_uid': runtime_uid,
                 'isp_uid': identity.uid_hex.upper(), 'firmware': image_digest,
-                'nvm': nvm_digest,
+                'nvm': nvm_digest, 'runtime_confirmed': reconnect_error is None,
             }
             atomic_json(self.installed_file, installed)
             self._clear_transaction()
-            self._remove_file(recovery_path)
-            if managed:
-                final_message = 'Firmware flashed, verified and reconnected'
+            self._remove_file(preserved_path)
+            raw_ttl_reset_pending = bool(self.args.mode == 'ttl' and not managed)
+            if reconnect_error is None and not raw_ttl_reset_pending:
+                final_message = (
+                    'Firmware verified and BMCU reconnected after RESET'
+                    if self.args.mode == 'ttl' else
+                    'Firmware flashed, verified and BMCU transports restarted')
+            else:
+                final_message = (
+                    'Firmware flashed and verified. PRESS RESET once on the BMCU to start the application.')
+            if self.args.mode == 'ttl' and (reconnect_error is not None or raw_ttl_reset_pending):
+                self.reporter.progress(
+                    99, 'ttl-reset',
+                    'Firmware verified - PRESS RESET once on the BMCU to start the application')
+            else:
                 self.reporter.progress(100, 'done', final_message)
-            else:
-                final_message = 'Firmware flashed and verified - waiting for BMCU runtime registration'
-                self.reporter.progress(98, 'register', final_message)
-            self.reporter.emit('result', ok=True,
-                               message=final_message,
-                               display_name=label, mode=self.args.mode,
-                               runtime_uid=runtime_uid, isp_uid=identity.uid_hex.upper(),
-                               released_device=raw_managed_device,
-                               released_devices=([raw_managed_device] if raw_managed_device else []) + list(raw_guard_devices),
-                               firmware=image_digest, nvm=nvm_digest)
-        except Exception as exc:
-            erase_started = erase_started or bool(getattr(exc, 'erase_started', False))
-            if raw_guard_devices:
-                try:
-                    raw_flash_guard_release(self.args, raw_guard_devices)
-                except Exception as guard_exc:
-                    self.reporter.log('ERROR', str(guard_exc))
-            if not erase_started:
-                cancelled = True
-                if managed and prepared_attempted:
-                    cancelled = self._cancel_managed_before_erase()
-                elif raw_managed_device and prepared_attempted:
-                    try:
-                        managed_access_device(
-                            self.args.moonraker, raw_managed_device, 'RESUME')
-                    except Exception as resume_exc:
-                        self.reporter.log(
-                            'ERROR', 'Could not release the raw configured port back to Klipper: %s' % resume_exc)
-                        cancelled = False
-                if cancelled:
-                    self._clear_transaction()
-                    self._remove_file(recovery_path)
-            else:
-                self.reporter.log(
-                    'ERROR', 'Erase started. Press Flash firmware again to retry safely; the exact full image is preserved.')
-            raise
-
-    def recover(self):
-        idle, state = printer_is_idle(self.args.moonraker)
-        if not idle:
-            raise RuntimeError(
-                'printer state is %s; firmware recovery is blocked' % state)
-        if not self.transaction_file.is_file() or self.transaction_file.is_symlink():
-            raise RuntimeError('no interrupted firmware flash exists')
-        transaction = self._normalize_transaction(
-            read_json_file(self.transaction_file, MAX_TRANSACTION_BYTES))
-        if transaction.get('recovery_required') is not True:
-            raise RuntimeError('no compatible interrupted firmware flash exists')
-        image_path = Path(str(transaction.get('firmware_path') or ''))
-        firmware = read_regular_file(image_path, FLASH_SIZE)
-        verify_blob(firmware, transaction.get('firmware'), 'recovery firmware')
-        legacy_recovery = bool(transaction.get('legacy_recovery', False))
-        if legacy_recovery:
-            if not firmware:
-                raise RuntimeError('recovery image is empty')
-        elif len(firmware) != FLASH_SIZE:
-            raise RuntimeError('recovery image must be exactly 65536 bytes')
-
-        raw_port = bool(transaction.get('raw_port', False))
-        managed = not raw_port
-        raw_managed_device = str(transaction.get('raw_managed_device') or '')
-        self.args.raw_port = raw_port
-        self.args.port = str(transaction.get('port') or '')
-        self.args.device = str(transaction.get('device') or '')
-        self.args.mode = str(transaction.get('mode') or '')
-        runtime_uid = str(transaction.get('runtime_uid') or '').upper()
-        expected_isp = str(transaction.get('isp_uid') or '').upper()
-        saved_port = transaction.get('port_identity')
-        current_port = freeze_serial_port(self.args.port)
-        if legacy_recovery:
-            self.reporter.log(
-                'WARN', 'Recovering a pre-release transaction without a preserved serial identity')
-        else:
-            if not isinstance(saved_port, dict):
-                raise RuntimeError('recovery transaction has no serial-port identity')
-            if int(saved_port.get('rdev', -1)) != current_port['rdev']:
-                raise RuntimeError('recovery serial device is not the original device')
-
-        erase_started = False
-        prepared_attempted = False
-        raw_guard_devices = []
-        try:
-            if managed:
-                prepared_attempted = True
-                managed_access(self.args, 'PREPARE', recovery=True)
-            elif raw_managed_device:
-                prepared_attempted = True
-                managed_access_device(
-                    self.args.moonraker, raw_managed_device,
-                    'PREPARE', recovery=True)
-            if raw_port:
-                raw_guard_devices = raw_flash_guard_acquire(
-                    self.args, exclude=(raw_managed_device,))
-                if raw_guard_devices:
-                    self.reporter.log(
-                        'INFO', 'Paused BMCU UID fallback scanners while the interrupted raw flash is retried')
-
-            idle, state = printer_is_idle(self.args.moonraker)
-            if not idle:
-                raise RuntimeError(
-                    'printer state changed to %s before recovery erase; '
-                    'firmware recovery is blocked' % state)
-
-            def before_erase(identity):
-                nonlocal erase_started
-                idle_now, state_now = printer_is_idle(self.args.moonraker)
-                if not idle_now:
-                    raise RuntimeError(
-                        'printer state changed to %s at the final recovery '
-                        'pre-erase gate; firmware recovery is blocked' % state_now)
-                if expected_isp and identity.uid_hex.upper() != expected_isp:
-                    raise RuntimeError(
-                        'recovery ISP UID does not match the interrupted module')
-                erase_started = True
-
-            wait_serial_port_free(current_port)
-            identity = flash_image(
-                self.args.port, firmware, mode=self.args.mode,
-                manual_timeout=self.args.manual_timeout,
-                log_callback=self.reporter.log,
-                progress_callback=self.reporter.progress,
-                before_erase=before_erase)
-            if expected_isp and identity.uid_hex.upper() != expected_isp:
-                raise RuntimeError('recovery ISP UID changed unexpectedly')
-            if runtime_uid:
-                self._save_identity(runtime_uid, identity.uid_hex.upper())
-            transaction['phase'] = 'recovery_flashed_verified'
-            self._record_transaction(transaction)
-            if managed:
-                managed_access(self.args, 'RESUME')
-                transaction['phase'] = 'recovery_waiting_runtime'
-                self._record_transaction(transaction)
-                if runtime_uid:
-                    wait_managed_ready(self.args, runtime_uid, 60.0)
-            elif raw_port:
-                transaction['phase'] = 'retry_raw_flash_waiting_registration'
-                self._record_transaction(transaction)
-            self._clear_transaction()
-            self._remove_file(image_path)
-            final_message = (
-                'Firmware retry flashed and verified - waiting for BMCU runtime registration'
-                if raw_port else 'Firmware retry flashed, verified and reconnected')
             self.reporter.emit(
-                'result', ok=True, recovered=True, message=final_message,
-                mode=self.args.mode, port=self.args.port, raw_port=raw_port,
+                'result', ok=True, message=final_message,
+                runtime_reconnect_pending=(reconnect_error is not None or raw_ttl_reset_pending),
+                display_name=label, mode=self.args.mode,
+                port=self.args.port, raw_port=bool(self.args.raw_port),
                 runtime_uid=runtime_uid, isp_uid=identity.uid_hex.upper(),
                 released_device=raw_managed_device,
-                released_devices=([raw_managed_device] if raw_managed_device else []) +
-                list(raw_guard_devices))
+                released_devices=list(service_devices),
+                firmware=image_digest, nvm=nvm_digest)
         except Exception as exc:
             erase_started = erase_started or bool(getattr(exc, 'erase_started', False))
-            if raw_guard_devices:
+            restore_ok = True
+            if service_active:
                 try:
-                    raw_flash_guard_release(self.args, raw_guard_devices)
-                except Exception as guard_exc:
-                    self.reporter.log('ERROR', str(guard_exc))
-            if managed and prepared_attempted and not erase_started:
-                self._cancel_managed_before_erase()
-            elif raw_managed_device and prepared_attempted and not erase_started:
-                try:
-                    managed_access_device(
-                        self.args.moonraker, raw_managed_device, 'RESUME')
-                except Exception as resume_exc:
+                    start_host_transports()
+                    service_active = False
+                    if transaction is not None:
+                        transaction['service_active'] = False
+                        self._record_transaction(transaction)
+                except Exception as runtime_exc:
+                    restore_ok = False
                     self.reporter.log(
-                        'ERROR', 'Could not release the raw configured port back to Klipper: %s' % resume_exc)
-            elif erase_started:
+                        'ERROR', 'Could not restart BMCU transport processes: %s' %
+                        runtime_exc)
+            if flash_verified:
+                if transaction is not None:
+                    transaction['phase'] = 'flashed_verified'
+                    transaction['erase_started'] = False
+                    transaction['service_active'] = bool(service_active)
+                    try:
+                        self._record_transaction(transaction)
+                    except Exception:
+                        pass
+                self._clear_transaction()
+                self._remove_file(preserved_path)
                 self.reporter.log(
-                    'ERROR', 'Flash retry did not finish after erase; the exact image remains preserved for the next Flash firmware attempt.')
+                    'WARNING',
+                    'Firmware was already flashed and verified; a post-flash finalization step failed: %s' %
+                    exc)
+            elif not erase_started:
+                cancelled = restore_ok
+                if managed and update_exported and cancelled:
+                    cancelled = self._cancel_managed_before_erase()
+                if cancelled:
+                    self._clear_transaction()
+                    self._remove_file(preserved_path)
+            else:
+                self.reporter.log(
+                    'ERROR',
+                    'Erase started. Start a fresh local or online flash. Only the preserved 4096-byte calibration NVM will be reused; firmware application bytes will come from the newly selected/downloaded source.')
             raise
 
 def validate_cli_args(args):
@@ -1135,7 +1575,7 @@ def validate_cli_args(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog='bmcu_update.py')
-    parser.add_argument('command', choices=('check', 'update', 'recover'))
+    parser.add_argument('command', choices=('check', 'update'))
     parser.add_argument('--port', default='/dev/ttyUSB0')
     parser.add_argument('--mode', choices=('usb', 'ttl'), default='usb')
     parser.add_argument('--variant', choices=('universal',), default='universal')
@@ -1149,7 +1589,7 @@ def build_parser():
     parser.add_argument('--confirm-ttl-target', action='store_true')
     parser.add_argument('--expected-size', type=int, default=None)
     parser.add_argument('--expected-sha256', default='')
-    parser.add_argument('--manual-timeout', type=float, default=120.0)
+    parser.add_argument('--manual-timeout', type=float, default=180.0)
     parser.add_argument('--json-lines', action='store_true')
     return parser
 
@@ -1160,9 +1600,10 @@ def main(argv=None):
         validate_cli_args(args)
         state_dir = prepare_private_directory(args.state_dir)
     except (ValueError, RuntimeError) as exc:
-        reporter.emit('result', ok=False, error=str(exc), recovery_required=False)
+        reporter.emit('result', ok=False, error=str(exc), interrupted_flash=False)
         return 2
     try:
+        reporter.set_log_path(state_dir / 'last-update.jsonl')
         with UpdateLock(state_dir / 'update.lock'):
             updater = Updater(args, reporter)
             if args.command == 'check':
@@ -1176,20 +1617,21 @@ def main(argv=None):
                               path=str(path), firmware=digest(firmware))
             elif args.command == 'update':
                 updater.update()
-            else:
-                updater.recover()
         return 0
     except Exception as exc:
-        recovery_required = False
+        interrupted_flash = False
         transaction_path = state_dir / 'transaction.json'
         if transaction_path.is_file() and not transaction_path.is_symlink():
             try:
-                recovery_required = bool(read_json_file(
-                    transaction_path, MAX_TRANSACTION_BYTES).get('recovery_required'))
+                journal = read_json_file(transaction_path, MAX_TRANSACTION_BYTES)
+                interrupted_flash = bool(
+                    journal.get('erase_started') or
+                    journal.get('recovery_required') is True or
+                    str(journal.get('phase') or '') == 'erase_started')
             except Exception:
-                recovery_required = True
+                interrupted_flash = True
         reporter.emit('result', ok=False, error=str(exc),
-                      recovery_required=recovery_required)
+                      interrupted_flash=interrupted_flash)
         return 1
 
 if __name__ == '__main__':

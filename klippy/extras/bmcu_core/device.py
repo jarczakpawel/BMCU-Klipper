@@ -939,27 +939,50 @@ class BMCUDevice(object):
             raise RuntimeError(pending.error)
         return pending.response
 
+    def _control_plane_request_begin(self):
+        enter = getattr(self.manager, '_control_plane_request_enter', None)
+        entered = False
+        if callable(enter):
+            entered = bool(enter())
+            if not entered:
+                raise RuntimeError(
+                    'BMCU control plane is unavailable during Klipper shutdown')
+        self.manager._required_transport_users += 1
+        try:
+            self.set_transport_paused(False, required=True)
+        except Exception:
+            self._control_plane_request_end(entered)
+            raise
+        return entered
+
+    def _control_plane_request_end(self, entered):
+        self.manager._required_transport_users = max(
+            0, self.manager._required_transport_users - 1)
+        leave = getattr(self.manager, '_control_plane_request_leave', None)
+        if entered and callable(leave):
+            leave()
+
     def request(self, msg_type, payload=b'', expected=None, timeout=2.0):
         timeout = _bounded_float(timeout, 'request timeout', 0.01, 300.0)
         if expected is None:
             expected = (protocol.MSG_ACK,)
-        cmd_id = self._next_cmd_id()
-        pending = self._new_pending(
-            cmd_id, expected, self.reactor.monotonic() + timeout)
-        self.pending[cmd_id] = pending
-        self.manager._required_transport_users += 1
+        control_plane_entered = self._control_plane_request_begin()
+        pending = None
+        cmd_id = None
         try:
-            if not self._reactor_quiesced:
-                self.set_transport_paused(False, required=True)
+            cmd_id = self._next_cmd_id()
+            pending = self._new_pending(
+                cmd_id, expected, self.reactor.monotonic() + timeout)
+            self.pending[cmd_id] = pending
             self.send(msg_type, payload, cmd_id)
             return self._wait_pending(
                 pending,
                 'BMCU request timeout type=0x%02X id=%d' %
                 (msg_type, cmd_id))
         finally:
-            self.manager._required_transport_users = max(
-                0, self.manager._required_transport_users - 1)
-            self.pending.pop(cmd_id, None)
+            if pending is not None:
+                self.pending.pop(cmd_id, None)
+            self._control_plane_request_end(control_plane_entered)
 
     def wait_for_op(self, op_id, timeout=8.0):
         op_id = _bounded_int(op_id, 'operation id', 1, 0xffffffff)
@@ -1267,12 +1290,14 @@ class BMCUDevice(object):
                                (self.expected_uid, uid))
         firmware_tuple = tuple(hello.get('firmware_tuple', (0, 0, 0)))
         protocol_ok = hello.get('protocol') == protocol.PROTO_VERSION
-        firmware_ok = firmware_tuple == protocol.REQUIRED_FIRMWARE
+        firmware_ok = protocol.firmware_is_compatible(firmware_tuple)
         if not protocol_ok or not firmware_ok:
             reported = hello.get('firmware') or 'unknown'
+            minimum = '.'.join(str(part) for part in protocol.MIN_COMPATIBLE_FIRMWARE)
             message = (
-                'BMCU firmware does not match host %s; flash bundled firmware %s' %
-                (protocol.REQUIRED_FIRMWARE_TEXT,
+                'BMCU firmware %s is outside the supported %s..%s range; '
+                'flash bundled firmware %s' %
+                (reported, minimum, protocol.REQUIRED_FIRMWARE_TEXT,
                  protocol.REQUIRED_FIRMWARE_TEXT))
             self.firmware_compatible = False
             self.firmware_error = message
@@ -1556,37 +1581,83 @@ class BMCUDevice(object):
         return self.request(protocol.MSG_RESET_ERROR, timeout=1.0)
 
     def update_prepare(self):
-        return self.request(protocol.MSG_UPDATE_PREPARE, timeout=2.0)
+        return self.request(protocol.MSG_UPDATE_PREPARE, timeout=15.0)
 
     def update_cancel(self):
-        return self.request(protocol.MSG_UPDATE_CANCEL, timeout=1.0)
+        return self.request(protocol.MSG_UPDATE_CANCEL, timeout=15.0)
 
     def suspend_for_update(self, reason='firmware_update'):
-        if self.suspended:
-            return
         self.suspended = True
         self.suspend_reason = str(reason or 'firmware_update')
-        self._send_sidecar_control(transport.CTRL_RELEASE_SERIAL)
-        self.close(notify=False)
         self.next_connect_at = float('inf')
+        try:
+            status = transport.control_request(
+                self.control_path, transport.CTRL_RELEASE_SERIAL,
+                pause=self.reactor.pause)
+            if status.get('serial_open') or not status.get('serial_released'):
+                raise RuntimeError('BMCU sidecar did not release the serial port')
+        finally:
+            self.close(notify=False)
 
     def resume_after_update(self):
+        status = transport.control_request(
+            self.control_path, transport.CTRL_RECONNECT_SERIAL,
+            pause=self.reactor.pause)
+        if status.get('serial_released'):
+            raise RuntimeError('BMCU sidecar remains suspended')
         self.suspended = False
         self.suspend_reason = ''
         self.last_error = ''
-        self._send_sidecar_control(transport.CTRL_RECONNECT_SERIAL)
         self.reconnect_delay = self.manager.reconnect_interval
         self.next_connect_at = self.reactor.monotonic() + max(
             1.0, self.manager.reconnect_interval)
 
-    def nvm_read(self, offset, length):
+    def nvm_read(self, offset, length, timeout=15.0):
         offset = _bounded_int(offset, 'NVM offset', 0, 4095)
         length = _bounded_int(length, 'NVM length', 1, 224)
+        timeout = _bounded_float(timeout, 'NVM read timeout', 0.05, 30.0)
         if offset + length > 4096:
             raise ValueError('NVM read exceeds 4 KiB region')
         payload = struct.pack('<HH', offset, length)
         return self.request(protocol.MSG_NVM_READ, payload,
-                            expected=(protocol.MSG_NVM_DATA,), timeout=2.0)
+                            expected=(protocol.MSG_NVM_DATA,), timeout=timeout)
+
+    def nvm_read_batch(self, chunks, timeout=15.0):
+        timeout = _bounded_float(timeout, 'NVM batch timeout', 0.05, 30.0)
+        chunks = list(chunks or ())
+        if not chunks or len(chunks) > 4:
+            raise ValueError('NVM batch must contain between 1 and 4 chunks')
+        validated = []
+        for offset, length in chunks:
+            offset = _bounded_int(offset, 'NVM offset', 0, 4095)
+            length = _bounded_int(length, 'NVM length', 1, 224)
+            if offset + length > 4096:
+                raise ValueError('NVM read exceeds 4 KiB region')
+            validated.append((offset, length))
+        entered = self._control_plane_request_begin()
+        pending_items = []
+        try:
+            deadline = self.reactor.monotonic() + timeout
+            for offset, length in validated:
+                cmd_id = self._next_cmd_id()
+                pending = self._new_pending(
+                    cmd_id, (protocol.MSG_NVM_DATA,), deadline)
+                self.pending[cmd_id] = pending
+                pending_items.append((offset, length, cmd_id, pending))
+                self.send(
+                    protocol.MSG_NVM_READ,
+                    struct.pack('<HH', offset, length), cmd_id)
+            results = []
+            for offset, length, cmd_id, pending in pending_items:
+                results.append(self._wait_pending(
+                    pending,
+                    'BMCU NVM batch timeout offset=%d length=%d id=%d' %
+                    (offset, length, cmd_id)))
+            return results
+        finally:
+            for _offset, _length, cmd_id, _pending in pending_items:
+                self.pending.pop(cmd_id, None)
+            self._control_plane_request_end(entered)
 
     def calibration_point(self, channel, point):
         channel = _bounded_int(channel, 'channel', 0, 3)
@@ -1615,46 +1686,61 @@ class BMCUDevice(object):
         channel = _bounded_int(channel, 'channel', 0, 3)
         millimeters = _bounded_float(millimeters, 'distance', 5.0, 5000.0)
         payload = bytes([channel]) + struct.pack('<f', millimeters)
-        op_id = self._next_cmd_id()
-        pending = self._new_pending(
-            op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
-            self.reactor.monotonic() + 2.0)
-        self.pending[op_id] = pending
+        control_plane_entered = self._control_plane_request_begin()
+        pending = None
+        op_id = None
         try:
+            op_id = self._next_cmd_id()
+            pending = self._new_pending(
+                op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
+                self.reactor.monotonic() + 2.0)
+            self.pending[op_id] = pending
             self.send(msg_type, payload, op_id)
             self._wait_pending(pending, 'operation start timeout')
             return op_id
         finally:
-            self.pending.pop(op_id, None)
+            if pending is not None:
+                self.pending.pop(op_id, None)
+            self._control_plane_request_end(control_plane_entered)
 
     def start_channel_retract(self, channel):
         channel = _bounded_int(channel, 'channel', 0, 3)
-        op_id = self._next_cmd_id()
-        pending = self._new_pending(
-            op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
-            self.reactor.monotonic() + 2.0)
-        self.pending[op_id] = pending
+        control_plane_entered = self._control_plane_request_begin()
+        pending = None
+        op_id = None
         try:
+            op_id = self._next_cmd_id()
+            pending = self._new_pending(
+                op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
+                self.reactor.monotonic() + 2.0)
+            self.pending[op_id] = pending
             self.send(protocol.MSG_CHANNEL_RETRACT, bytes([channel]), op_id)
             self._wait_pending(pending, 'channel retract start timeout')
             return op_id
         finally:
-            self.pending.pop(op_id, None)
+            if pending is not None:
+                self.pending.pop(op_id, None)
+            self._control_plane_request_end(control_plane_entered)
 
     def start_auto_calibration(self, selected_mask=0x0f):
         selected_mask = _bounded_int(selected_mask, 'calibration channel mask', 1, 0x0f)
-        op_id = self._next_cmd_id()
-        pending = self._new_pending(
-            op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
-            self.reactor.monotonic() + 2.0)
-        self.pending[op_id] = pending
+        control_plane_entered = self._control_plane_request_begin()
+        pending = None
+        op_id = None
         try:
+            op_id = self._next_cmd_id()
+            pending = self._new_pending(
+                op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
+                self.reactor.monotonic() + 2.0)
+            self.pending[op_id] = pending
             self.send(protocol.MSG_CAL_AUTO_START, bytes([selected_mask]), op_id)
             self._wait_pending(
                 pending, 'automatic calibration start timeout')
             return op_id
         finally:
-            self.pending.pop(op_id, None)
+            if pending is not None:
+                self.pending.pop(op_id, None)
+            self._control_plane_request_end(control_plane_entered)
 
     def abort_operation(self):
         return self.request(protocol.MSG_ABORT_OP, timeout=1.0)
@@ -1668,17 +1754,22 @@ class BMCUDevice(object):
         contact_pct = _bounded_int(contact_pct, 'contact percentage', 55, 98)
         timeout_ms = _bounded_int(timeout_ms, 'operation timeout ms', 250, 300000)
         payload = struct.pack('<BfBI', channel, millimeters, contact_pct, timeout_ms)
-        op_id = self._next_cmd_id()
-        pending = self._new_pending(
-            op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
-            self.reactor.monotonic() + 2.0)
-        self.pending[op_id] = pending
+        control_plane_entered = self._control_plane_request_begin()
+        pending = None
+        op_id = None
         try:
+            op_id = self._next_cmd_id()
+            pending = self._new_pending(
+                op_id, (protocol.MSG_ACK, protocol.MSG_OP_RESULT),
+                self.reactor.monotonic() + 2.0)
+            self.pending[op_id] = pending
             self.send(msg_type, payload, op_id)
             self._wait_pending(pending, 'feed operation start timeout')
             return op_id
         finally:
-            self.pending.pop(op_id, None)
+            if pending is not None:
+                self.pending.pop(op_id, None)
+            self._control_plane_request_end(control_plane_entered)
 
     def start_feed_to_contact(self, channel, maximum_mm, contact_pct, timeout_ms):
         return self.start_feed_operation(protocol.MSG_FEED_TO_CONTACT, channel,
@@ -1693,11 +1784,11 @@ class BMCUDevice(object):
         payload = protocol.pack_runtime_sync(
             values, rgb, policy, channel_retract_m, channel_autoload_m,
             include_channel_autoload=True)
-        return self.request(protocol.MSG_RUNTIME_SYNC, payload, timeout=1.0)
+        return self.request(protocol.MSG_RUNTIME_SYNC, payload, timeout=15.0)
 
     def set_slots(self, slots):
         payload = protocol.pack_slots(slots)
-        return self.request(protocol.MSG_SET_SLOTS, payload, timeout=2.0)
+        return self.request(protocol.MSG_SET_SLOTS, payload, timeout=15.0)
 
     def config_get(self, key):
         key = _bounded_int(key, 'configuration key', 0, 0xffff)
@@ -1719,11 +1810,11 @@ class BMCUDevice(object):
         green = _bounded_int(green, 'green', 0, 255)
         blue = _bounded_int(blue, 'blue', 0, 255)
         payload = bytes([red, green, blue])
-        return self.request(protocol.MSG_SET_SYSTEM_LED, payload, timeout=1.0)
+        return self.request(protocol.MSG_SET_SYSTEM_LED, payload, timeout=15.0)
 
     def set_lighting(self, config):
         payload = protocol.pack_lighting(config)
-        return self.request(protocol.MSG_SET_LIGHTING, payload, timeout=1.0)
+        return self.request(protocol.MSG_SET_LIGHTING, payload, timeout=15.0)
 
     def preview_led(self, target, red, green, blue):
         values = [
@@ -1737,4 +1828,4 @@ class BMCUDevice(object):
     def set_slot(self, channel, color, name, tmin, tmax, material):
         payload = protocol.pack_slot(channel, color, name, tmin, tmax, material)
         return self.request(protocol.MSG_SET_SLOT_INFO, payload,
-                            expected=(protocol.MSG_SLOT_INFO,), timeout=2.0)
+                            expected=(protocol.MSG_SLOT_INFO,), timeout=15.0)

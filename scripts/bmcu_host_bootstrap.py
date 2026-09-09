@@ -438,7 +438,50 @@ def _prepare_transport_log(path, uid, gid):
     finally:
         os.close(fd)
 
-def ensure_transport_processes(bmcu_dir, metadata):
+def _wait_transport_online(process, status_file, name, expected_uid, timeout):
+    timeout = max(0.0, float(timeout or 0.0))
+    if timeout <= 0.0:
+        return
+    deadline = time.monotonic() + timeout
+    last = 'status file is not ready'
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise BootstrapError(
+                'preferred BMCU transport exited before becoming online')
+        try:
+            info = os.lstat(status_file)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise BootstrapError('unsafe BMCU transport status file')
+            if info.st_size > MAX_JSON:
+                raise BootstrapError('BMCU transport status file is too large')
+            with open(status_file, 'r') as stream:
+                value = json.load(stream)
+            if not isinstance(value, dict):
+                raise ValueError('invalid transport status')
+            if str(value.get('name') or '') != str(name):
+                raise ValueError('transport status belongs to another device')
+            if int(value.get('pid', 0) or 0) != int(process.pid):
+                raise ValueError('transport status PID is stale')
+            uid = str(value.get('uid') or '').upper()
+            expected = str(expected_uid or '').upper()
+            if expected and uid and uid != expected:
+                last = 'transport found foreign UID %s while scanning' % uid
+                time.sleep(0.05)
+                continue
+            if (bool(value.get('online')) and bool(value.get('serial_open')) and
+                    not bool(value.get('serial_released')) and
+                    (not expected or uid == expected)):
+                return
+            last = str(value.get('last_error') or 'transport is not online yet')
+        except BootstrapError:
+            raise
+        except Exception as exc:
+            last = str(exc)
+        time.sleep(0.05)
+    raise BootstrapError(
+        'preferred BMCU transport did not become online: %s' % last)
+
+def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferred_online_timeout=0.0):
 
     runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
     daemon = os.path.realpath(os.path.join(
@@ -497,7 +540,9 @@ def ensure_transport_processes(bmcu_dir, metadata):
         log_dir = bmcu_dir
     records = {}
     started = 0
+    preferred_name = str(preferred_name or '')
     ordered_devices = sorted(config['devices'], key=lambda item: (
+        0 if preferred_name and str(item.get('name', '')) == preferred_name else 1,
         0 if str(item.get('port', '')).startswith('/dev/serial/by-path/') else
         1 if str(item.get('port', '')).startswith('/dev/serial/by-id/') else 2,
         str(item.get('name', ''))))
@@ -604,6 +649,11 @@ def ensure_transport_processes(bmcu_dir, metadata):
 
         _atomic_transport_records(record_path, records)
         started += 1
+        if (preferred_name and name == preferred_name and
+                float(preferred_online_timeout or 0.0) > 0.0):
+            _wait_transport_online(
+                process, status_file, name, item.get('uid', ''),
+                preferred_online_timeout)
     _atomic_transport_records(record_path, records)
     return started
 
@@ -1362,12 +1412,14 @@ def repair(metadata_path, quiet=False, repair_config=True):
                planner_changed, panel_changed))
     return changed
 
-def sync_transports(metadata_path):
+def sync_transports(metadata_path, preferred_name=None, preferred_online_timeout=0.0):
     metadata = read_metadata(metadata_path)
     bmcu_dir, _extras_dir, _source_dir = validate_paths(metadata, metadata_path)
     lock = acquire_lock(bmcu_dir)
     try:
-        return ensure_transport_processes(bmcu_dir, metadata)
+        return ensure_transport_processes(
+            bmcu_dir, metadata, preferred_name=preferred_name,
+            preferred_online_timeout=preferred_online_timeout)
     finally:
         os.close(lock)
 
