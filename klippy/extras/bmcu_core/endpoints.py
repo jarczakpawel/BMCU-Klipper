@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import copy
+import json
 import logging
 import math
 import re
@@ -2192,6 +2193,28 @@ class SnapmakerU1Endpoint(Endpoint):
             if disabled != expected_disabled:
                 raise EndpointError(
                     'U1 native feeder state did not change for head %d' % self._head())
+        if save:
+            obj = self._native_feeder_object(strict=True)
+            path = str(getattr(obj, 'config_path', '') or '')
+            try:
+                import queuefile
+                saved = copy.deepcopy(obj.config)
+                modes = saved.get('auto_mode')
+                if (not isinstance(modes, list) or len(modes) != 2 or
+                        modes[channel] is not bool(enabled)):
+                    raise ValueError('auto_mode does not match the request')
+                queuefile.sync_write_file(
+                    self.manager.reactor, path,
+                    json.dumps(saved, indent=4, allow_nan=False),
+                    safe_write=True, timeout=10.0)
+                self.manager._durable_writer.sync(path, timeout=10.0)
+                state = self._native_feeder_status(strict=True)
+                if bool(state.get('disable_auto', False)) == bool(enabled):
+                    raise ValueError('native AUTO changed while saving')
+            except Exception as exc:
+                raise EndpointError(
+                    'U1 native feeder AUTO could not be durably saved to %s: %s' %
+                    (path or 'the Snapmaker configuration', exc))
         return state
 
     def native_path_status(self, sensor_snapshot=None,

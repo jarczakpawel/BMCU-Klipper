@@ -24,6 +24,9 @@ _EXTRAS = os.path.join(_ROOT, 'klippy', 'extras')
 if _EXTRAS not in sys.path:
     sys.path.insert(0, _EXTRAS)
 from bmcu_core.release import PACKAGE_VERSION
+sys.path.insert(0, os.path.join(_ROOT, 'scripts'))
+import bmcu_planner_process as planner_process
+import bmcu_transport_process as transport_process
 
 PRODUCT = 'BMCU-Klipper'
 VERSION = PACKAGE_VERSION
@@ -328,56 +331,21 @@ def _transport_config(path):
     return values
 
 def _read_transport_records(path):
-    try:
-        if os.path.islink(path) or not os.path.isfile(path):
-            return {}
-        with open(path, 'r') as stream:
-            value = json.load(stream)
-        if not isinstance(value, dict):
-            return {}
-        records = value.get('devices', {})
-        return records if isinstance(records, dict) else {}
-    except Exception:
-        return {}
+    records = transport_process.processes(os.path.dirname(path))
+    if len({record['name'] for record in records}) != len(records):
+        raise BootstrapError('multiple verified BMCU transports have the same name; restart the service')
+    return {record['name']: record for record in records}
+
 
 def _recorded_transport_alive(record, runtime):
-    if not isinstance(record, dict):
-        return False
-    try:
-        pid = int(record.get('pid', 0) or 0)
-    except (TypeError, ValueError):
-        return False
-    daemon = os.path.realpath(str(record.get('daemon', '') or ''))
-    if (pid <= 1 or os.path.basename(daemon) != 'bmcu_transportd.py' or
-            not inside(daemon, runtime)):
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    command = _process_cmdline(pid)
-    return bool(command and 'bmcu_transportd.py' in command and daemon in command)
+    return planner_process.alive(record, runtime, 'transport')
+
 
 def _stop_transport_record(record, runtime):
-    if not _recorded_transport_alive(record, runtime):
+    if not record:
         return False
-    pid = int(record['pid'])
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return False
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return True
-        time.sleep(0.05)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
-    return True
+    return transport_process.stop_record(record, runtime)
+
 
 def _atomic_transport_records(path, records):
     fd, temporary = tempfile.mkstemp(
@@ -389,6 +357,9 @@ def _atomic_transport_records(path, records):
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o640)
+        if os.geteuid() == 0:
+            parent = os.stat(os.path.dirname(path))
+            os.chown(temporary, parent.st_uid, parent.st_gid)
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -417,7 +388,9 @@ def _wait_transport_started(process, socket_path, timeout=2.0):
         try:
             stream_info = os.stat(socket_path)
             control_info = os.stat(socket_path + '.ctl')
-            if (stat.S_ISSOCK(stream_info.st_mode) and
+            owner = planner_process.read_record(socket_path + '.lock')
+            if (int(owner.get('pid', 0) or 0) == process.pid and owner.get('ready') and
+                    stat.S_ISSOCK(stream_info.st_mode) and
                     stat.S_ISSOCK(control_info.st_mode)):
                 return
         except OSError:
@@ -587,12 +560,6 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             records[name] = old
             continue
         _stop_transport_record(old, runtime)
-        for stale in (socket_path, socket_path + '.ctl', status_file):
-            try:
-                if os.path.lexists(stale):
-                    os.unlink(stale)
-            except OSError:
-                pass
         command = [
             sys.executable, '-I', '-S', daemon,
             '--name', name, '--port', port, '--socket', socket_path,
@@ -603,6 +570,7 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             '--status-interval', str(config['status_interval']),
             '--connect-settle', str(config['connect_settle']),
             '--log-file', logfile, '--status-file', status_file,
+            '--settings-digest', settings_digest,
         ]
         if item.get('uid'):
             command.extend(['--expected-uid', item['uid']])
@@ -626,13 +594,6 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
                     process.kill()
                 except Exception:
                     pass
-            for stale in (socket_path, socket_path + '.ctl', status_file):
-                try:
-                    if os.path.lexists(stale):
-                        os.unlink(stale)
-                except OSError:
-                    pass
-
             fallback = dict(records)
             for previous_name, previous_record in previous.items():
                 if (previous_name in desired_names and
@@ -643,6 +604,7 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             raise
         records[name] = {
             'pid': int(process.pid), 'daemon': daemon,
+            'name': name, 'uid': str(item.get('uid', '') or ''),
             'settings_digest': settings_digest, 'socket': socket_path,
             'port': port, 'logfile': logfile, 'status_file': status_file,
         }
@@ -657,55 +619,6 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
     _atomic_transport_records(record_path, records)
     return started
 
-def _read_planner_record(path):
-    try:
-        if os.path.islink(path) or not os.path.isfile(path):
-            return {}
-        with open(path, 'r') as stream:
-            value = json.load(stream)
-        return value if isinstance(value, dict) else {}
-    except Exception:
-        return {}
-
-def _recorded_planner_alive(record, runtime):
-    if not isinstance(record, dict):
-        return False
-    try:
-        pid = int(record.get('pid', 0) or 0)
-    except (TypeError, ValueError):
-        return False
-    daemon = os.path.realpath(str(record.get('daemon', '') or ''))
-    if (pid <= 1 or os.path.basename(daemon) != 'bmcu_plannerd.py' or
-            not inside(daemon, runtime)):
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    command = _process_cmdline(pid)
-    return bool(command and 'bmcu_plannerd.py' in command and daemon in command)
-
-def _stop_planner_record(record, runtime):
-    if not _recorded_planner_alive(record, runtime):
-        return False
-    pid = int(record['pid'])
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return False
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return True
-        time.sleep(0.05)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
-    return True
-
 def _atomic_planner_record(path, payload):
     fd, temporary = tempfile.mkstemp(
         prefix='.planner-process.', dir=os.path.dirname(path))
@@ -716,6 +629,9 @@ def _atomic_planner_record(path, payload):
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o640)
+        if os.geteuid() == 0:
+            parent = os.stat(os.path.dirname(path))
+            os.chown(temporary, parent.st_uid, parent.st_gid)
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -744,28 +660,35 @@ def _wait_planner_started(process, socket_path, timeout=2.0):
             raise BootstrapError(
                 'BMCU U1 planner exited during startup with code %d' % code)
         try:
-            if stat.S_ISSOCK(os.stat(socket_path).st_mode):
+            owner = planner_process.read_record(socket_path + '.lock')
+            if (int(owner.get('pid', 0) or 0) == process.pid and
+                    stat.S_ISSOCK(os.lstat(socket_path).st_mode)):
                 return
-        except OSError:
+        except (OSError, TypeError, ValueError):
             pass
         time.sleep(0.05)
     raise BootstrapError('BMCU U1 planner did not create its Unix socket')
 
-def ensure_planner_process(bmcu_dir, metadata):
+def ensure_planner_process(bmcu_dir, metadata, restart=False):
 
+    if metadata.get('platform') != 'snapmaker_u1':
+        return 0
     runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
     daemon = os.path.realpath(os.path.join(
         runtime, 'scripts', 'bmcu_plannerd.py'))
     record_path = os.path.join(bmcu_dir, 'planner-process.json')
-    previous = _read_planner_record(record_path)
     config = _transport_config(os.path.join(bmcu_dir, 'bmcu.cfg'))
     enabled = (str(metadata.get('platform', '') or '') == 'snapmaker_u1' and
                bool(config.get('enabled', True)) and bool(config.get('devices')))
     socket_dir = config['socket_dir']
     socket_path = os.path.join(socket_dir, 'u1-planner.sock')
     result_dir = os.path.join(socket_dir, 'u1-plans')
+    records = planner_process.processes(bmcu_dir, socket_path)
+    previous = records[0] if len(records) == 1 else {}
+    lock_owner = planner_process.lock_owner(socket_path, runtime)
     if not enabled:
-        _stop_planner_record(previous, runtime)
+        for record in records:
+            planner_process.stop_record(record, runtime)
         for stale in (record_path, socket_path):
             try:
                 os.unlink(stale)
@@ -798,17 +721,13 @@ def ensure_planner_process(bmcu_dir, metadata):
     settings_digest = hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(',', ':')).encode(
             'utf-8')).hexdigest()
-    current = (_recorded_planner_alive(previous, runtime) and
+    current = (bool(lock_owner) and planner_process.alive(previous, runtime) and
                str(previous.get('settings_digest', '')) == settings_digest and
                _planner_paths_ready(socket_path, result_dir, uid, gid))
-    if current:
+    if current and not restart:
         return 0
-    _stop_planner_record(previous, runtime)
-    try:
-        if os.path.lexists(socket_path):
-            os.unlink(socket_path)
-    except OSError:
-        pass
+    for record in records:
+        planner_process.stop_record(record, runtime)
     if os.path.lexists(result_dir):
         if os.path.islink(result_dir) or not os.path.isdir(result_dir):
             raise BootstrapError('unsafe BMCU U1 planner result directory')
@@ -834,6 +753,13 @@ def ensure_planner_process(bmcu_dir, metadata):
             preexec_fn=_transport_preexec(user, uid, gid))
     try:
         _wait_planner_started(process, socket_path)
+        _atomic_planner_record(record_path, {
+            'pid': int(process.pid),
+            'daemon': daemon,
+            'socket': socket_path,
+            'result_dir': result_dir,
+            'settings_digest': settings_digest,
+        })
     except Exception:
         try:
             process.terminate()
@@ -844,13 +770,6 @@ def ensure_planner_process(bmcu_dir, metadata):
             except Exception:
                 pass
         raise
-    _atomic_planner_record(record_path, {
-        'pid': int(process.pid),
-        'daemon': daemon,
-        'socket': socket_path,
-        'result_dir': result_dir,
-        'settings_digest': settings_digest,
-    })
     return 1
 
 def _panel_config(path):
@@ -946,60 +865,6 @@ def _read_package_digest(path):
         pass
     return 'unknown'
 
-def _read_panel_record(path):
-    try:
-        if os.path.islink(path) or not os.path.isfile(path):
-            return {}
-        with open(path, 'r') as stream:
-            value = json.load(stream)
-        if not isinstance(value, dict):
-            return {}
-        value['pid'] = int(value.get('pid', 0) or 0)
-        return value
-    except Exception:
-        return {}
-
-def _process_cmdline(pid):
-    try:
-        with open('/proc/%d/cmdline' % int(pid), 'rb') as stream:
-            return stream.read(8192).replace(b'\0', b' ').decode(
-                'utf-8', 'replace')
-    except Exception:
-        return ''
-
-def _recorded_panel_alive(record):
-    pid = int(record.get('pid', 0) or 0)
-    server = os.path.realpath(str(record.get('server', '') or ''))
-    if pid <= 1 or not server or os.path.basename(server) != 'bmcu_panel_server.py':
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    command = _process_cmdline(pid)
-    return bool(command and 'bmcu_panel_server.py' in command and server in command)
-
-def _stop_recorded_panel(record):
-    if not _recorded_panel_alive(record):
-        return False
-    pid = int(record['pid'])
-    try:
-        os.kill(pid, 15)
-    except OSError:
-        return False
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return True
-        time.sleep(0.05)
-    try:
-        os.kill(pid, 9)
-    except OSError:
-        pass
-    return True
-
 def _atomic_panel_record(path, payload):
     fd, temporary = tempfile.mkstemp(prefix='.panel-process.', dir=os.path.dirname(path))
     try:
@@ -1019,9 +884,10 @@ def ensure_panel_process(bmcu_dir):
     runtime = os.path.join(bmcu_dir, 'runtime')
     settings = _panel_config(os.path.join(bmcu_dir, 'bmcu_panel.cfg'))
     pidfile = os.path.join(bmcu_dir, 'panel-process.json')
-    record = _read_panel_record(pidfile)
+    records = transport_process.panel_processes(bmcu_dir)
+    record = records[0] if len(records) == 1 else {}
     if not settings['enabled']:
-        _stop_recorded_panel(record)
+        transport_process.stop_panel(bmcu_dir)
         try:
             os.unlink(pidfile)
         except OSError:
@@ -1039,13 +905,13 @@ def ensure_panel_process(bmcu_dir):
             (os.path.isfile(updater) and not inside(updater, runtime))):
         raise BootstrapError('panel runtime paths are unsafe')
 
-    current = (_recorded_panel_alive(record) and
+    current = (planner_process.alive(record, runtime, 'panel') and
                os.path.realpath(str(record.get('server', '') or '')) == server and
                str(record.get('digest', '') or '') == digest and
                str(record.get('settings_digest', '') or '') == settings_digest)
     if current:
         return 0
-    _stop_recorded_panel(record)
+    transport_process.stop_panel(bmcu_dir)
 
     state_dir = os.path.join(bmcu_dir, 'update')
     if not os.path.isdir(state_dir):
@@ -1389,8 +1255,12 @@ def repair(metadata_path, quiet=False, repair_config=True):
     finally:
         os.close(lock)
     discovery_changed = 0
-    transport_changed = ensure_transport_processes(bmcu_dir, metadata)
-    planner_changed = ensure_planner_process(bmcu_dir, metadata)
+    lock = acquire_lock(bmcu_dir)
+    try:
+        transport_changed = ensure_transport_processes(bmcu_dir, metadata)
+        planner_changed = ensure_planner_process(bmcu_dir, metadata)
+    finally:
+        os.close(lock)
     panel_changed = 0
     try:
         panel_changed = ensure_panel_process(bmcu_dir)
@@ -1412,6 +1282,15 @@ def repair(metadata_path, quiet=False, repair_config=True):
                planner_changed, panel_changed))
     return changed
 
+def sync_planner(metadata_path, restart=False):
+    metadata = read_metadata(metadata_path)
+    bmcu_dir, _extras_dir, _source_dir = validate_paths(metadata, metadata_path)
+    lock = acquire_lock(bmcu_dir)
+    try:
+        return ensure_planner_process(bmcu_dir, metadata, restart=restart)
+    finally:
+        os.close(lock)
+
 def sync_transports(metadata_path, preferred_name=None, preferred_online_timeout=0.0):
     metadata = read_metadata(metadata_path)
     bmcu_dir, _extras_dir, _source_dir = validate_paths(metadata, metadata_path)
@@ -1427,35 +1306,13 @@ def remove(metadata_path, quiet=False):
     metadata = read_metadata(metadata_path)
     bmcu_dir, extras_dir, _source_dir = validate_paths(metadata, metadata_path)
     runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
-    record_path = os.path.join(bmcu_dir, 'transport-processes.json')
-    records = _read_transport_records(record_path)
-    for record in records.values():
-        _stop_transport_record(record, runtime)
-        for socket_path in (str(record.get('socket', '') or ''),
-                            str(record.get('socket', '') or '') + '.ctl'):
-            if socket_path:
-                try:
-                    os.unlink(socket_path)
-                except OSError:
-                    pass
-    try:
-        os.unlink(record_path)
-    except OSError:
-        pass
-    planner_record_path = os.path.join(bmcu_dir, 'planner-process.json')
-    planner_record = _read_planner_record(planner_record_path)
-    _stop_planner_record(planner_record, runtime)
-    for stale in (str(planner_record.get('socket', '') or ''),
-                  planner_record_path):
-        if not stale:
-            continue
-        try:
-            os.unlink(stale)
-        except OSError:
-            pass
     lock = acquire_lock(bmcu_dir)
     removed = 0
     try:
+        transport_process.stop(bmcu_dir, locked=True)
+        transport_process.stop_panel(bmcu_dir)
+        if metadata.get('platform') == 'snapmaker_u1':
+            planner_process.stop(bmcu_dir, locked=True)
         for name in MODULES:
             target = os.path.join(extras_dir, name)
             if not os.path.lexists(target):
@@ -1484,6 +1341,8 @@ def main():
     action.add_argument('--repair', action='store_true')
     action.add_argument('--remove', action='store_true')
     action.add_argument('--sync-transports', action='store_true')
+    action.add_argument('--sync-planner', action='store_true')
+    action.add_argument('--restart-planner', action='store_true')
     parser.add_argument('--metadata', default=default_metadata())
     parser.add_argument('--quiet', action='store_true')
     parser.add_argument('--links-only', action='store_true', help=argparse.SUPPRESS)
@@ -1492,6 +1351,8 @@ def main():
         remove(args.metadata, args.quiet)
     elif args.sync_transports:
         sync_transports(args.metadata)
+    elif args.sync_planner or args.restart_planner:
+        sync_planner(args.metadata, restart=args.restart_planner)
     else:
         repair(args.metadata, args.quiet, not args.links_only)
     return 0
@@ -1499,6 +1360,7 @@ def main():
 if __name__ == '__main__':
     try:
         raise SystemExit(main())
-    except (BootstrapError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (BootstrapError, planner_process.PlannerProcessError,
+            OSError, ValueError, json.JSONDecodeError) as exc:
         print('ERROR: %s' % exc, file=sys.stderr)
         raise SystemExit(1)

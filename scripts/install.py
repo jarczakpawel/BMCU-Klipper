@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 import argparse
+import atexit
 import errno
 import fcntl
 import glob
@@ -66,6 +67,7 @@ SYSTEMD_DROPIN_NAME = 'bmcu-klipper.conf'
 RUNTIME_SCRIPTS = (
     'apply_detected_devices.py', 'bmcu_cli.py', 'bmcu_doctor.py',
     'bmcu_host_bootstrap.py', 'bmcu_transportd.py', 'bmcu_plannerd.py',
+    'bmcu_planner_process.py', 'bmcu_transport_process.py',
     'bmcu_isp.py', 'bmcu_runtime.py', 'bmcu_collect_logs.py',
     'bmcu_update.py', 'bmcu_vendor.py', 'detect_bmcu.py',
     'bmcu_platform.py', 'safe_file_ops.py',
@@ -73,6 +75,8 @@ RUNTIME_SCRIPTS = (
 )
 
 UNINSTALL_NOTE = b'Run uninstall from an extracted BMCU-Klipper package:\n    sh ./uninstall\n'
+planner_process = None
+transport_process = None
 
 class InstallError(RuntimeError):
     pass
@@ -653,14 +657,42 @@ def printer_state(base):
         raise InstallError('invalid Moonraker /printer/info response')
     return str(result.get('state') or '').strip().lower(), str(result.get('state_message') or '')
 
+def snapmaker_u1_machine_idle(base):
+    data = query_json(
+        base.rstrip('/') + '/printer/objects/query?machine_state_manager')
+    result = data.get('result') if isinstance(data, dict) else None
+    status = result.get('status') if isinstance(result, dict) else None
+    machine = status.get('machine_state_manager') if isinstance(status, dict) else None
+    if not isinstance(machine, dict) or 'main_state' not in machine:
+        raise InstallError(
+            'Snapmaker U1 machine_state_manager status is unavailable')
+    state = machine.get('main_state')
+    if isinstance(state, bool):
+        idle = False
+    elif isinstance(state, (int, float)):
+        idle = int(state) == 0 and float(state) == 0.0
+    else:
+        idle = str(state or '').strip().upper() in ('IDLE', '0')
+    return idle, str(state)
+
 def printer_idle(base, assume_idle=False):
     data = query_json(
         base.rstrip('/') +
-        '/printer/objects/query?print_stats&pause_resume&idle_timeout')
+        '/printer/objects/query?print_stats&pause_resume&idle_timeout'
+        '&bmcu=active_operations,prestaged,u1_cross_refill_pending')
     result = data.get('result') if isinstance(data, dict) else None
     status = result.get('status') if isinstance(result, dict) else None
     if not isinstance(status, dict):
         raise InstallError('Moonraker did not return printer status objects')
+
+    if 'bmcu' in status:
+        bmcu = status['bmcu']
+        if not isinstance(bmcu, dict):
+            raise InstallError('Moonraker did not return valid BMCU status')
+        if any(bmcu.get(key) for key in (
+                'active_operations', 'prestaged', 'u1_cross_refill_pending')):
+            return False, ('BMCU is busy; finish the current BMCU operation '
+                           'or clear prestage/refill recovery before update')
 
     pause = status.get('pause_resume')
     if isinstance(pause, dict) and bool(pause.get('is_paused')):
@@ -1107,6 +1139,21 @@ def seal_staging(path):
     finally:
         os.close(root_fd)
 
+def validate_target_python(target_python, target_user, uid, gid):
+    command = [
+        os.path.realpath(target_python), '-c',
+        'import sys; raise SystemExit(0 if sys.version_info >= (3, 7) and sys.version_info[0] == 3 else 42)',
+    ]
+    result = run_as_user(
+        command, target_user, uid, gid, check=False, timeout=10)
+    if result == 42:
+        raise InstallError(
+            'Klipper Python 3.7 or newer is required: %s' % target_python)
+    if result != 0:
+        raise InstallError(
+            'Klipper Python could not execute the BMCU compatibility check: %s' %
+            target_python)
+
 def validate_root_run_installation(plan, target_python, uid):
     if int(uid) != 0:
         return
@@ -1246,6 +1293,67 @@ def wait_pids_gone(pids, timeout):
         time.sleep(0.2)
     return [pid for pid in remaining if os.path.exists('/proc/%d' % pid)]
 
+def prepare_live_update(base, moonraker_gcode):
+    try:
+        payload = query_json(
+            base.rstrip('/') +
+            '/printer/objects/query?gcode&bmcu=package_version')
+    except Exception as exc:
+        raise InstallError(
+            'cannot verify the running BMCU update barrier: %s' % exc)
+    result = payload.get('result') if isinstance(payload, dict) else None
+    status = result.get('status') if isinstance(result, dict) else None
+    if not isinstance(status, dict):
+        raise InstallError(
+            'Moonraker did not return printer status while preparing update')
+    bmcu = status.get('bmcu')
+    if not isinstance(bmcu, dict):
+        return None
+    gcode = status.get('gcode')
+    commands = gcode.get('commands') if isinstance(gcode, dict) else None
+    if not isinstance(commands, dict):
+        raise InstallError(
+            'Moonraker did not return the registered G-code commands')
+
+    version = str(bmcu.get('package_version', '') or 'unknown')
+    if 'BMCU_PREPARE_UPDATE' not in commands:
+        raise InstallError(
+            'running BMCU %s does not provide the safe live-update barrier; '
+            'when upgrading from public release 1.0.2, finish BMCU operations '
+            'and refill recovery, clear prestage and unload the routes, stop '
+            'the Klipper OS service, then rerun sh ./install --assume-idle. '
+            'FIRMWARE_RESTART does not stop the service' % version)
+    command = 'BMCU_PREPARE_UPDATE'
+    cancel = 'BMCU_PREPARE_UPDATE ACTION=CANCEL'
+    mode = 'update'
+
+    preparation = {'mode': mode, 'cancel': cancel, 'version': version}
+    atexit.register(cancel_live_update, base, moonraker_gcode, preparation)
+    try:
+        response = moonraker_gcode.request_gcode(
+            command, base, timeout=180.0)
+    except Exception as exc:
+        raise InstallError(
+            'BMCU update preparation failed; no files changed: %s' % exc)
+    if response.get('result') != 'ok':
+        raise InstallError(
+            'BMCU update preparation was not confirmed by Moonraker')
+    return preparation
+
+def cancel_live_update(base, moonraker_gcode, preparation):
+    atexit.unregister(cancel_live_update)
+    if not isinstance(preparation, dict):
+        return
+    command = str(preparation.get('cancel', '') or '')
+    if not command:
+        return
+    try:
+        moonraker_gcode.request_gcode(command, base, timeout=5.0)
+    except Exception:
+        print(
+            'BMCU update preparation could not be cancelled; restart Klipper '
+            'before issuing new BMCU motion.')
+
 def wait_single_klippy(klipper_dir, printer_cfg, timeout=10.0):
 
     deadline = time.time() + float(timeout)
@@ -1350,91 +1458,20 @@ def configured_transport_devices(bmcu_dir):
         devices.append((name, port))
     return devices
 
-def _load_transport_records(bmcu_dir):
-    path = os.path.join(bmcu_dir, 'transport-processes.json')
-    if os.path.islink(path) or not os.path.isfile(path):
-        return {}
-    try:
-        data, _info = read_regular(path)
-        value = json.loads(data.decode('utf-8'))
-    except Exception as exc:
-        raise InstallError(
-            'cannot read managed BMCU transport records: %s' % exc)
-    records = value.get('devices', {}) if isinstance(value, dict) else None
-    if not isinstance(records, dict):
-        raise InstallError('managed BMCU transport records are malformed')
-    return records
-
-def _managed_transport_record(record, bmcu_dir, require_alive=True):
-    if not isinstance(record, dict):
-        return None
-    try:
-        pid = int(record.get('pid', 0) or 0)
-    except (TypeError, ValueError):
-        return None
-    runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
-    daemon = os.path.realpath(str(record.get('daemon', '') or ''))
-    socket_path = str(record.get('socket', '') or '')
-    if (pid <= 1 or os.path.basename(daemon) != 'bmcu_transportd.py' or
-            not daemon.startswith(runtime + os.sep)):
-        return None
-    argv = read_proc_cmdline(pid)
-    command = ' '.join(argv)
-    alive = bool(command and daemon in command and
-                 'bmcu_transportd.py' in command)
-    if require_alive and not alive:
-        return None
-    return pid, daemon, socket_path, alive
-
 def stop_managed_transport_processes(bmcu_dir):
-
     try:
-        records = _load_transport_records(bmcu_dir)
-    except InstallError:
+        return transport_process.stop(bmcu_dir)
+    except Exception as exc:
+        raise InstallError('cannot stop managed BMCU transports: %s' % exc)
 
-        return 0
-    stopped = 0
-    sockets = []
-    pids = []
-    for name, record in records.items():
-        validated = _managed_transport_record(
-            record, bmcu_dir, require_alive=False)
-        if validated is None:
-            continue
-        pid, _daemon, socket_path, alive = validated
-        if socket_path:
-            sockets.extend((socket_path, socket_path + '.ctl'))
-        if not alive:
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-            pids.append(pid)
-            stopped += 1
-        except ProcessLookupError:
-            pass
-    remaining = wait_pids_gone(pids, 3.0)
-    for pid in remaining:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    remaining = wait_pids_gone(remaining, 1.0)
-    if remaining:
-        raise InstallError(
-            'managed BMCU transport did not stop: %s' %
-            ', '.join(map(str, remaining)))
-    for socket_path in sockets:
-        try:
-            if os.path.lexists(socket_path):
-                os.unlink(socket_path)
-        except OSError:
-            pass
-    return stopped
 
 def verify_managed_transport_processes(bmcu_dir):
 
     expected = dict(configured_transport_devices(bmcu_dir))
-    records = _load_transport_records(bmcu_dir)
+    owners = transport_process.processes(bmcu_dir)
+    records = {record['name']: record for record in owners}
+    if len(records) != len(owners):
+        raise InstallError('duplicate BMCU transport owners')
     if set(records) != set(expected):
         missing = sorted(set(expected) - set(records))
         unexpected = sorted(set(records) - set(expected))
@@ -1448,11 +1485,10 @@ def verify_managed_transport_processes(bmcu_dir):
             '; '.join(details))
     for name, port in sorted(expected.items()):
         record = records.get(name)
-        validated = _managed_transport_record(record, bmcu_dir)
-        if validated is None:
+        if not planner_process.alive(record, os.path.join(bmcu_dir, 'runtime'), 'transport'):
             raise InstallError(
                 'BMCU transport sidecar is not alive for %s' % name)
-        _pid, _daemon, socket_path, _alive = validated
+        socket_path = record['socket']
         if str(record.get('port', '') or '') != port:
             raise InstallError(
                 'BMCU transport sidecar port mismatch for %s' % name)
@@ -1468,70 +1504,13 @@ def verify_managed_transport_processes(bmcu_dir):
 
     return len(expected)
 
-def _load_planner_record(bmcu_dir):
-    path = os.path.join(bmcu_dir, 'planner-process.json')
-    if os.path.islink(path) or not os.path.isfile(path):
-        return {}
-    try:
-        data, _info = read_regular(path)
-        value = json.loads(data.decode('utf-8'))
-    except Exception as exc:
-        raise InstallError('cannot read managed U1 planner record: %s' % exc)
-    if not isinstance(value, dict):
-        raise InstallError('managed U1 planner record is malformed')
-    return value
-
-def _managed_planner_record(record, bmcu_dir, require_alive=True):
-    if not isinstance(record, dict):
-        return None
-    try:
-        pid = int(record.get('pid', 0) or 0)
-    except (TypeError, ValueError):
-        return None
-    runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
-    daemon = os.path.realpath(str(record.get('daemon', '') or ''))
-    socket_path = str(record.get('socket', '') or '')
-    if (pid <= 1 or os.path.basename(daemon) != 'bmcu_plannerd.py' or
-            not daemon.startswith(runtime + os.sep)):
-        return None
-    argv = read_proc_cmdline(pid)
-    command = ' '.join(argv)
-    alive = bool(command and daemon in command and 'bmcu_plannerd.py' in command)
-    if require_alive and not alive:
-        return None
-    return pid, daemon, socket_path, alive
-
 def stop_managed_planner_process(bmcu_dir):
+    if (load_managed_metadata(bmcu_dir) or {}).get('platform') != 'snapmaker_u1':
+        return 0
     try:
-        record = _load_planner_record(bmcu_dir)
-    except InstallError:
-        return 0
-    validated = _managed_planner_record(record, bmcu_dir, require_alive=False)
-    if validated is None:
-        return 0
-    pid, _daemon, socket_path, alive = validated
-    if alive:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            alive = False
-        if alive:
-            remaining = wait_pids_gone([pid], 3.0)
-            if remaining:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                remaining = wait_pids_gone(remaining, 1.0)
-            if remaining:
-                raise InstallError('managed U1 planner did not stop')
-    if socket_path:
-        try:
-            if os.path.lexists(socket_path):
-                os.unlink(socket_path)
-        except OSError:
-            pass
-    return 1 if alive else 0
+        return planner_process.stop(bmcu_dir)
+    except Exception as exc:
+        raise InstallError('cannot stop managed U1 planner: %s' % exc)
 
 def verify_managed_planner_process(bmcu_dir):
     metadata = load_managed_metadata(bmcu_dir)
@@ -1539,11 +1518,11 @@ def verify_managed_planner_process(bmcu_dir):
         return 0
     if not configured_transport_devices(bmcu_dir):
         return 0
-    record = _load_planner_record(bmcu_dir)
-    validated = _managed_planner_record(record, bmcu_dir)
-    if validated is None:
-        raise InstallError('BMCU U1 source planner is not alive')
-    _pid, _daemon, socket_path, _alive = validated
+    records = planner_process.processes(bmcu_dir)
+    if len(records) != 1:
+        raise InstallError('expected one verified BMCU U1 source planner')
+    record = records[0]
+    socket_path = str(record.get('socket', '') or '')
     result_dir = str(record.get('result_dir', '') or '')
     if (not socket_path or os.path.islink(socket_path) or
             not os.path.exists(socket_path) or
@@ -1613,42 +1592,11 @@ def release_managed_serial_holders(bmcu_dir):
                 (port, ', '.join(map(str, remaining))))
 
 def stop_managed_panel_process(bmcu_dir):
+    try:
+        return transport_process.stop_panel(bmcu_dir)
+    except Exception as exc:
+        raise InstallError('cannot stop managed BMCU panel: %s' % exc)
 
-    pidfile = os.path.join(bmcu_dir, 'panel-process.json')
-    try:
-        if os.path.islink(pidfile) or not os.path.isfile(pidfile):
-            return False
-        with open(pidfile, 'r') as stream:
-            record = json.load(stream)
-        pid = int(record.get('pid', 0) or 0)
-        server = os.path.realpath(str(record.get('server', '') or ''))
-    except Exception:
-        return False
-    if (pid <= 1 or os.path.basename(server) != 'bmcu_panel_server.py' or
-            not os.path.commonpath((server, os.path.realpath(bmcu_dir))) ==
-            os.path.realpath(bmcu_dir)):
-        return False
-    argv = read_proc_cmdline(pid)
-    command = ' '.join(argv)
-    if not command:
-        return False
-    if 'bmcu_panel_server.py' not in command or server not in command:
-        raise InstallError(
-            'panel pid file points to a foreign process; refusing pid %d' % pid)
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    remaining = wait_pids_gone([pid], 3.0)
-    if remaining:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        remaining = wait_pids_gone([pid], 1.0)
-    if remaining:
-        raise InstallError('managed BMCU panel did not stop: pid %d' % pid)
-    return True
 
 def write_new_atomic(path, data, mode=0o755):
     parent = os.path.dirname(path)
@@ -2547,6 +2495,15 @@ def populate_runtime(snapshot, runtime, installation):
             snapshot, relative,
             os.path.join(runtime, 'scripts', name), 0o750)
     write_snapshot_file(snapshot, 'version', os.path.join(runtime, 'version'), 0o640)
+    digest = hashlib.sha256()
+    for relative in sorted(snapshot):
+        if relative == 'package.sha256':
+            continue
+        digest.update(relative.encode('utf-8') + b'\0')
+        digest.update(hashlib.sha256(snapshot[relative]).digest())
+    write_new_atomic(
+        os.path.join(runtime, 'package.sha256'),
+        (digest.hexdigest() + '\n').encode('ascii'), 0o640)
     write_new_atomic(
         os.path.join(runtime, '.managed-by-bmcu'),
         (OWNERSHIP_MARKER + '\n').encode('utf-8'), 0o640)
@@ -2738,7 +2695,7 @@ def restore_legacy_panel_macros(snapshot):
 
 def repair_existing(snapshot, plan, service, target_user, target_group, target_python,
                     uid, gid, bmcu_dir, state_file, printer_cfg, moonraker,
-                    assume_idle=False):
+                    moonraker_gcode, assume_idle=False):
     metadata = load_managed_metadata(bmcu_dir)
     validate_repair_identity(
         metadata, plan, service, target_user, target_group, target_python)
@@ -2773,6 +2730,7 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
     cfg_changed = False
     service_stopped = False
     transaction_started = False
+    update_preparation = None
     failed_runtime = os.path.join(
         bmcu_dir, '.runtime-failed-repair-%d' % os.getpid())
     managed_config_snapshots = []
@@ -2828,12 +2786,28 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
             is_idle, job_state = printer_idle(moonraker, assume_idle)
             if not is_idle:
                 raise InstallError('printer is not idle: %s' % job_state)
+            update_preparation = prepare_live_update(
+                moonraker, moonraker_gcode)
+            if isinstance(update_preparation, dict):
+                print('BMCU motion quiesced for host update.')
+            else:
+                print(
+                    'Running Klipper has no BMCU object; continuing repair '
+                    'update without a BMCU motion barrier.')
         elif host_state in ('shutdown', 'error', 'startup', 'unavailable'):
             print('Klipper is %s; continuing with the managed update.' % host_state)
         else:
             raise InstallError(
                 'unexpected Klipper state during update: %s - %s' %
                 (host_state, host_message))
+
+        if plan['platform_id'] == 'snapmaker_u1' and host_state == 'ready':
+            native_idle, native_state = snapmaker_u1_machine_idle(moonraker)
+            if not native_idle:
+                raise InstallError(
+                    'Snapmaker U1 native host activity is %s; wait for the '
+                    'stock feeder/calibration to become IDLE before update' %
+                    native_state)
 
         current_cfg, _current_info = read_regular(printer_cfg)
         if current_cfg != original_cfg:
@@ -2844,8 +2818,21 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
         assert_directory_identity(stage, stage_identity)
         assert_directory_identity(runtime_final, original_runtime_identity)
 
+        if host_state == 'ready':
+            is_idle, job_state = printer_idle(moonraker, False)
+            if not is_idle:
+                raise InstallError(
+                    'printer activity changed immediately before update: %s' %
+                    job_state)
+            if plan['platform_id'] == 'snapmaker_u1':
+                native_idle, native_state = snapmaker_u1_machine_idle(moonraker)
+                if not native_idle:
+                    raise InstallError(
+                        'Snapmaker U1 native host activity changed to %s '
+                        'immediately before update' % native_state)
         stop_service_strict(service, klipper_dir, printer_cfg)
         service_stopped = True
+        atexit.unregister(cancel_live_update)
         transaction_started = True
         stop_managed_transport_processes(bmcu_dir)
         stop_managed_planner_process(bmcu_dir)
@@ -2935,6 +2922,9 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
         return 0
     except Exception as original_error:
         if not transaction_started:
+            if update_preparation is not None:
+                cancel_live_update(
+                    moonraker, moonraker_gcode, update_preparation)
             shutil.rmtree(stage, ignore_errors=True)
             raise InstallError(str(original_error))
         rollback_errors = []
@@ -2970,6 +2960,7 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
             if runtime_swapped:
                 stop_managed_transport_processes(bmcu_dir)
                 stop_managed_planner_process(bmcu_dir)
+                stop_managed_panel_process(bmcu_dir)
                 if os.path.lexists(failed_runtime):
                     raise InstallError(
                         'failed-runtime preservation path is occupied: %s' %
@@ -3067,9 +3058,12 @@ def main():
 
     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     snapshot = load_release_snapshot(package)
-    global PRODUCT_VERSION
+    global PRODUCT_VERSION, planner_process, transport_process
     PRODUCT_VERSION = release_versions_from_snapshot(snapshot)['package']
+    planner_process = load_package_module('bmcu_planner_process', snapshot, package)
+    transport_process = load_package_module('bmcu_transport_process', snapshot, package)
     platform = load_package_module('bmcu_platform', snapshot, package)
+    moonraker_gcode = load_package_module('moonraker_gcode', snapshot, package)
     print('Package integrity: %d files verified' % (len(snapshot) - 1))
 
     discovery = ['discover', '--format', 'json', '--non-interactive']
@@ -3089,6 +3083,11 @@ def main():
     service = plan.get('service') or {}
     if service.get('backend') in ('none', 'process-only', ''):
         raise InstallError('controllable Klipper service was not detected; no changes made')
+    if (plan.get('platform_id') != 'snapmaker_u1' and
+            service.get('backend') != 'systemd'):
+        raise InstallError(
+            'Generic persistent installation requires systemd; detected %s; '
+            'no changes made' % service.get('backend'))
     klipper_dir = plan['klipper_dir']
     config_dir = plan['config_dir']
     printer_cfg = plan['printer_cfg']
@@ -3100,6 +3099,7 @@ def main():
     uid = pwd.getpwnam(target_user).pw_uid
     gid = grp.getgrnam(target_group).gr_gid
     validate_root_run_installation(plan, target_python, uid)
+    validate_target_python(target_python, target_user, uid, gid)
 
     print('\n=== BMCU-Klipper %s installation ===' % PRODUCT_VERSION)
     print('Platform:       %s' % plan['platform_id'])
@@ -3119,7 +3119,7 @@ def main():
         return repair_existing(
             snapshot, plan, service, target_user, target_group, target_python,
             uid, gid, bmcu_dir, state_file, printer_cfg, moonraker,
-            args.assume_idle)
+            moonraker_gcode, args.assume_idle)
 
     original_cfg, cfg_info = read_regular(printer_cfg)
     cfg_xattrs = read_xattrs(printer_cfg)
@@ -3237,6 +3237,13 @@ def main():
         assert_preflight_unchanged(
             printer_cfg, original_cfg, bmcu_dir, state_file, targets,
             orphan_state)
+        if plan['platform_id'] == 'snapmaker_u1':
+            native_idle, native_state = snapmaker_u1_machine_idle(moonraker)
+            if not native_idle:
+                raise InstallError(
+                    'Snapmaker U1 native host activity is %s; wait for the '
+                    'stock feeder/calibration to become IDLE before installation' %
+                    native_state)
         stop_service_strict(service, klipper_dir, printer_cfg)
         service_stopped = True
         transaction_started = True

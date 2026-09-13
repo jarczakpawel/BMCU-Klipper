@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -112,68 +113,84 @@ def main():
     parent_info = os.stat(parent)
     if stat.S_IMODE(parent_info.st_mode) != 0o700:
         raise RuntimeError('planner socket directory is not private')
-    if os.path.lexists(result_dir):
-        if os.path.islink(result_dir) or not os.path.isdir(result_dir):
-            raise RuntimeError('planner result path is unsafe')
-    else:
-        os.mkdir(result_dir, 0o700)
-    os.chmod(result_dir, 0o700)
-    _cleanup_results(result_dir, 0.0)
-    _unlink_socket(socket_path)
-
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    try:
-        listener.bind(socket_path)
-        os.chmod(socket_path, 0o600)
-        listener.settimeout(1.0)
-        signal.signal(signal.SIGTERM, _stop)
-        signal.signal(signal.SIGINT, _stop)
-        print('BMCU U1 source planner ready: %s' % socket_path,
-              file=sys.stderr, flush=True)
-        requests = 0
-        while not _STOP:
-            try:
-                raw = listener.recv(8193)
-            except socket.timeout:
-                continue
-            except InterruptedError:
-                continue
-            request_id = ''
-            started = time.monotonic()
-            try:
-                request_id, path, expected = _parse_request(raw)
-                result = scan_file(path, expected)
-                payload = {
-                    'ok': True,
-                    'request_id': request_id,
-                    'schema': PLAN_SCHEMA,
-                    'result': result,
-                }
-            except Exception as exc:
-                if not request_id:
-                    continue
-                payload = {
-                    'ok': False,
-                    'request_id': request_id,
-                    'schema': PLAN_SCHEMA,
-                    'error': str(exc),
-                }
-            payload['daemon_ms'] = round(
-                (time.monotonic() - started) * 1000.0, 3)
-            try:
-                _atomic_result(result_dir, request_id, payload)
-            except OSError as exc:
-                print('bmcu_plannerd: cannot publish result %s: %s' %
-                      (request_id, exc), file=sys.stderr, flush=True)
-            requests += 1
-            if requests % 32 == 0:
-                _cleanup_results(result_dir)
-    finally:
-        listener.close()
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(socket_path + '.lock', flags, 0o600)
+    with os.fdopen(descriptor, 'r+') as lifetime_lock:
+        if not stat.S_ISREG(os.fstat(lifetime_lock.fileno()).st_mode):
+            raise RuntimeError('planner lock path is not a regular file')
         try:
-            _unlink_socket(socket_path)
-        except Exception:
-            pass
+            fcntl.flock(lifetime_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('another planner already owns this socket')
+        os.fchmod(lifetime_lock.fileno(), 0o600)
+        if os.path.lexists(result_dir):
+            if os.path.islink(result_dir) or not os.path.isdir(result_dir):
+                raise RuntimeError('planner result path is unsafe')
+        else:
+            os.mkdir(result_dir, 0o700)
+        os.chmod(result_dir, 0o700)
+        _cleanup_results(result_dir, 0.0)
+        _unlink_socket(socket_path)
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            listener.bind(socket_path)
+            os.chmod(socket_path, 0o600)
+            listener.settimeout(1.0)
+            signal.signal(signal.SIGTERM, _stop)
+            signal.signal(signal.SIGINT, _stop)
+            json.dump({
+                'pid': os.getpid(), 'daemon': os.path.realpath(__file__),
+                'socket': socket_path, 'result_dir': result_dir,
+            }, lifetime_lock, sort_keys=True)
+            lifetime_lock.truncate()
+            lifetime_lock.flush()
+            print('BMCU U1 source planner ready: %s' % socket_path,
+                  file=sys.stderr, flush=True)
+            requests = 0
+            while not _STOP:
+                try:
+                    raw = listener.recv(8193)
+                except socket.timeout:
+                    continue
+                except InterruptedError:
+                    continue
+                request_id = ''
+                started = time.monotonic()
+                try:
+                    request_id, path, expected = _parse_request(raw)
+                    result = scan_file(path, expected)
+                    payload = {
+                        'ok': True,
+                        'request_id': request_id,
+                        'schema': PLAN_SCHEMA,
+                        'result': result,
+                    }
+                except Exception as exc:
+                    if not request_id:
+                        continue
+                    payload = {
+                        'ok': False,
+                        'request_id': request_id,
+                        'schema': PLAN_SCHEMA,
+                        'error': str(exc),
+                    }
+                payload['daemon_ms'] = round(
+                    (time.monotonic() - started) * 1000.0, 3)
+                try:
+                    _atomic_result(result_dir, request_id, payload)
+                except OSError as exc:
+                    print('bmcu_plannerd: cannot publish result %s: %s' %
+                          (request_id, exc), file=sys.stderr, flush=True)
+                requests += 1
+                if requests % 32 == 0:
+                    _cleanup_results(result_dir)
+        finally:
+            listener.close()
+            try:
+                _unlink_socket(socket_path)
+            except Exception:
+                pass
     return 0
 
 if __name__ == '__main__':

@@ -117,6 +117,11 @@ class TransportDaemon(object):
         os.chmod(self.args.socket + '.ctl', 0o600)
 
         self._write_status_file(force=True)
+        self.args.process_record['ready'] = True
+        self.args.lifetime_lock.seek(0)
+        json.dump(self.args.process_record, self.args.lifetime_lock, sort_keys=True)
+        self.args.lifetime_lock.truncate()
+        self.args.lifetime_lock.flush()
         self.next_serial_connect = time.monotonic()
 
     def cleanup(self):
@@ -1113,6 +1118,7 @@ def parse_args():
     parser.add_argument('--connect-settle', type=float, default=1.5)
     parser.add_argument('--log-file', required=True)
     parser.add_argument('--status-file', required=True)
+    parser.add_argument('--settings-digest', default='')
     args = parser.parse_args()
     args.expected_uid = str(args.expected_uid or '').strip().upper()
     args.exclude_ports = tuple(str(value) for value in (args.exclude_port or []) if value)
@@ -1142,17 +1148,39 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    while state['running']:
-        daemon = TransportDaemon(args)
-        state['daemon'] = daemon
+    descriptor = os.open(args.socket + '.lock',
+                         os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    with os.fdopen(descriptor, 'r+') as lifetime_lock:
+        if not stat.S_ISREG(os.fstat(lifetime_lock.fileno()).st_mode):
+            raise RuntimeError('BMCU transport lock is not a regular file')
         try:
-            daemon.run()
-        except Exception:
-            logging.exception('BMCU transport cycle failed; rebuilding sidecar')
-            if state['running']:
-                time.sleep(min(1.0, max(0.1, args.reconnect)))
-        finally:
-            state['daemon'] = None
+            fcntl.flock(lifetime_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('another BMCU transport already owns this socket')
+        os.fchmod(lifetime_lock.fileno(), 0o600)
+        args.lifetime_lock = lifetime_lock
+        args.process_record = {
+            'pid': os.getpid(), 'daemon': os.path.realpath(__file__),
+            'name': args.name, 'socket': args.socket, 'port': args.port,
+            'uid': args.expected_uid, 'status_file': args.status_file,
+            'settings_digest': args.settings_digest,
+        }
+        while state['running']:
+            args.process_record['ready'] = False
+            lifetime_lock.seek(0)
+            json.dump(args.process_record, lifetime_lock, sort_keys=True)
+            lifetime_lock.truncate()
+            lifetime_lock.flush()
+            daemon = TransportDaemon(args)
+            state['daemon'] = daemon
+            try:
+                daemon.run()
+            except Exception:
+                logging.exception('BMCU transport cycle failed; rebuilding sidecar')
+                if state['running']:
+                    time.sleep(min(1.0, max(0.1, args.reconnect)))
+            finally:
+                state['daemon'] = None
 
 if __name__ == '__main__':
     main()

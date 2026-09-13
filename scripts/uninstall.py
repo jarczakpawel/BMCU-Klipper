@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 import argparse
+import atexit
 import errno
 import fcntl
 import hashlib
@@ -24,6 +25,8 @@ sys.dont_write_bytecode = True
 
 PRODUCT = 'BMCU-Klipper'
 VERSION = None
+planner_process = None
+transport_process = None
 OWNERSHIP_MARKER = PRODUCT
 OWNER_RE = re.compile(
     r'^%s(?: [0-9]+\.[0-9]+\.[0-9]+)?$' % re.escape(PRODUCT))
@@ -390,6 +393,24 @@ def printer_state(base):
         raise UninstallError('invalid Moonraker /printer/info response')
     return (str(result.get('state') or '').strip().lower(),
             str(result.get('state_message') or '').strip())
+
+def snapmaker_u1_machine_idle(base):
+    data = query_json(
+        base.rstrip('/') + '/printer/objects/query?machine_state_manager')
+    result = data.get('result') if isinstance(data, dict) else None
+    status = result.get('status') if isinstance(result, dict) else None
+    machine = status.get('machine_state_manager') if isinstance(status, dict) else None
+    if not isinstance(machine, dict) or 'main_state' not in machine:
+        raise UninstallError(
+            'Snapmaker U1 machine_state_manager status is unavailable')
+    state = machine.get('main_state')
+    if isinstance(state, bool):
+        idle = False
+    elif isinstance(state, (int, float)):
+        idle = int(state) == 0 and float(state) == 0.0
+    else:
+        idle = str(state or '').strip().upper() in ('IDLE', '0')
+    return idle, str(state)
 
 def printer_idle(base, assume_idle=False):
     payload = query_json(
@@ -1298,9 +1319,10 @@ def parser():
     value.add_argument('--moonraker-conf', default='')
     value.add_argument('--service-backend', default='')
     value.add_argument('--service-name', default='')
-    value.add_argument('--assume-idle', action='store_true', help=argparse.SUPPRESS)
-    value.add_argument('--host-recovery', action='store_true', help=argparse.SUPPRESS)
-    value.add_argument('--confirm-paths-empty', action='store_true', help=argparse.SUPPRESS)
+    value.add_argument('--host-recovery', action='store_true',
+                       help='remove host files and leave Klipper stopped; pending recovery blocks removal')
+    value.add_argument('--confirm-paths-empty', action='store_true',
+                       help='confirm that every filament path was physically cleared for host recovery')
     return value
 
 def discover(platform, args):
@@ -1514,6 +1536,83 @@ def validate_state(state_file):
         raise UninstallError('BMCU state path is unsafe: %s' % state_file)
     return True
 
+def require_safe_u1_state(data, u1=True):
+    if data is None and not u1:
+        return
+    try:
+        state = json.loads(data.decode('utf-8')) if data is not None else None
+    except (ValueError, UnicodeError) as exc:
+        raise UninstallError('cannot verify U1 recovery state: %s' % exc)
+    if (not isinstance(state, dict) or
+            not isinstance(state.get('u1_ownership'), dict) or
+            not isinstance(state.get('print_session'), dict)):
+        raise UninstallError(
+            'U1 recovery state is missing or invalid; restore BMCU in Klipper '
+            'and complete recovery before uninstall')
+    for name, record in state['u1_ownership'].items():
+        if (not isinstance(record, dict) or
+                any(record.get(key) for key in (
+                    'persistent_hold', 'generation_open', 'native_auto_override_active',
+                    'tail_detached', 'follower_pending')) or
+                str(record.get('route_state', 'EMPTY')).upper() != 'EMPTY'):
+            raise UninstallError(
+                '%s retains U1 ownership or AUTO recovery; restore BMCU in '
+                'Klipper and complete recovery before uninstall' % name)
+    session = state['print_session']
+    if any(session.get(key) for key in (
+            'active', 'plan_open', 'job_id', 'tools', 'transaction_phase',
+            'loaded_routes', 'terminal_unload_pending', 'u1_cross_refill_pending',
+            'u1_original', 'u1_map_backup', 'u1_used_backup', 'u1_end_unload_backup')):
+        raise UninstallError('U1 print/route recovery must finish before uninstall')
+    devices = state.get('devices', {})
+    if not isinstance(devices, dict):
+        raise UninstallError('BMCU device state is invalid')
+    for device in devices.values():
+        channels = device.get('channels') if isinstance(device, dict) else None
+        if not isinstance(channels, dict):
+            raise UninstallError('BMCU channel state is invalid')
+        for channel in channels.values():
+            if (not isinstance(channel, dict) or
+                    channel.get('tail_detached') or channel.get('tail_follower_pending')):
+                raise UninstallError('BMCU detached-tail recovery must finish before uninstall')
+
+def prepare_live_uninstall(base, moonraker_gcode):
+    try:
+        payload = query_json(base.rstrip('/') + '/printer/objects/query?gcode&bmcu')
+    except Exception as exc:
+        raise UninstallError('cannot verify the running BMCU version: %s' % exc)
+    result = payload.get('result') if isinstance(payload, dict) else None
+    status = result.get('status') if isinstance(result, dict) else None
+    gcode = status.get('gcode') if isinstance(status, dict) else None
+    commands = gcode.get('commands') if isinstance(gcode, dict) else None
+    if not isinstance(commands, dict):
+        raise UninstallError('Moonraker did not return the registered G-code commands')
+    if 'BMCU_PREPARE_UNINSTALL' not in commands:
+        raise UninstallError(
+            'BMCU_PREPARE_UNINSTALL is unavailable; restore the BMCU Klipper '
+            'configuration before uninstall')
+    bmcu = status.get('bmcu')
+    if not isinstance(bmcu, dict) or bmcu.get('package_version') != VERSION:
+        raise UninstallError(
+            'running BMCU does not match package %s; run sh ./install from '
+            'this package first and wait for Klipper READY' % VERSION)
+    atexit.register(cancel_live_uninstall, base, moonraker_gcode)
+    try:
+        result = moonraker_gcode.request_gcode(
+            'BMCU_PREPARE_UNINSTALL', base, timeout=180.0)
+    except Exception as exc:
+        raise UninstallError('BMCU uninstall handoff failed; no files removed: %s' % exc)
+    if result.get('result') != 'ok':
+        raise UninstallError('BMCU uninstall handoff was not confirmed by Moonraker')
+    return True
+
+def cancel_live_uninstall(base, moonraker_gcode):
+    try:
+        moonraker_gcode.request_gcode(
+            'BMCU_PREPARE_UNINSTALL ACTION=CANCEL', base, timeout=5.0)
+    except Exception:
+        print('BMCU preparation could not be cancelled; restart Klipper before using BMCU.')
+
 def managed_uninstall_backup(path):
 
     name = os.path.basename(path)
@@ -1567,7 +1666,7 @@ def orphan_boot_hook_snapshot(service, platform_id):
     return (path, data, kind, info, read_xattrs(path))
 
 def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
-                         moonraker, bmcu_dir):
+                         moonraker, bmcu_dir, moonraker_gcode, host_recovery=False):
 
     if os.path.lexists(bmcu_dir):
         raise UninstallError('BMCU directory appeared during residual cleanup: %s' % bmcu_dir)
@@ -1611,17 +1710,37 @@ def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
             raise UninstallError(
                 'Moonraker activity cannot be verified while Klipper is running; '
                 'stop the print and restore Moonraker before uninstall: %s' % exc)
-        print('Moonraker unavailable and Klipper is not running; continuing residual cleanup.')
+        print('Moonraker unavailable; no Klipper process is running.')
     else:
         if host_state == 'ready':
             is_idle, job_state = printer_idle(moonraker, False)
             if not is_idle:
                 raise UninstallError('printer is not idle: %s' % job_state)
         elif host_state in ('shutdown', 'error', 'startup'):
-            print('Klipper is %s; continuing residual cleanup.' % host_state)
+            print('Klipper state: %s.' % host_state)
         else:
             raise UninstallError('unexpected Klipper state before cleanup: %s - %s' %
                                  (host_state, host_message))
+
+    if not host_recovery:
+        if host_state != 'ready':
+            raise UninstallError('Klipper must be READY for normal uninstall')
+        prepare_live_uninstall(moonraker, moonraker_gcode)
+    state_exists = validate_state(state_file)
+    state_snapshot = read_regular(state_file, MAX_JSON) if state_exists else None
+    state_xattrs = read_xattrs(state_file) if state_exists else None
+    require_safe_u1_state(state_snapshot[0] if state_snapshot else None,
+                         u1=plan.get('platform_id') == 'snapmaker_u1')
+    if host_state == 'ready':
+        if printer_state(moonraker)[0] != 'ready' or not printer_idle(moonraker, False)[0]:
+            raise UninstallError('printer state changed during residual cleanup preparation')
+        if plan.get('platform_id') == 'snapmaker_u1':
+            native_idle, native_state = snapmaker_u1_machine_idle(moonraker)
+            if not native_idle:
+                raise UninstallError(
+                    'Snapmaker U1 native host activity is %s; wait for the '
+                    'stock feeder/calibration to become IDLE before cleanup' %
+                    native_state)
 
     service_stopped = False
     cfg_changed = False
@@ -1632,6 +1751,7 @@ def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
     try:
         stop_service_strict(service, klipper_dir, printer_cfg)
         service_stopped = True
+        atexit.unregister(cancel_live_uninstall)
         current_cfg, _ = read_regular(printer_cfg)
         if current_cfg != original_cfg:
             raise UninstallError('printer.cfg changed before residual cleanup')
@@ -1660,15 +1780,18 @@ def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
         if state_snapshot is not None:
             unlink_regular_expected(state_file, state_snapshot[0], state_snapshot[1])
             state_removed = True
-        start_service_strict(service, klipper_dir, printer_cfg)
-        service_stopped = False
-        ready, last = wait_ready(moonraker)
-        if not ready:
-            raise UninstallError('Klipper did not become ready after residual cleanup: %s - %s' % last)
-        pids = wait_single_klippy(klipper_dir, printer_cfg)
-        if len(pids) != 1:
-            raise UninstallError('expected one Klipper process after cleanup, found %d' % len(pids))
+        if not host_recovery:
+            start_service_strict(service, klipper_dir, printer_cfg)
+            service_stopped = False
+            ready, last = wait_ready(moonraker)
+            if not ready:
+                raise UninstallError('Klipper did not become ready after residual cleanup: %s - %s' % last)
+            pids = wait_single_klippy(klipper_dir, printer_cfg)
+            if len(pids) != 1:
+                raise UninstallError('expected one Klipper process after cleanup, found %d' % len(pids))
         print('BMCU-Klipper %s residual host state removed safely.' % VERSION)
+        if host_recovery:
+            print('Host recovery complete; Klipper is stopped.')
         print('Removed printer.cfg references: %d' % removed_references)
         print('Removed Klipper module links: %d' % len(removed_links))
         return 0
@@ -1708,7 +1831,7 @@ def cleanup_missing_tree(plan, service, config_dir, printer_cfg, klipper_dir,
                              read_xattrs(printer_cfg), expected=current_cfg)
         except Exception as exc:
             rollback_errors.append('printer.cfg restore: %s' % exc)
-        if not rollback_errors:
+        if not rollback_errors and not host_recovery:
             try:
                 start_service_strict(service, klipper_dir, printer_cfg)
                 service_stopped = False
@@ -1759,137 +1882,38 @@ def prune_uninstall_backups(data_root, keep=UNINSTALL_BACKUP_RETENTION):
             os.close(directory_fd)
     return removed
 
-def _read_managed_process_json(path, label):
-    if not os.path.lexists(path):
-        return {}
-    if os.path.islink(path) or not os.path.isfile(path):
-        raise UninstallError('%s process record is unsafe' % label)
+def stop_managed_bmcu_workers(bmcu_dir, platform_id):
     try:
-        data, _info = read_regular(path, MAX_JSON)
-        value = json.loads(data.decode('utf-8'))
+        stopped = transport_process.stop(bmcu_dir)
+        if platform_id == 'snapmaker_u1':
+            stopped += planner_process.stop(bmcu_dir)
     except Exception as exc:
-        raise UninstallError('cannot read %s process record: %s' % (label, exc))
-    if not isinstance(value, dict):
-        raise UninstallError('%s process record is malformed' % label)
-    return value
-
-def _stop_recorded_worker(record, runtime, daemon_name, label):
-    if not isinstance(record, dict):
-        return False
-    try:
-        pid = int(record.get('pid', 0) or 0)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    daemon = os.path.realpath(str(record.get('daemon', '') or ''))
-    if (pid <= 1 or os.path.basename(daemon) != daemon_name or
-            not inside(daemon, runtime)):
-        return False
-    argv = read_proc_cmdline(pid)
-    if not argv:
-        return False
-    command = ' '.join(argv)
-    if daemon not in command or daemon_name not in command:
-
-        return False
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as exc:
-        if exc.errno == errno.ESRCH:
-            return False
-        raise UninstallError('cannot stop %s: %s' % (label, exc))
-    remaining = wait_pids_gone([pid], 3.0)
-    if remaining:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError as exc:
-            if exc.errno != errno.ESRCH:
-                raise UninstallError('cannot kill %s: %s' % (label, exc))
-        remaining = wait_pids_gone(remaining, 1.0)
-    if remaining:
-        raise UninstallError('%s did not stop' % label)
-    return True
-
-def stop_managed_bmcu_workers(bmcu_dir):
-
-    runtime = os.path.realpath(os.path.join(bmcu_dir, 'runtime'))
-    transport_path = os.path.join(bmcu_dir, 'transport-processes.json')
-    transport_record = _read_managed_process_json(
-        transport_path, 'BMCU transport')
-    devices = transport_record.get('devices', {})
-    if devices and not isinstance(devices, dict):
-        raise UninstallError('BMCU transport process record is malformed')
-    stopped = 0
-    for name, record in sorted((devices or {}).items()):
-        if _stop_recorded_worker(
-                record, runtime, 'bmcu_transportd.py',
-                'BMCU transport %s' % name):
-            stopped += 1
-    planner_path = os.path.join(bmcu_dir, 'planner-process.json')
-    planner_record = _read_managed_process_json(planner_path, 'U1 planner')
-    if planner_record and _stop_recorded_worker(
-            planner_record, runtime, 'bmcu_plannerd.py', 'U1 source planner'):
-        stopped += 1
+        raise UninstallError('cannot stop managed BMCU workers: %s' % exc)
     return stopped
 
 def stop_managed_panel_process(bmcu_dir):
+    try:
+        return transport_process.stop_panel(bmcu_dir)
+    except Exception as exc:
+        raise UninstallError('cannot stop managed BMCU panel: %s' % exc)
 
-    pidfile = os.path.join(bmcu_dir, 'panel-process.json')
-    if not os.path.isfile(pidfile) or os.path.islink(pidfile):
-        return False
-    try:
-        with open(pidfile, 'r') as stream:
-            record = json.load(stream)
-        pid = int(record.get('pid', 0) or 0)
-    except Exception:
-        return False
-    if pid <= 1:
-        return False
-    command_path = '/proc/%d/cmdline' % pid
-    try:
-        with open(command_path, 'rb') as stream:
-            command = stream.read(8192).replace(b'\0', b' ').decode(
-                'utf-8', 'replace')
-    except Exception:
-        return False
-    expected = os.path.realpath(os.path.join(
-        bmcu_dir, 'runtime', 'web', 'bmcu_panel_server.py'))
-    if 'bmcu_panel_server.py' not in command or expected not in command:
-        raise UninstallError(
-            'panel pid file points to a foreign process; refusing to stop pid %d' % pid)
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as exc:
-        if exc.errno == errno.ESRCH:
-            return False
-        raise
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError as exc:
-            if exc.errno == errno.ESRCH:
-                return True
-            raise
-        time.sleep(0.05)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError as exc:
-        if exc.errno != errno.ESRCH:
-            raise
-    return True
 
 def main():
     if sys.version_info < (3, 7):
         raise UninstallError('Python 3.7 or newer is required')
     args = parser().parse_args()
+    if args.host_recovery != args.confirm_paths_empty:
+        raise UninstallError('host recovery requires --host-recovery --confirm-paths-empty together')
     if os.geteuid() != 0:
         raise UninstallError('run the uninstaller as root or through sudo')
     _trusted_root_path(sys.executable, require_executable=True)
 
     package = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     snapshot = load_release_snapshot(package)
-    global VERSION
+    global VERSION, planner_process, transport_process
     VERSION = release_versions_from_snapshot(snapshot)['package']
+    planner_process = load_package_module('bmcu_planner_process', snapshot, package)
+    transport_process = load_package_module('bmcu_transport_process', snapshot, package)
     platform = load_package_module('bmcu_platform', snapshot, package)
     moonraker_gcode = load_package_module('moonraker_gcode', snapshot, package)
     print('Package integrity: %d files verified' % (len(snapshot) - 1))
@@ -1909,7 +1933,7 @@ def main():
     if not os.path.lexists(bmcu_dir):
         return cleanup_missing_tree(
             plan, service, config_dir, printer_cfg, klipper_dir,
-            moonraker, bmcu_dir)
+            moonraker, bmcu_dir, moonraker_gcode, args.host_recovery)
     if os.path.islink(bmcu_dir) or not os.path.isdir(bmcu_dir):
         raise UninstallError('BMCU directory is unsafe: %s' % bmcu_dir)
     metadata = None
@@ -1925,6 +1949,17 @@ def main():
         metadata, config_dir, printer_cfg, klipper_dir, service,
         plan.get('install_user'), plan.get('python'))
     validate_ownership(bmcu_dir, runtime, metadata)
+    if not args.host_recovery:
+        try:
+            runtime_version = release_versions_from_snapshot({
+                'version': read_regular(os.path.join(runtime, 'version'), 4096)[0]})['package']
+        except (OSError, UninstallError):
+            runtime_version = None
+        if (runtime_version != VERSION or
+                (metadata and metadata.get('version') != VERSION)):
+            raise UninstallError(
+                'installed BMCU does not match package %s; run sh ./install '
+                'from this package first' % VERSION)
     bmcu_identity = directory_identity(bmcu_dir)
     boot_hook = hook_snapshot(
         metadata, service, plan.get('platform_id'))
@@ -1938,11 +1973,6 @@ def main():
         original_cfg, config_dir, bmcu_dir)
     links = module_snapshot(klipper_dir, bmcu_dir)
     state_file = os.path.join(config_dir, 'bmcu_state.json')
-    state_exists = validate_state(state_file)
-    state_snapshot = None
-    if state_exists:
-        state_data, state_info = read_regular(state_file, MAX_JSON)
-        state_snapshot = (state_data, state_info.st_dev, state_info.st_ino)
 
     host_state = 'unavailable'
     host_message = ''
@@ -1954,7 +1984,7 @@ def main():
             raise UninstallError(
                 'Moonraker activity cannot be verified while Klipper is running; '
                 'stop the print and restore Moonraker before uninstall: %s' % exc)
-        print('Moonraker unavailable and Klipper is not running; continuing host-only uninstall.')
+        print('Moonraker unavailable; no Klipper process is running.')
     else:
         if host_state == 'ready':
             try:
@@ -1965,11 +1995,25 @@ def main():
             if not is_idle:
                 raise UninstallError('printer is not idle: %s' % job_state)
         elif host_state in ('shutdown', 'error', 'startup'):
-            print('Klipper is %s; continuing host-only uninstall without BMCU commands.' % host_state)
+            print('Klipper state: %s.' % host_state)
         else:
             raise UninstallError(
                 'unexpected Klipper state before uninstall: %s - %s' %
                 (host_state, host_message))
+
+    prepared = False
+    if not args.host_recovery:
+        if host_state != 'ready':
+            raise UninstallError('Klipper must be READY for normal uninstall; restore Klipper first')
+        prepared = prepare_live_uninstall(moonraker, moonraker_gcode)
+    state_exists = validate_state(state_file)
+    state_snapshot = None
+    if state_exists:
+        state_data, state_info = read_regular(state_file, MAX_JSON)
+        state_snapshot = (state_data, state_info.st_dev, state_info.st_ino)
+    require_safe_u1_state(state_snapshot[0] if state_snapshot else None,
+                         u1=(plan.get('platform_id') == 'snapmaker_u1' or
+                             (metadata or {}).get('platform') == 'snapmaker_u1'))
 
     current_cfg, _current_info = read_regular(printer_cfg)
     if current_cfg != original_cfg:
@@ -1995,6 +2039,14 @@ def main():
         is_idle, job_state = printer_idle(moonraker, False)
         if not is_idle:
             raise UninstallError('printer started a job during uninstall: %s' % job_state)
+        if (plan.get('platform_id') == 'snapmaker_u1' or
+                (metadata or {}).get('platform') == 'snapmaker_u1'):
+            native_idle, native_state = snapmaker_u1_machine_idle(moonraker)
+            if not native_idle:
+                raise UninstallError(
+                    'Snapmaker U1 native host activity is %s; wait for the '
+                    'stock feeder/calibration to become IDLE before uninstall' %
+                    native_state)
 
     data_root = os.path.dirname(os.path.realpath(config_dir))
     stamp = time.strftime('%Y%m%d-%H%M%S')
@@ -2016,7 +2068,8 @@ def main():
     try:
         stop_service_strict(service, klipper_dir, printer_cfg)
         service_stopped = True
-        stop_managed_bmcu_workers(bmcu_dir)
+        atexit.unregister(cancel_live_uninstall)
+        stop_managed_bmcu_workers(bmcu_dir, plan.get('platform_id'))
         stop_managed_panel_process(bmcu_dir)
 
         current_cfg, _current_info = read_regular(printer_cfg)
@@ -2025,6 +2078,14 @@ def main():
         assert_module_snapshot(links)
         validate_ownership(bmcu_dir, runtime, metadata)
         assert_directory_identity(bmcu_dir, bmcu_identity)
+        if validate_state(state_file) != state_exists:
+            raise UninstallError('BMCU state presence changed after Klipper stop')
+        if state_snapshot is not None:
+            state_data, state_info = read_regular(state_file, MAX_JSON)
+            if (state_data != state_snapshot[0] or
+                    state_info.st_dev != state_snapshot[1] or
+                    state_info.st_ino != state_snapshot[2]):
+                raise UninstallError('BMCU state changed after Klipper stop')
 
         os.mkdir(backup, 0o750)
         backup_identity = directory_identity(backup)
@@ -2080,17 +2141,18 @@ def main():
             os.rename(state_file, backup_state)
             state_moved = True
 
-        start_service_strict(service, klipper_dir, printer_cfg)
-        service_stopped = False
-        ready, last = wait_ready(moonraker)
-        if not ready:
-            raise UninstallError(
-                'Klipper did not become ready after uninstall: %s - %s' % last)
-        pids = wait_single_klippy(klipper_dir, printer_cfg)
-        if len(pids) != 1:
-            raise UninstallError(
-                'expected one Klipper process after uninstall, found %d' %
-                len(pids))
+        if not args.host_recovery:
+            start_service_strict(service, klipper_dir, printer_cfg)
+            service_stopped = False
+            ready, last = wait_ready(moonraker)
+            if not ready:
+                raise UninstallError(
+                    'Klipper did not become ready after uninstall: %s - %s' % last)
+            pids = wait_single_klippy(klipper_dir, printer_cfg)
+            if len(pids) != 1:
+                raise UninstallError(
+                    'expected one Klipper process after uninstall, found %d' %
+                    len(pids))
 
         assert_directory_identity(backup, backup_identity)
         assert_directory_identity(backup_bmcu, backup_bmcu_identity)
@@ -2104,7 +2166,7 @@ def main():
             ('yes' if hook_removed else 'no') +
             'Removed managed U1 S60 integration: %s\n' %
             ('yes' if u1_integration_removed else 'no') +
-            'Host-only uninstall: yes\n' +
+            'Host-only uninstall: %s\n' % ('no' if prepared else 'yes') +
             'Temporary rollback state: %s\n' %
             ('yes' if state_moved else 'no'))
         write_new_bytes(marker_path, marker_text.encode('utf-8'), 0o640)
@@ -2118,7 +2180,7 @@ def main():
         marker_removed = False
         marker_warning = ''
         if (plan.get('platform_id') == 'snapmaker_u1' and
-                metadata.get('persistence_marker_preexisting') is False):
+                (metadata or {}).get('persistence_marker_preexisting') is False):
             try:
                 if os.path.lexists(U1_PERSISTENCE_MARKER):
                     marker_data, marker_info = read_regular(
@@ -2142,6 +2204,8 @@ def main():
             cleanup_warning = str(exc)
 
         print('BMCU-Klipper %s removed safely.' % VERSION)
+        if args.host_recovery:
+            print('Host recovery complete; Klipper is stopped. Start it after resolving its configuration errors.')
         if marker_removed:
             print('Removed package-created Snapmaker persistence marker: %s' %
                   U1_PERSISTENCE_MARKER)
@@ -2222,7 +2286,7 @@ def main():
         except Exception as exc:
             rollback_errors.append('Klipper module restore: %s' % exc)
 
-        if not rollback_errors:
+        if not rollback_errors and not args.host_recovery:
             try:
                 start_service_strict(service, klipper_dir, printer_cfg)
                 service_stopped = False

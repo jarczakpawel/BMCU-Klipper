@@ -680,6 +680,10 @@ class AutoRefillController(object):
         return True
 
     def on_channel_empty(self, device, channel, source_tool, endpoint):
+        maintenance_prepared = getattr(
+            self.manager, '_maintenance_prepared', None)
+        if callable(maintenance_prepared) and maintenance_prepared():
+            return False
         key = '%s:%d' % (device.name, int(channel))
         if key in self._pending or key in self.transactions:
             return False
@@ -1698,7 +1702,14 @@ class AutoRefillController(object):
 
     def _run(self, eventtime, source_device, source_channel, source_tool, endpoint):
         key = '%s:%d' % (source_device.name, source_channel)
-        self._pending.discard(key)
+        try:
+            return self._run_pending(
+                eventtime, source_device, source_channel, source_tool, endpoint)
+        finally:
+            self._pending.discard(key)
+
+    def _run_pending(self, eventtime, source_device, source_channel, source_tool, endpoint):
+        key = '%s:%d' % (source_device.name, source_channel)
         if key in self._toolchange_preemptions:
             self.last = {
                 'source_device_name': source_device.name,

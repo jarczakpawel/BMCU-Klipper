@@ -137,6 +137,7 @@ The printer's normal `RESUME` is additionally used as a fail-closed gate for a p
 
 | Command | Scope | Short description |
 | --- | --- | --- |
+| `BMCU_PREPARE_UPDATE` | service | prepare BMCU for a package update |
 | `BMCU_PREPARE_UNINSTALL` | service | prepare runtime for uninstallation |
 | `BMCU_FORGET_DEVICE` | service | controlled removal of persistent device data |
 | `BMCU_UPDATE_ACCESS` | internal | updater interface for quiesce/update/recovery |
@@ -727,7 +728,21 @@ Controls ownership of a native U1 feeder:
 BMCU_SNAP_FEEDER ENDPOINT=u1_head1 TAKEOVER=1
 ```
 
-`TAKEOVER=1` is only a runtime lease and cannot be saved as a persistent setting. Normal U1 configuration should use the panel and preset.
+`TAKEOVER=1` is a runtime lease and cannot be saved as a persistent setting. BMCU remembers the native AUTO setting before it takes over the shared path and restores it when ownership is released.
+
+After detaching all BMCU channels from the head, restore the captured setting with:
+
+```gcode
+BMCU_SNAP_FEEDER ENDPOINT=u1_head1 TAKEOVER=0
+```
+
+To explicitly enable native AUTO on an unrouted, idle head:
+
+```gcode
+BMCU_SNAP_FEEDER ENDPOINT=u1_head1 TAKEOVER=0 AUTO=1
+```
+
+`AUTO=0` explicitly disables native AUTO. Explicit AUTO changes require `TAKEOVER=0` and no BMCU channels assigned to the head. The panel also shows **Enable native auto feed** when the head is unrouted and native AUTO is disabled.
 
 ---
 
@@ -957,6 +972,20 @@ BMCU_HOTEND_FAN_RESET
 
 ## 14. Package and device management
 
+### `BMCU_PREPARE_UPDATE`
+
+Used automatically by the installer before replacing the installed runtime. It blocks new BMCU motion while the update is prepared and keeps the current filament routes in place.
+
+```gcode
+BMCU_PREPARE_UPDATE
+```
+
+If the update is aborted before Klipper stops, release the update state with:
+
+```gcode
+BMCU_PREPARE_UPDATE ACTION=CANCEL
+```
+
 ### `BMCU_PREPARE_UNINSTALL`
 
 Prepares runtime for safe uninstallation. It is used by the `uninstall` script.
@@ -965,7 +994,13 @@ Prepares runtime for safe uninstallation. It is used by the `uninstall` script.
 BMCU_PREPARE_UNINSTALL
 ```
 
-Normally it is called by the `uninstall` script and is not needed during regular operation.
+The command requires an idle printer and empty BMCU routes. On U1 it restores the native feeder state before removal.
+
+The `uninstall` script calls it automatically. If preparation is cancelled before Klipper stops:
+
+```gcode
+BMCU_PREPARE_UNINSTALL ACTION=CANCEL
+```
 
 ### `BMCU_FORGET_DEVICE`
 

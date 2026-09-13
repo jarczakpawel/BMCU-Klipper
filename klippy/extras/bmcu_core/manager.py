@@ -12,6 +12,8 @@ import os
 import re
 import socket
 import stat
+import subprocess
+import sys
 import tempfile
 from collections import deque
 from contextlib import contextmanager
@@ -338,6 +340,8 @@ class BMCUManager(object):
         self._u1_lease_reconcile_max_ms = 0.0
         self._u1_lease_endpoint_max_ms = {}
         self._klippy_disconnecting = False
+        self._uninstall_prepared = False
+        self._update_prepared = False
         self._status_cache = None
         self._status_cache_at = 0.0
         self._manager_tick_count = 0
@@ -477,6 +481,37 @@ class BMCUManager(object):
 
     def _snapmaker_platform(self):
         return bool(self.printer_analysis.get('features', {}).get('snapmaker_u1'))
+
+    def _u1_host_maintenance_busy_reason(self):
+        if not self._snapmaker_platform():
+            return ''
+        for object_name in ('filament_feed left', 'filament_feed right'):
+            feeder = self.printer.lookup_object(object_name, None)
+            if feeder is None:
+                return '%s is unavailable' % object_name
+            if getattr(feeder, 'channel_active', None) is not None:
+                return '%s is actively moving filament' % object_name
+            manual = getattr(feeder, 'manual_feeding', None)
+            if isinstance(manual, (list, tuple)) and any(bool(value) for value in manual):
+                return '%s has an active manual filament session' % object_name
+        machine_state = self.printer.lookup_object('machine_state_manager', None)
+        if machine_state is None:
+            return 'machine_state_manager is unavailable'
+        try:
+            status = machine_state.get_status()
+            main_state = str(status.get('main_state', '')).strip().upper()
+        except Exception as exc:
+            return 'machine_state_manager status is unavailable: %s' % exc
+        if main_state != 'IDLE':
+            return 'Snapmaker U1 machine state is %s' % (main_state or 'unknown')
+        return ''
+
+    def _require_u1_host_maintenance_idle(self, gcmd, operation):
+        reason = self._u1_host_maintenance_busy_reason()
+        if reason:
+            raise gcmd.error(
+                '%s cannot continue while the stock Snapmaker U1 host is busy: %s' %
+                (operation, reason))
 
     def _generic_external_endpoint(self):
         if self._snapmaker_platform():
@@ -1449,6 +1484,7 @@ class BMCUManager(object):
             'BMCU_REFILL_STATUS': self.cmd_REFILL_STATUS,
             'BMCU_REFILL_NOW': self.cmd_REFILL_NOW,
             'BMCU_PRINT_REFILL': self.cmd_PRINT_REFILL,
+            'BMCU_PREPARE_UPDATE': self.cmd_PREPARE_UPDATE,
             'BMCU_PREPARE_UNINSTALL': self.cmd_PREPARE_UNINSTALL,
             'BMCU_FORGET_DEVICE': self.cmd_FORGET_DEVICE,
             'BMCU_UPDATE_ACCESS': self.cmd_UPDATE_ACCESS,
@@ -1457,7 +1493,30 @@ class BMCUManager(object):
             'BMCU_REFILL_RESUME': self.cmd_SNAP_REFILL_RESUME,
         }
         for name, handler in commands.items():
-            self.gcode.register_command(name, handler)
+            self.gcode.register_command(
+                name, lambda gcmd, handler=handler: self._dispatch_command(handler, gcmd))
+
+    def _dispatch_command(self, handler, gcmd):
+        if (getattr(self, '_uninstall_prepared', False) and
+                handler.__name__ not in (
+                    'cmd_PREPARE_UNINSTALL', 'cmd_STATUS', 'cmd_STOP',
+                    'cmd_CALIBRATION_STATUS', 'cmd_REFILL_STATUS')):
+            raise gcmd.error(
+                'BMCU uninstall is prepared; finish uninstall or run '
+                'BMCU_PREPARE_UNINSTALL ACTION=CANCEL')
+        if (getattr(self, '_update_prepared', False) and
+                handler.__name__ not in (
+                    'cmd_PREPARE_UPDATE', 'cmd_STATUS', 'cmd_STOP',
+                    'cmd_CALIBRATION_STATUS', 'cmd_REFILL_STATUS')):
+            raise gcmd.error(
+                'BMCU host update is prepared; finish the update or run '
+                'BMCU_PREPARE_UPDATE ACTION=CANCEL')
+        return handler(gcmd)
+
+    def _maintenance_prepared(self):
+        return bool(
+            getattr(self, '_uninstall_prepared', False) or
+            getattr(self, '_update_prepared', False))
 
     def _require_standalone_operation(self, operation, gcmd=None):
         mode = getattr(self, 'controller_mode', 'standalone')
@@ -1764,6 +1823,9 @@ class BMCUManager(object):
         return cancel_requested
 
     def _enter_critical_motion(self, reason='printer_motion'):
+        if self._maintenance_prepared():
+            raise BMCUError(
+                'BMCU maintenance is prepared; printer-critical motion is blocked')
         reason = str(reason or 'printer_motion')
         while self._critical_motion_pending and not self._klippy_disconnecting:
             self.reactor.pause(self.reactor.monotonic() + 0.010)
@@ -2169,6 +2231,8 @@ class BMCUManager(object):
         return True
 
     def _drain_deferred_task(self, eventtime):
+        if self._maintenance_prepared():
+            return eventtime + self._background_retry_interval
         if self._critical_motion_active:
             return self.reactor.NEVER
         if self._klippy_disconnecting:
@@ -2427,6 +2491,8 @@ class BMCUManager(object):
     def _timer_event(self, eventtime):
         if self._klippy_disconnecting:
             return self.reactor.NEVER
+        if self._maintenance_prepared():
+            return eventtime + self.manager_idle_interval
         if self._critical_motion_active:
 
             return self.reactor.NEVER
@@ -4429,6 +4495,16 @@ class BMCUManager(object):
             raise BMCUError('%s has an invalid Snapmaker JSON path' % context)
         try:
             payload = json.dumps(config, indent=4, allow_nan=False) + '\n'
+            if self._snapmaker_platform():
+                import queuefile
+                sync_write = getattr(queuefile, 'sync_write_file', None)
+                if not callable(sync_write):
+                    raise BMCUError(
+                        '%s requires the Snapmaker queued file writer' % context)
+                sync_write(
+                    self.reactor, path, payload, safe_write=True, timeout=30.0)
+                self._durable_writer.sync(path, timeout=30.0)
+                return True
             return self._durable_writer.write(
                 path, payload, mode=None, timeout=30.0)
         except Exception as exc:
@@ -5477,6 +5553,7 @@ class BMCUManager(object):
                 'baseline_filament': {},
                 'head_index': -1,
                 'persistent_hold': False,
+                'native_auto_override_active': False,
                 'tail_detached': False,
                 'tail_sensor_cleared': False,
                 'follower_pending': False,
@@ -5495,7 +5572,134 @@ class BMCUManager(object):
             }
             records[endpoint_name] = record
         record.setdefault('baseline_filament', {})
+        record.setdefault('native_auto_override_active', bool(
+            record.get('persistent_hold')))
         return record
+
+    def _commit_u1_route_ownership(self, device, channel, route_state):
+        endpoint = self._endpoint_for_channel(device, channel)
+        if endpoint is None or endpoint.driver != 'snapmaker_u1':
+            return False
+        record = self._u1_ownership_record(endpoint.name)
+        if record.get('tail_detached') or record.get('follower_pending'):
+            return False
+        if self._route_states_from_status(device.status)[channel] != route_state:
+            device.refresh()
+        if self._route_states_from_status(device.status)[channel] != route_state:
+            raise BMCUError('%s Channel %d route commit is not verified' %
+                            (device.name, channel + 1))
+        uid = self._device_uid(device)
+        if route_state == protocol.ROUTE_EMPTY:
+            expected_uid = str(record.get('device_uid', '') or '').upper()
+            if (int(record.get('channel', -1)) != channel or
+                    (expected_uid != uid if expected_uid else
+                     record.get('device') != device.name)):
+                return False
+            owner = {'device': '', 'device_uid': '', 'channel': -1,
+                     'route_state': 'EMPTY'}
+        elif route_state == protocol.ROUTE_LOADED:
+            occupied = self._routes_for_endpoint(
+                endpoint.name, (protocol.ROUTE_LOADED, protocol.ROUTE_UNCERTAIN))
+            if (len(occupied) != 1 or occupied[0][0] is not device or
+                    occupied[0][1] != channel):
+                raise BMCUError('%s has no exclusive confirmed route owner' %
+                                endpoint.name)
+            owner = {'device': device.name, 'device_uid': uid,
+                     'channel': channel, 'route_state': 'LOADED'}
+        else:
+            raise BMCUError('U1 route commit requires EMPTY or LOADED')
+        if all(record.get(key) == value for key, value in owner.items()):
+            return False
+        previous = dict(record)
+        record.update(owner)
+        try:
+            self.state.save()
+        except Exception:
+            record.clear()
+            record.update(previous)
+            raise
+        self._u1_lease_dirty = True
+        return True
+
+    def _reconcile_u1_route_ownership(self, endpoint):
+        if endpoint.driver != 'snapmaker_u1':
+            return False
+        record = self._u1_ownership_record(endpoint.name)
+        if (record.get('route_state') not in ('LOADED', 'UNCERTAIN') or
+                record.get('tail_detached') or record.get('follower_pending') or
+                self._klippy_disconnecting or self.u1_cross_refill_pending or
+                self._print_state() in ('printing', 'paused', 'pause') or
+                self._u1_disconnect_hazards.get(endpoint.name) or
+                endpoint.name in self.endpoint_locks or
+                endpoint.shared_path_group() in self.path_locks or
+                self._u1_endpoint_transition_reserved(endpoint.name) or
+                self._prestaged_devices_for_endpoint(endpoint.name)):
+            return False
+        assigned = self._assigned_routes_for_endpoint(endpoint.name)
+        devices = list({device.name: device for device, _channel in assigned}.values())
+        if not devices or any(
+                not device.ready or not device.runtime_configured or
+                not device.status_reconciled or device.name in self.active_operations
+                for device in devices):
+            return False
+        uid = str(record.get('device_uid', '') or '').upper()
+        previous = next(((device, channel) for device, channel in assigned
+                         if channel == record.get('channel') and
+                         (self._device_uid(device) == uid if uid else
+                          device.name == record.get('device'))), None)
+        if (previous is None or
+                self._route_states_from_status(previous[0].status)[previous[1]] !=
+                protocol.ROUTE_EMPTY or
+                sum(self._route_states_from_status(device.status)[channel] ==
+                    protocol.ROUTE_LOADED for device, channel in assigned) != 1):
+            return False
+        before = dict(record)
+        operation = 'U1_OWNERSHIP_RECONCILE'
+        self._lock(devices[0], endpoint, operation, channel=0xff)
+        locked = [devices[0]]
+        try:
+            for device in devices[1:]:
+                self._lock_channel_input(device, operation, 0xff)
+                locked.append(device)
+            snapshots = {device.name: copy.deepcopy(device.refresh()) for device in devices}
+            if (record != before or assigned != self._assigned_routes_for_endpoint(endpoint.name) or
+                    self._klippy_disconnecting or self.u1_cross_refill_pending or
+                    self._print_state() in ('printing', 'paused', 'pause') or
+                    self._u1_disconnect_hazards.get(endpoint.name)):
+                return False
+            loaded = []
+            for device, channel in assigned:
+                snapshot = snapshots[device.name]
+                routes = self._route_states_from_status(snapshot)
+                if (not device.ready or not device.runtime_configured or
+                        not device.status_reconciled or device.session_changed or
+                        self._route_states_from_status(device.status) != routes or
+                        device.status.get('session_id') != snapshot.get('session_id') or
+                        not (int(snapshot.get('connected_mask', 0)) & (1 << channel)) or
+                        routes[channel] == protocol.ROUTE_UNCERTAIN or
+                        self._durable_tail_route(device, channel) is not None or
+                        int(snapshot.get('active_op_state', protocol.OP_STATE_IDLE)) ==
+                        protocol.OP_STATE_RUNNING):
+                    return False
+                motion = snapshot.get('motion', [protocol.MOTION_IDLE] * 4)[channel]
+                allowed = (protocol.MOTION_IDLE, protocol.MOTION_ON_USE) if (
+                    routes[channel] == protocol.ROUTE_LOADED) else (protocol.MOTION_IDLE,)
+                if motion not in allowed:
+                    return False
+                if routes[channel] == protocol.ROUTE_LOADED:
+                    if not snapshot.get('present', [0] * 4)[channel]:
+                        return False
+                    loaded.append((device, channel))
+            if (len(loaded) != 1 or self._route_state(*previous) != protocol.ROUTE_EMPTY):
+                return False
+            return self._commit_u1_route_ownership(
+                loaded[0][0], loaded[0][1], protocol.ROUTE_LOADED)
+        finally:
+            for device in locked:
+                if self.active_operations.get(device.name, {}).get('name') == operation:
+                    self.active_operations.pop(device.name, None)
+            self.endpoint_locks.discard(endpoint.name)
+            self.path_locks.discard(endpoint.shared_path_group())
 
     def _capture_u1_baseline(self, endpoint):
         record = self._u1_ownership_record(endpoint.name)
@@ -5504,9 +5708,15 @@ class BMCUManager(object):
         except (TypeError, ValueError, OverflowError):
             record['head_index'] = -1
         if (record.get('baseline_captured') and
-                record.get('generation_open')):
+                (record.get('generation_open') or
+                 record.get('native_auto_override_active'))):
             return record
+        if record.get('native_auto_override_active'):
+            raise BMCUError(
+                '%s has a persistent AUTO override without its original '
+                'baseline; restore the native feeder explicitly' % endpoint.name)
         feeder = self._u1_native_feeder_status(endpoint, strict=True)
+        previous = dict(record)
         record['baseline_captured'] = True
         record['baseline_disabled'] = bool(
             feeder.get('disable_auto', False))
@@ -5523,15 +5733,22 @@ class BMCUManager(object):
                 if isinstance(values, list) and head < len(values):
                     baseline[key] = copy.deepcopy(values[head])
         record['baseline_filament'] = baseline
+        record['native_auto_override_active'] = True
         record['generation_open'] = True
         record['generation'] = min(
             0x7FFFFFFF, int(record.get('generation', 0)) + 1)
         record['reason'] = 'captured stock feeder baseline for lease generation'
-        self.state.save()
+        try:
+            self.state.save()
+        except Exception:
+            record.clear()
+            record.update(previous)
+            raise
         return record
 
     def _handoff_u1_to_native(self, endpoint, reason='verified EMPTY handoff',
-                              save=False, close_generation=False):
+                              save=False, close_generation=False,
+                              auto=None, require_restore=False):
 
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
@@ -5558,20 +5775,42 @@ class BMCUManager(object):
                 (endpoint.name, path.get('channel_state', 'unknown')))
 
         generation_open = bool(record.get('generation_open', False))
-        if record.get('baseline_captured') and generation_open:
+        if auto is not None:
+            previous = dict(record)
+            record['baseline_captured'] = True
+            record['baseline_disabled'] = not bool(auto)
+            record['generation_open'] = True
+            record['native_auto_override_active'] = True
+            try:
+                self.state.save()
+            except Exception:
+                record.clear()
+                record.update(previous)
+                raise
+            endpoint.restore_native_feeder(save=True, enabled=bool(auto))
+        elif (record.get('baseline_captured') and
+              (generation_open or record.get('native_auto_override_active'))):
             enabled = not bool(record.get('baseline_disabled', False))
 
             endpoint.restore_native_feeder(save=True, enabled=enabled)
-        elif record.get('persistent_hold'):
+        elif (record.get('persistent_hold') or
+              record.get('native_auto_override_active')):
 
             raise BMCUError(
                 '%s has a persistent BMCU hold without an open captured '
                 'baseline generation; exact recovery is required' % endpoint.name)
         else:
-
-            pass
+            feeder = self._u1_native_feeder_status(endpoint, strict=True)
+            if require_restore and bool(feeder.get('disable_auto', False)):
+                raise BMCUError(
+                    '%s native AUTO is disabled and no open baseline is '
+                    'available; to enable it explicitly use '
+                    'BMCU_SNAP_FEEDER ENDPOINT=%s TAKEOVER=0 AUTO=1' %
+                    (endpoint.name, endpoint.name))
         endpoint.release_runtime_sensor_takeover()
+        previous = dict(record)
         record['persistent_hold'] = False
+        record['native_auto_override_active'] = False
         record['tail_detached'] = False
         record['tail_sensor_cleared'] = False
         record['follower_pending'] = False
@@ -5587,12 +5826,21 @@ class BMCUManager(object):
         if close_generation:
 
             record['generation_open'] = False
+            record['baseline_captured'] = False
+            record['baseline_disabled'] = False
+            record['baseline_filament'] = {}
         record['reason'] = str(reason or 'verified EMPTY handoff')[:160]
+        try:
+            self.state.save()
+        except Exception:
+            record.clear()
+            record.update(previous)
+            raise
         self._set_u1_lease_state(
             endpoint.name, 'native', record['reason'],
             path=path, online=bool(
                 self._assigned_routes_for_endpoint(endpoint.name)))
-        self.state.save()
+        self._u1_persistent_reasserted.discard(endpoint.name)
         return True
 
     def _u1_tail_detached_matches(self, endpoint, device, channel):
@@ -5900,10 +6148,16 @@ class BMCUManager(object):
         record = self._u1_ownership_record(endpoint.name)
         if record.get('persistent_hold'):
             if (not record.get('baseline_captured') or
-                    not record.get('generation_open')):
+                    not (record.get('generation_open') or
+                         record.get('native_auto_override_active'))):
                 raise BMCUError(
                     '%s has active BMCU ownership without an open native '
                     'feeder baseline' % endpoint.name)
+            if (not record.get('native_auto_override_active') or
+                    not record.get('generation_open')):
+                record['native_auto_override_active'] = True
+                record['generation_open'] = True
+                self.state.save()
             self._set_u1_lease_state(
                 endpoint.name, 'bmcu',
                 str(reason or 'BMCU route motion'),
@@ -5932,11 +6186,13 @@ class BMCUManager(object):
                 (endpoint.name, path.get('channel_state', 'unknown')))
         if (bmcu_occupied and
                 not (record.get('baseline_captured') and
-                     record.get('generation_open'))):
+                     (record.get('generation_open') or
+                      record.get('native_auto_override_active')))):
             raise BMCUError(
                 '%s has BMCU route ownership without a captured native '
                 'feeder baseline' % endpoint.name)
         record = self._capture_u1_baseline(endpoint)
+        previous = dict(record)
         if device is None:
             device, inferred = self._u1_operation_source(endpoint.name)
             if channel is None or int(channel) < 0:
@@ -5946,6 +6202,7 @@ class BMCUManager(object):
         except (TypeError, ValueError, OverflowError):
             channel = -1
         record['persistent_hold'] = True
+        record['native_auto_override_active'] = True
 
         record['generation_open'] = True
         record['device'] = device.name if device is not None else ''
@@ -5963,7 +6220,12 @@ class BMCUManager(object):
             device=(device.name if device is not None else ''),
             channel=record['channel'])
 
-        self.state.save()
+        try:
+            self.state.save()
+        except Exception:
+            record.clear()
+            record.update(previous)
+            raise
         endpoint.set_native_feeder_enabled(False, save=True)
         self._u1_persistent_reasserted.add(endpoint.name)
         endpoint.activate_runtime_sensor_takeover()
@@ -5974,7 +6236,8 @@ class BMCUManager(object):
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
         record = self._u1_ownership_record(endpoint.name)
-        if not record.get('persistent_hold'):
+        if not (record.get('persistent_hold') or
+                record.get('native_auto_override_active')):
             return False
         if self._endpoint_has_loaded_or_active_route(endpoint.name):
             return False
@@ -6233,7 +6496,8 @@ class BMCUManager(object):
             stock = owner_status.get('stock_source')
             if (isinstance(stock, dict) and isinstance(record, dict) and
                     record.get('baseline_captured') and
-                    record.get('generation_open')):
+                    (record.get('generation_open') or
+                     record.get('native_auto_override_active'))):
                 stock['material_origin'] = 'captured'
                 stock['user_auto_enabled'] = not bool(
                     record.get('baseline_disabled', False))
@@ -6260,6 +6524,7 @@ class BMCUManager(object):
                     endpoint.name, hazards),
             }
         elif (ownership.get('persistent_hold') or
+              ownership.get('native_auto_override_active') or
               any(item['claimed'] for item in evidence) or
               endpoint.name in getattr(self, '_u1_background_jobs', {})):
             busy = any(
@@ -6275,7 +6540,8 @@ class BMCUManager(object):
         stock_snapshot = {}
         stock_origin = 'unknown'
         if (ownership.get('baseline_captured') and
-                ownership.get('generation_open')):
+                (ownership.get('generation_open') or
+                 ownership.get('native_auto_override_active'))):
             stock_snapshot = copy.deepcopy(
                 ownership.get('baseline_filament', {}))
             stock_origin = 'captured'
@@ -6293,7 +6559,9 @@ class BMCUManager(object):
         color = '#%s' % rgba[:6] if re.fullmatch(r'[0-9A-F]{8}', rgba) else '#FFFFFF'
         module, native_channel = endpoint.native_feeder_target()
         user_auto_enabled = None
-        if ownership.get('baseline_captured') and ownership.get('generation_open'):
+        if (ownership.get('baseline_captured') and
+                (ownership.get('generation_open') or
+                 ownership.get('native_auto_override_active'))):
             user_auto_enabled = not bool(ownership.get('baseline_disabled', False))
         elif native_disabled is not None:
             user_auto_enabled = not native_disabled
@@ -6336,7 +6604,8 @@ class BMCUManager(object):
         return value
 
     def _reconcile_u1_leases(self, eventtime=None, force=False):
-        if getattr(self, '_klippy_disconnecting', False):
+        if (getattr(self, '_klippy_disconnecting', False) or
+                self._maintenance_prepared()):
             return
         self._u1_lease_dirty = False
         for endpoint in tuple(self.endpoints.values()):
@@ -6365,6 +6634,7 @@ class BMCUManager(object):
 
             managed_journal = bool(
                 persistent_hold or ownership.get('generation_open', False) or
+                ownership.get('native_auto_override_active', False) or
                 ownership.get('baseline_captured', False))
             if not assigned and not active and not hazards and not managed_journal:
                 endpoint.release_runtime_sensor_takeover()
@@ -6378,6 +6648,8 @@ class BMCUManager(object):
                 continue
 
             try:
+                self._reconcile_u1_route_ownership(endpoint)
+                active = self._endpoint_has_loaded_or_active_route(endpoint.name)
                 if (persistent_hold and endpoint.name not in
                         self._u1_persistent_reasserted):
 
@@ -6434,7 +6706,8 @@ class BMCUManager(object):
                 if online:
 
                     if not active and not persistent_hold and not hazards:
-                        if (ownership.get('generation_open', False) and
+                        if ((ownership.get('generation_open', False) or
+                             ownership.get('native_auto_override_active', False)) and
                                 ownership.get('baseline_captured', False)):
                             if path.get('known') and not path.get('busy'):
                                 self._handoff_u1_to_native(
@@ -6514,7 +6787,7 @@ class BMCUManager(object):
                     endpoint.activate_runtime_sensor_takeover()
                     self._set_u1_lease_state(
                         endpoint.name, 'bmcu',
-                        'routed BMCU online; native feeder disabled in RAM',
+                        'routed BMCU online; native AUTO disabled with a captured restore baseline',
                         path=path, online=True)
                     continue
 
@@ -6662,6 +6935,14 @@ class BMCUManager(object):
                 self._route_state(device, channel) != protocol.ROUTE_EMPTY):
             raise BMCUError(
                 'unload or confirm EMPTY before changing %s Channel %d routing' %
+                (device.name, channel + 1))
+        current_endpoint = self._endpoint_for_channel(device, channel)
+        if (not restoring_tail_route and current_endpoint is not None and
+                current_endpoint.driver == 'snapmaker_u1' and
+                self._u1_route_ownership_evidence(device, channel)['durable_loaded']):
+            raise BMCUError(
+                '%s Channel %d still has a loaded route journal; confirm the '
+                'physical route EMPTY before changing its routing' %
                 (device.name, channel + 1))
         if route_key in self.prestaged:
             raise BMCUError(
@@ -7064,6 +7345,8 @@ class BMCUManager(object):
             (endpoint.name, summary))
 
     def _lock(self, device, endpoint, operation, channel=None):
+        if self._maintenance_prepared():
+            raise BMCUError('BMCU maintenance is prepared; new motion is blocked')
         active = self.active_operations.get(device.name)
         if active is not None:
             raise BMCUError('%s is busy: %s' % (device.name, active))
@@ -7087,6 +7370,8 @@ class BMCUManager(object):
         self.active_operations.pop(device.name, None)
 
     def _lock_channel_input(self, device, operation, channel):
+        if self._maintenance_prepared():
+            raise BMCUError('BMCU maintenance is prepared; new motion is blocked')
         active = self.active_operations.get(device.name)
         if active is not None:
             raise BMCUError('%s is busy: %s' % (device.name, active))
@@ -7101,6 +7386,8 @@ class BMCUManager(object):
 
     def _lock_refill(self, source_device, replacement_device, endpoint, operation,
                      replacement_endpoint=None):
+        if self._maintenance_prepared():
+            raise BMCUError('BMCU maintenance is prepared; new refill motion is blocked')
         devices = []
         for device in (source_device, replacement_device):
             if device is not None and device.name not in [item.name for item in devices]:
@@ -8210,6 +8497,47 @@ class BMCUManager(object):
             defaults[tool] = profile
         return plan, defaults
 
+    def _recover_u1_planner(self, restart=False):
+        if self._klippy_disconnecting:
+            raise BMCUError('U1 source planner recovery interrupted by Klipper shutdown')
+        runtime = os.path.realpath(os.path.join(
+            os.path.dirname(__file__), '..', '..', '..'))
+        bootstrap = os.path.join(runtime, 'scripts', 'bmcu_host_bootstrap.py')
+        metadata = os.path.join(runtime, 'INSTALLATION.json')
+        if not os.path.isfile(bootstrap) or not os.path.isfile(metadata):
+            raise BMCUError(
+                'U1 source planner is not running at %s; automatic recovery '
+                'requires an installed BMCU runtime. Run the BMCU installer '
+                'or restart the Klipper system service' % self._u1_planner_socket)
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen(
+                [sys.executable, '-I', '-S', bootstrap,
+                 '--restart-planner' if restart else '--sync-planner',
+                 '--metadata', metadata],
+                stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                close_fds=True, start_new_session=True)
+            try:
+                deadline = self.reactor.monotonic() + 10.0
+                while process.poll() is None:
+                    now = self.reactor.monotonic()
+                    if now >= deadline or self._klippy_disconnecting:
+                        raise BMCUError('U1 source planner recovery timed out or was interrupted')
+                    self.reactor.pause(min(deadline, now + 0.05))
+                if process.returncode:
+                    output.seek(0)
+                    details = output.read(4096).decode('utf-8', 'replace').strip()
+                    raise BMCUError('U1 source planner recovery failed: %s' %
+                                    (details or 'bootstrap exited with code %d' %
+                                     process.returncode))
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=0.5)
+
     def _load_u1_toolchange_plan(self):
 
         self._reset_u1_lookahead(stop_jobs=False)
@@ -8239,26 +8567,64 @@ class BMCUManager(object):
             client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
             try:
                 client.settimeout(0.20)
-                client.sendto(request, self._u1_planner_socket)
+                payload = None
+                for attempt in range(2):
+                    if self._klippy_disconnecting:
+                        raise BMCUError('U1 source planning interrupted by Klipper shutdown')
+                    restart = False
+                    try:
+                        client.sendto(request, self._u1_planner_socket)
+                    except OSError as exc:
+                        unavailable = exc.errno in (errno.ENOENT, errno.ECONNREFUSED)
+                        restart = isinstance(exc, socket.timeout)
+                        if attempt or not (unavailable or restart):
+                            reason = ('is not running' if unavailable else
+                                      'socket access denied' if exc.errno in
+                                      (errno.EACCES, errno.EPERM) else
+                                      'request could not be delivered')
+                            raise BMCUError('U1 source planner %s at %s: %s' %
+                                            (reason, self._u1_planner_socket, exc))
+                    else:
+                        deadline = self.reactor.monotonic() + float(self.u1_planner_timeout)
+                        while True:
+                            if self._klippy_disconnecting:
+                                raise BMCUError('U1 source planning interrupted by Klipper shutdown')
+                            try:
+                                payload = self._read_u1_planner_result(
+                                    result_path, request_id)
+                                break
+                            except OSError as exc:
+                                if exc.errno != errno.ENOENT:
+                                    raise
+                                now = self.reactor.monotonic()
+                                if now >= deadline:
+                                    break
+                                self.reactor.pause(min(
+                                    deadline, now + self.u1_planner_poll_interval))
+                        if payload is not None:
+                            break
+                        if attempt:
+                            raise BMCUError(
+                                'U1 source planner at %s did not answer within %.1f s '
+                                'after one recovery attempt; inspect bmcu-planner.log '
+                                'and the Klipper system service' %
+                                (self._u1_planner_socket, self.u1_planner_timeout))
+                        restart = True
+                    logging.warning(
+                        'BMCU U1 source planner %s at %s; starting one recovery attempt',
+                        'not responding' if restart else 'unavailable',
+                        self._u1_planner_socket)
+                    try:
+                        self._recover_u1_planner(restart=restart)
+                    except Exception as recovery_exc:
+                        raise BMCUError(
+                            'U1 source planner unavailable at %s; %s. '
+                            'FIRMWARE_RESTART does not restart system services; '
+                            'inspect bmcu-planner.log and restart the Klipper '
+                            'system service if recovery fails' %
+                            (self._u1_planner_socket, recovery_exc))
             finally:
                 client.close()
-            deadline = started + float(self.u1_planner_timeout)
-            payload = None
-            while True:
-                try:
-                    payload = self._read_u1_planner_result(
-                        result_path, request_id)
-                    break
-                except OSError as exc:
-                    if exc.errno != errno.ENOENT:
-                        raise
-                    now = self.reactor.monotonic()
-                    if now >= deadline:
-                        raise BMCUError(
-                            'U1 source planner did not answer within %.1f s' %
-                            self.u1_planner_timeout)
-                    self.reactor.pause(min(
-                        deadline, now + self.u1_planner_poll_interval))
             result = payload.get('result')
             plan, defaults = self._validate_u1_external_plan(
                 result, path, identity)
@@ -8277,6 +8643,10 @@ class BMCUManager(object):
                 'Klipper in %.3f ms (Klipper wait %.3f ms)',
                 len(plan), self._u1_planner_last_scan_ms, elapsed)
             return True
+        except OSError as exc:
+            self._u1_planner_failures += 1
+            raise BMCUError('U1 source planner IPC at %s failed: %s' %
+                            (self._u1_planner_socket, exc))
         except Exception:
             self._u1_planner_failures += 1
             raise
@@ -10439,6 +10809,7 @@ class BMCUManager(object):
             record['tail_sensor_cleared'] = False
             if native:
                 record['persistent_hold'] = False
+                record['native_auto_override_active'] = False
                 record['route_state'] = 'EMPTY'
                 record['device'] = ''
                 record['device_uid'] = ''
@@ -10781,6 +11152,8 @@ class BMCUManager(object):
                     endpoint.select()
                     endpoint.verify_selected()
                     device.set_motion(channel, protocol.MOTION_ON_USE)
+                    self._commit_u1_route_ownership(
+                        device, channel, protocol.ROUTE_LOADED)
                     endpoint.activate_runtime_sensor_takeover()
                     if hasattr(endpoint, 'sync_active_filament'):
                         endpoint.sync_active_filament(
@@ -11513,13 +11886,15 @@ class BMCUManager(object):
                     'U1 %s prime completed; switching firmware motion '
                     'BEFORE_ON_USE -> ON_USE', endpoint.name)
             device.set_motion(channel, protocol.MOTION_ON_USE)
+            self._clear_u1_tail_detached(
+                endpoint, device, channel,
+                'new BMCU source physically captured and loaded')
+            self._commit_u1_route_ownership(
+                device, channel, protocol.ROUTE_LOADED)
             endpoint.activate_runtime_sensor_takeover()
             if hasattr(endpoint, 'sync_active_filament'):
                 endpoint.sync_active_filament(
                     self._channel_metadata(device, channel))
-            self._clear_u1_tail_detached(
-                endpoint, device, channel,
-                'new BMCU source physically captured and loaded')
             if tool >= 0:
                 self.loaded_tools[route_key] = tool
                 self.active_tool = tool
@@ -12129,6 +12504,7 @@ class BMCUManager(object):
             raise BMCUError(
                 'PARK_FAILED: BMCU did not commit Channel %d as EMPTY' %
                 (channel + 1))
+        self._commit_u1_route_ownership(device, channel, protocol.ROUTE_EMPTY)
         if not self._routes_for_endpoint(
                 endpoint.name,
                 (protocol.ROUTE_LOADED, protocol.ROUTE_UNCERTAIN)):
@@ -12329,6 +12705,7 @@ class BMCUManager(object):
             device.refresh()
             if self._route_states_from_status(device.status)[channel] != protocol.ROUTE_EMPTY:
                 raise BMCUError('PRESTAGE_NOT_CLEARED: route did not commit EMPTY')
+            self._commit_u1_route_ownership(device, channel, protocol.ROUTE_EMPTY)
             self._drop_prestage_record(
                 route_key, release_sensor=not preserve_sensor_takeover)
         except Exception:
@@ -12580,12 +12957,19 @@ class BMCUManager(object):
                 'Finish detached-tail recovery before calibration: Channel %s '
                 'still has filament in the downstream route' %
                 ', '.join(str(channel + 1) for channel in durable_tails))
+        for channel in selected_channels:
+            endpoint = self._endpoint_for_channel(device, channel)
+            if (endpoint is not None and endpoint.driver == 'snapmaker_u1' and
+                    self._u1_ownership_record(endpoint.name).get('follower_pending')):
+                raise gcmd.error(
+                    'Finish pending refill recovery for %s before calibration' %
+                    endpoint.name)
 
         print_busy = bool(
             self.print_map_active or self.print_plan_open or
             self.print_transaction_phase or self.u1_cross_refill_pending)
         if not print_busy and not self.active_operations:
-            changed = False
+            cleared_channels = []
             previous = dict(refreshed)
             for channel in selected_channels:
                 if (self._route_state(device, channel, refreshed) == protocol.ROUTE_UNCERTAIN and
@@ -12594,9 +12978,12 @@ class BMCUManager(object):
                     self._uncertain_routes.discard(self._route_key(device, channel))
                     self.loaded_tools.pop(self._route_key(device, channel), None)
                     self._unmark_print_route(device, channel)
-                    changed = True
-            if changed:
+                    cleared_channels.append(channel)
+            if cleared_channels:
                 refreshed = dict(device.refresh())
+                for channel in cleared_channels:
+                    self._commit_u1_route_ownership(
+                        device, channel, protocol.ROUTE_EMPTY)
                 self.device_status_changed(device, previous, refreshed)
                 self._save_runtime()
 
@@ -13543,6 +13930,9 @@ class BMCUManager(object):
             raise gcmd.error('ENDPOINT must name a Snapmaker U1 endpoint')
         takeover = bool(gcmd.get_int('TAKEOVER', minval=0, maxval=1))
         save = bool(gcmd.get_int('SAVE', 0, minval=0, maxval=1))
+        auto = gcmd.get_int('AUTO', None, minval=0, maxval=1)
+        if takeover and auto is not None:
+            raise gcmd.error('AUTO is only valid with TAKEOVER=0')
         routed = self._endpoint_routed(endpoint_name)
         if takeover and not routed:
             raise gcmd.error(
@@ -13554,7 +13944,8 @@ class BMCUManager(object):
                 endpoint_name)
         if takeover and save:
             raise gcmd.error(
-                'persistent U1 feeder disable is forbidden; BMCU takeover is always a runtime lease')
+                'SAVE=1 is not accepted here; BMCU manages persistent AUTO '
+                'and its restore baseline automatically')
 
         old_takeover = bool(endpoint.get('u1_native_feeder_takeover', False))
         state_config = self.state.data['endpoints'][endpoint_name]
@@ -13572,17 +13963,17 @@ class BMCUManager(object):
 
                 self._handoff_u1_to_native(
                     endpoint, 'explicit BMCU feeder handoff', save=True,
-                    close_generation=True)
+                    close_generation=True, auto=auto, require_restore=True)
                 record = self._u1_ownership_record(endpoint_name)
-                if record.get('generation_open'):
+                if (record.get('generation_open') or
+                        record.get('native_auto_override_active')):
 
                     raise BMCUError(
                         '%s feeder lease remained open after handoff' %
                         endpoint_name)
-                state_text = (
-                    'Snapmaker owns the feed path; the current AUTO preference '
-                    'was restored from the open lease baseline or left unchanged '
-                    'when no active lease existed')
+                feeder = self._u1_native_feeder_status(endpoint, strict=True)
+                state_text = 'Snapmaker owns the feed path; AUTO=%d' % (
+                    not bool(feeder.get('disable_auto', False)))
         except Exception as exc:
             endpoint.config['u1_native_feeder_takeover'] = old_takeover
             state_config['u1_native_feeder_takeover'] = old_takeover
@@ -16058,97 +16449,231 @@ class BMCUManager(object):
              ('; motor power disabled through output_pin %s' % power_pin)
              if power_pin else ''))
 
+    def cmd_PREPARE_UPDATE(self, gcmd):
+        action = str(gcmd.get('ACTION', 'PREPARE') or '').upper()
+        if action == 'CANCEL':
+            self._update_prepared = False
+            gcmd.respond_info('BMCU host update preparation cancelled')
+            return
+        if action != 'PREPARE':
+            raise gcmd.error('ACTION must be PREPARE or CANCEL')
+        if getattr(self, '_uninstall_prepared', False):
+            raise gcmd.error('BMCU uninstall is already prepared')
+
+        self._update_prepared = True
+        try:
+            print_state = self._print_state()
+            if print_state in ('printing', 'paused', 'pause'):
+                raise gcmd.error(
+                    'printer is %s; finish or cancel the job before update' %
+                    print_state)
+            self._require_u1_host_maintenance_idle(gcmd, 'BMCU host update')
+            if self.active_operations:
+                raise gcmd.error(
+                    'BMCU operation is active; finish it before update')
+            if self._forget_pending:
+                raise gcmd.error(
+                    'BMCU device removal is prepared; finish or cancel it '
+                    'before update')
+            if (self.print_plan_open or self.print_map_active or
+                    self.print_transaction_phase or self._u1_toolchange_plan):
+                raise gcmd.error(
+                    'BMCU print transaction is retained; finish or cancel the '
+                    'print transaction before update')
+            if self.prestaged:
+                raise gcmd.error(
+                    'clear every retained BMCU prestage before update')
+            if self.u1_cross_refill_pending:
+                raise gcmd.error(
+                    'Snapmaker U1 cross-head refill recovery is pending; '
+                    'finish it before update')
+            if self._u1_background_jobs:
+                raise gcmd.error(
+                    'BMCU background preparation is active; finish it before update')
+            refill = getattr(self, 'refill', None)
+            if refill is not None:
+                if (getattr(refill, 'transactions', {}) or
+                        getattr(refill, '_pending', set())):
+                    raise gcmd.error(
+                        'BMCU refill handling is active or pending; finish it '
+                        'before update')
+                if getattr(refill, 'manual_pending', None):
+                    raise gcmd.error(
+                        'BMCU manual refill recovery is pending; finish it '
+                        'before update')
+            if (getattr(self, '_critical_motion_pending', False) or
+                    getattr(self, '_critical_motion_active', False) or
+                    getattr(self, '_critical_motion_depth', 0)):
+                raise gcmd.error(
+                    'printer motion controlled by BMCU is active or pending; '
+                    'finish it before update')
+            if getattr(self, '_control_plane_requests', 0):
+                raise gcmd.error(
+                    'BMCU control-plane work is still in flight; retry the '
+                    'update when BMCU is idle')
+            if self._firmware_update_power_restore:
+                raise gcmd.error(
+                    'BMCU firmware-update power ownership is retained; finish '
+                    'or recover the firmware update before host update')
+            for device in self.devices:
+                if getattr(device, 'suspended', False):
+                    raise gcmd.error(
+                        '%s is suspended for firmware/device maintenance; '
+                        'finish that operation before host update' % device.name)
+                if not device.ready:
+                    continue
+                try:
+                    status = dict(device.refresh())
+                except Exception as exc:
+                    raise gcmd.error(
+                        '%s live status could not be verified before update: %s' %
+                        (device.name, exc))
+                motion = status.get('motion', [])
+                if (len(motion) != 4 or
+                        any(int(value) != protocol.MOTION_IDLE
+                            for value in motion)):
+                    raise gcmd.error(
+                        '%s still reports active or unverifiable BMCU motion; '
+                        'finish it before update' % device.name)
+                if (int(status.get(
+                        'active_op_state', protocol.OP_STATE_IDLE)) ==
+                        protocol.OP_STATE_RUNNING or
+                        bool(status.get('auto_calibration', {}).get('active'))):
+                    raise gcmd.error(
+                        '%s still reports an active firmware operation; finish '
+                        'it before update' % device.name)
+            if self._print_state() in ('printing', 'paused', 'pause'):
+                raise gcmd.error(
+                    'printer activity changed while preparing update; retry '
+                    'after the printer is idle')
+            if (getattr(self, '_critical_motion_pending', False) or
+                    getattr(self, '_critical_motion_active', False) or
+                    getattr(self, '_critical_motion_depth', 0) or
+                    getattr(self, '_control_plane_requests', 0)):
+                raise gcmd.error(
+                    'BMCU/printer activity changed while preparing update; '
+                    'retry when the system is idle')
+            self._require_u1_host_maintenance_idle(gcmd, 'BMCU host update')
+            gcmd.respond_info(
+                'BMCU host update is prepared. Loaded routes and native feeder '
+                'ownership are preserved; new BMCU motion is blocked until '
+                'Klipper stops or ACTION=CANCEL is used.')
+        except Exception:
+            self._update_prepared = False
+            raise
+
     def cmd_PREPARE_UNINSTALL(self, gcmd):
-        print_state = self._print_state()
-        if print_state in ('printing', 'paused', 'pause'):
-            raise gcmd.error(
-                'printer is %s; finish or cancel the job before uninstall' %
-                print_state)
-        if self.active_operations:
-            raise gcmd.error('BMCU operation is active; stop it before uninstall')
-        if self.prestaged:
-            raise gcmd.error('Clear every BMCU prestage before uninstall')
-        occupied = []
-        for device in self.devices:
-            if not device.ready:
-                routed_u1 = any(
-                    (self._endpoint_for_channel(device, channel) is not None and
-                     self._endpoint_for_channel(device, channel).driver ==
-                     'snapmaker_u1')
-                    for channel in range(4))
-                if (routed_u1 and device.name not in
-                        self._u1_devices_reconciled_once):
+        action = str(gcmd.get('ACTION', 'PREPARE') or '').upper()
+        if action == 'CANCEL':
+            self._uninstall_prepared = False
+            gcmd.respond_info('BMCU uninstall preparation cancelled')
+            return
+        if action != 'PREPARE':
+            raise gcmd.error('ACTION must be PREPARE or CANCEL')
+        self._uninstall_prepared = True
+        try:
+            print_state = self._print_state()
+            if print_state in ('printing', 'paused', 'pause'):
+                raise gcmd.error(
+                    'printer is %s; finish or cancel the job before uninstall' %
+                    print_state)
+            self._require_u1_host_maintenance_idle(gcmd, 'BMCU uninstall')
+            if self.active_operations:
+                raise gcmd.error('BMCU operation is active; stop it before uninstall')
+            if self.prestaged:
+                raise gcmd.error('Clear every BMCU prestage before uninstall')
+            if any(self._u1_endpoint_transition_reserved(name) for name in self.endpoints):
+                raise gcmd.error('BMCU background preparation is active; clear it before uninstall')
+            occupied = []
+            snapshots = {}
+            for device in self.devices:
+                if (not device.ready or not device.runtime_configured or
+                        not device.status_reconciled):
                     raise gcmd.error(
-                        '%s is offline and has not supplied a fresh route '
-                        'snapshot since Klipper started; reconnect it before '
-                        'uninstall' % device.name)
-                nonempty = [channel for channel in range(4)
-                            if self._route_state(device, channel) != protocol.ROUTE_EMPTY]
-                if nonempty:
+                        '%s has no verified live route snapshot; reconnect BMCU '
+                        'before uninstall' % device.name)
+                snapshots[device.name] = copy.deepcopy(device.refresh())
+            for device in self.devices:
+                status = snapshots[device.name]
+                if (not device.ready or not device.runtime_configured or
+                        not device.status_reconciled or device.session_changed or
+                        status.get('session_id') != device.status.get('session_id') or
+                        self._route_states_from_status(status) !=
+                        self._route_states_from_status(device.status)):
+                    raise gcmd.error('%s changed while preparing uninstall; retry' % device.name)
+                if (int(status.get('active_op_state', protocol.OP_STATE_IDLE)) ==
+                        protocol.OP_STATE_RUNNING or
+                        any(value != protocol.MOTION_IDLE for value in status.get('motion', [])) or
+                        len(status.get('motion', [])) != 4):
+                    raise gcmd.error('%s is moving; stop BMCU before uninstall' % device.name)
+                if int(status.get('connected_mask', 0)) != 0x0f:
+                    raise gcmd.error('%s has an unavailable Channel; reconnect BMCU before uninstall' % device.name)
+                for channel in range(4):
+                    route = self._route_state(device, channel, status=status)
+                    if route != protocol.ROUTE_EMPTY:
+                        occupied.append((device.name, channel,
+                                         protocol.ROUTE_NAMES.get(route, 'UNCERTAIN')))
+            if occupied:
+                raise gcmd.error(
+                    'Unload or confirm EMPTY before uninstall: %s' %
+                    ', '.join('%s Channel %d=%s' % (item[0], item[1] + 1, item[2]) for item in occupied))
+
+            if self.u1_cross_refill_pending:
+                raise gcmd.error(
+                    'cannot uninstall while Snapmaker U1 cross-head refill recovery is '
+                    'pending; finish BMCU_REFILL_RESUME or restore the exact print '
+                    'transaction from the recovery panel first')
+            print_transaction_present = bool(
+                self.print_map_active or self.print_plan_open or self.print_tools or
+                self.print_job_id or self._u1_original or
+                self.print_transaction_phase or self._u1_map_backup or
+                self._u1_used_backup or self._u1_end_unload_backup)
+            if print_transaction_present:
+                if not self._clear_print_session(
+                        'verified live uninstall print-map handoff'):
                     raise gcmd.error(
-                        '%s is offline; Channel route state cannot be verified' %
-                        device.name)
-            for channel in range(4):
-                route = self._route_state(device, channel)
-                if route != protocol.ROUTE_EMPTY:
-                    occupied.append((device.name, channel,
-                                     protocol.ROUTE_NAMES.get(route, 'UNCERTAIN')))
-        if occupied:
-            raise gcmd.error(
-                'Unload or confirm EMPTY before uninstall: %s' %
-                ', '.join('%s Channel %d=%s' % (item[0], item[1] + 1, item[2]) for item in occupied))
+                        'cannot uninstall: the exact Snapmaker U1 print map could '
+                        'not be restored and persisted')
+                if (self.print_map_active or self.print_plan_open or
+                        self.print_tools or self._u1_original or
+                        self.print_transaction_phase or self._u1_map_backup or
+                        self._u1_used_backup or self._u1_end_unload_backup):
+                    raise gcmd.error(
+                        'cannot uninstall: Snapmaker U1 print transaction remains active')
 
-        if self.u1_cross_refill_pending:
-            raise gcmd.error(
-                'cannot uninstall while Snapmaker U1 cross-head refill recovery is '
-                'pending; finish BMCU_REFILL_RESUME or restore the exact print '
-                'transaction from the recovery panel first')
-        print_transaction_present = bool(
-            self.print_map_active or self.print_plan_open or self.print_tools or
-            self.print_job_id or self._u1_original or
-            self.print_transaction_phase or self._u1_map_backup or
-            self._u1_used_backup or self._u1_end_unload_backup)
-        if print_transaction_present:
-            if not self._clear_print_session(
-                    'verified live uninstall print-map handoff'):
-                raise gcmd.error(
-                    'cannot uninstall: the exact Snapmaker U1 print map could '
-                    'not be restored and persisted')
-            if (self.print_map_active or self.print_plan_open or
-                    self.print_tools or self._u1_original or
-                    self.print_transaction_phase or self._u1_map_backup or
-                    self._u1_used_backup or self._u1_end_unload_backup):
-                raise gcmd.error(
-                    'cannot uninstall: Snapmaker U1 print transaction remains active')
-
-        restored = []
-        for endpoint in self.endpoints.values():
-            if endpoint.driver != 'snapmaker_u1':
-                continue
-            ownership = self._u1_ownership_record(endpoint.name)
-            hazards = self._u1_disconnect_hazards.get(endpoint.name, set())
-            active_ownership = bool(
-                hazards or
-                self._endpoint_has_loaded_or_active_route(endpoint.name) or
-                ownership.get('persistent_hold', False) or
-                ownership.get('generation_open', False))
-            if not active_ownership:
-                endpoint.release_runtime_sensor_takeover()
-                continue
-            path = endpoint.native_path_status()
-            if not path.get('known') or path.get('busy'):
-                raise gcmd.error(
-                    '%s shared path cannot be handed back safely (%s); '
-                    'resolve the active BMCU ownership before uninstall' %
-                    (endpoint.name, path.get('channel_state', 'unknown')))
-            self._handoff_u1_to_native(
-                endpoint, 'verified uninstall handoff to Snapmaker', save=True,
-                close_generation=True)
-            restored.append(endpoint.name)
-        self.state.save()
-        gcmd.respond_info(
-            'BMCU uninstall is safe. Restored U1 endpoints: %s' %
-            (', '.join(restored) if restored else 'none'))
+            restored = []
+            for endpoint in self.endpoints.values():
+                if endpoint.driver != 'snapmaker_u1':
+                    continue
+                ownership = self._u1_ownership_record(endpoint.name)
+                hazards = self._u1_disconnect_hazards.get(endpoint.name, set())
+                active_ownership = bool(
+                    hazards or
+                    self._endpoint_has_loaded_or_active_route(endpoint.name) or
+                    ownership.get('persistent_hold', False) or
+                    ownership.get('generation_open', False) or
+                    ownership.get('native_auto_override_active', False))
+                if not active_ownership:
+                    endpoint.release_runtime_sensor_takeover()
+                    continue
+                path = endpoint.native_path_status()
+                if not path.get('known') or path.get('busy'):
+                    raise gcmd.error(
+                        '%s shared path cannot be handed back safely (%s); '
+                        'resolve the active BMCU ownership before uninstall' %
+                        (endpoint.name, path.get('channel_state', 'unknown')))
+                self._handoff_u1_to_native(
+                    endpoint, 'verified uninstall handoff to Snapmaker', save=True,
+                    close_generation=True)
+                restored.append(endpoint.name)
+            self._require_u1_host_maintenance_idle(gcmd, 'BMCU uninstall')
+            self.state.save()
+            gcmd.respond_info(
+                'BMCU uninstall is safe. Restored U1 endpoints: %s' %
+                (', '.join(restored) if restored else 'none'))
+        except Exception:
+            self._uninstall_prepared = False
+            raise
 
     def cmd_FORGET_DEVICE(self, gcmd):
         device = self._require_device(gcmd)
@@ -16219,7 +16744,8 @@ class BMCUManager(object):
                 continue
             if (any(ownership.get(key) for key in (
                     'persistent_hold', 'generation_open', 'baseline_captured',
-                    'tail_detached', 'follower_pending')) or
+                    'native_auto_override_active', 'tail_detached',
+                    'follower_pending')) or
                     str(ownership.get('route_state', 'EMPTY') or 'EMPTY').upper() != 'EMPTY'):
                 raise gcmd.error(
                     '%s still participates in the Snapmaker ownership journal for %s; run recovery first' %
@@ -16700,6 +17226,12 @@ class BMCUManager(object):
                     post_commit_errors.append(
                         'endpoint ownership commit failed: %s' % exc)
 
+            if not post_commit_errors:
+                try:
+                    self._commit_u1_route_ownership(device, channel, expected_route)
+                except Exception as exc:
+                    post_commit_errors.append('route journal commit failed: %s' % exc)
+
             self._uncertain_routes.discard(route_key)
             if (isinstance(self.last_error, dict) and
                     self.last_error.get('device') == device.name and
@@ -17119,6 +17651,9 @@ class BMCUManager(object):
         for endpoint_name in endpoint_names:
             if endpoint_name in conflicts:
                 continue
+            endpoint = self.endpoints.get(endpoint_name)
+            if endpoint is not None:
+                self._reconcile_u1_route_ownership(endpoint)
             if not self._routes_for_endpoint(
                     endpoint_name,
                     (protocol.ROUTE_LOADED, protocol.ROUTE_UNCERTAIN)):

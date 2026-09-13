@@ -4,7 +4,7 @@ Integration for Voron, VzBot and other Klipper-based printers.
 
 BMCU handles the channel, buffer, PTFE transport and source selection. The printer only needs to know how to take over the filament at the toolhead and how to release it safely afterward. In Generic, this is handled by two Klipper macros.
 
-Installation and updates are shared across all printers: [main README](../../README.md#installation-and-update). After updating the printer firmware or operating system, run the BMCU-Klipper installer again.
+Installation and updates are shared across all printers: [main README](../../README.md#installation-and-update). Generic currently requires systemd. After updating the printer firmware or operating system, run the BMCU-Klipper installer again.
 
 ## Required macros
 

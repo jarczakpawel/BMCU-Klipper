@@ -1344,6 +1344,26 @@ function renderOwnership() {
     else if (stock.user_auto_enabled === false) stockBadges.push(['Auto feed off', '']);
     replaceBadges(stockRow.querySelector('.source-badges'), stockBadges);
 
+    let restore = node.querySelector('.restore-native-feeder');
+    if (!restore) {
+      restore = document.createElement('button');
+      restore.type = 'button';
+      restore.className = 'small-action restore-native-feeder';
+      restore.textContent = 'Enable native auto feed';
+      stockRow.parentElement.append(restore);
+    }
+    restore.hidden = sources.length > 0 || owner.native_feeder_enabled !== false;
+    restore.disabled = ui.busy || lightingPreviewLocked() ||
+      path.known !== true || path.busy !== false ||
+      Boolean(owner.disconnect_hazards?.length) ||
+      Boolean(owner.persistent_journal?.tail_detached) ||
+      Boolean(owner.persistent_journal?.follower_pending);
+    restore.title = 'Enable and save native AUTO after all BMCU routes have been detached and the shared path is clear.';
+    restore.onclick = () => confirmAction('Enable native auto feed',
+      `Enable native auto feed for Head ${head + 1}? This preference will be saved. The shared path must be clear of BMCU filament.`,
+      () => run(`BMCU_SNAP_FEEDER ENDPOINT=${gcodeValue(name)} TAKEOVER=0 AUTO=1`,
+        {success: `Head ${head + 1} native auto feed enabled.`}));
+
     const sourceList = node.querySelector('.bmcu-source-list');
     if (!sources.length) {
       syncKeyed(sourceList, [{key: 'empty'}], (item) => item.key, () => {

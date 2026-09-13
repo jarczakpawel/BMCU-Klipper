@@ -556,6 +556,53 @@ def _clean_tool_mappings(raw, allow_native=False):
             cleaned[str(tool)] = entry
     return cleaned
 
+def _clean_u1_baseline_filament(raw):
+    if not isinstance(raw, dict):
+        return {}
+    result = {}
+    for key in ('filament_vendor', 'filament_type', 'filament_sub_type'):
+        value = raw.get(key)
+        if isinstance(value, str):
+            result[key] = _clean_text(value, '', 96)
+    for key in ('filament_soft', 'filament_official',
+                'filament_exist', 'filament_edit'):
+        value = raw.get(key)
+        if isinstance(value, (bool, int)) and int(value) in (0, 1):
+            result[key] = bool(value)
+    color = raw.get('filament_color')
+    if (isinstance(color, int) and not isinstance(color, bool) and
+            0 <= color <= 0xFFFFFFFF):
+        result['filament_color'] = color
+    rgba = raw.get('filament_color_rgba')
+    if isinstance(rgba, str) and re.fullmatch(r'[0-9A-Fa-f]{8}', rgba):
+        result['filament_color_rgba'] = rgba.upper()
+    sku = raw.get('filament_sku')
+    if isinstance(sku, int) and not isinstance(sku, bool) and sku >= 0:
+        result['filament_sku'] = min(sku, 0x7FFFFFFF)
+    multi = raw.get('filament_color_multi')
+    if isinstance(multi, dict):
+        nums = multi.get('nums')
+        alpha = multi.get('alpha')
+        mode = multi.get('mode')
+        colors = multi.get('colors')
+        if (isinstance(nums, int) and not isinstance(nums, bool) and
+                1 <= nums <= 5 and
+                isinstance(alpha, int) and not isinstance(alpha, bool) and
+                0 <= alpha <= 255 and
+                isinstance(mode, int) and not isinstance(mode, bool) and
+                0 <= mode <= 255 and
+                isinstance(colors, list) and len(colors) >= nums and
+                all(isinstance(item, str) and
+                    re.fullmatch(r'[0-9A-Fa-f]{6}', item)
+                    for item in colors[:nums])):
+            result['filament_color_multi'] = {
+                'nums': nums,
+                'alpha': alpha,
+                'colors': [item.upper() for item in colors[:nums]],
+                'mode': mode,
+            }
+    return result
+
 def _clean_u1_ownership(raw):
 
     cleaned = {}
@@ -578,8 +625,13 @@ def _clean_u1_ownership(raw):
                 record.get('baseline_captured'), False),
             'baseline_disabled': _clean_bool(
                 record.get('baseline_disabled'), False),
+            'baseline_filament': _clean_u1_baseline_filament(
+                record.get('baseline_filament')),
             'persistent_hold': _clean_bool(
                 record.get('persistent_hold'), False),
+            'native_auto_override_active': _clean_bool(
+                record.get('native_auto_override_active'),
+                _clean_bool(record.get('persistent_hold'), False)),
 
             'tail_detached': _clean_bool(
                 record.get('tail_detached'), False),
@@ -638,6 +690,13 @@ def _clean_u1_ownership(raw):
             clean_record['follower_device'] = ''
             clean_record['follower_uid'] = ''
             clean_record['follower_channel'] = -1
+        if (clean_record['route_state'] == 'EMPTY' and
+                not any(clean_record[key] for key in (
+                    'persistent_hold', 'generation_open', 'native_auto_override_active',
+                    'tail_detached', 'follower_pending'))):
+            clean_record['baseline_captured'] = False
+            clean_record['baseline_disabled'] = False
+            clean_record['baseline_filament'] = {}
         cleaned[endpoint] = clean_record
     return cleaned
 

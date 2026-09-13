@@ -23,7 +23,7 @@ The project core is prepared for additional printers and hardware adapters.
 
 ## Installation and update
 
-Installation is the same on every printer.
+The installer supports Snapmaker U1 and Generic Klipper hosts using systemd. Other service managers are not currently supported on Generic hosts.
 
 The simplest method is to run the installer directly on the Klipper host:
 
@@ -32,6 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/inst
 ```
 
 If BMCU-Klipper is already installed, the same command performs an update. After updating the printer firmware or operating system, run the installer again.
+
+When updating from v1.0.2, finish any BMCU operation, clear prestage/refill recovery and unload all BMCU routes. Stop the Klipper service, then run `sh ./install --assume-idle` from the extracted v1.0.3 package. `FIRMWARE_RESTART` is not enough because it does not stop the Klipper service. From v1.0.3 onward, use the normal installer command for updates.
 
 Panel:
 
@@ -60,7 +62,15 @@ From an extracted BMCU-Klipper package:
 sh ./uninstall
 ```
 
-The uninstaller removes components managed by BMCU-Klipper and restores modified host components.
+The uninstaller requires Klipper READY, an idle printer and empty BMCU routes. On Snapmaker U1 it restores the native feeder state before removing BMCU-Klipper.
+
+If Klipper cannot reach READY and every filament path is physically empty, use host recovery:
+
+```sh
+sh ./uninstall --host-recovery --confirm-paths-empty
+```
+
+Host recovery leaves Klipper stopped and cannot restore U1 feeder settings while Klipper is unavailable.
 
 ## First setup
 

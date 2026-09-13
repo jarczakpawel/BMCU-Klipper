@@ -13,11 +13,12 @@ class DurableWriteError(RuntimeError):
     pass
 
 class _Job(object):
-    def __init__(self, path, payload, mode, completion):
+    def __init__(self, path, payload, mode, completion, sync=False):
         self.path = path
         self.payload = payload
         self.mode = mode
         self.completion = completion
+        self.sync = sync
         self.event = threading.Event()
         self.result = None
         self.error = None
@@ -104,6 +105,23 @@ class DurableWriteWorker(object):
 
             pass
 
+    @staticmethod
+    def _sync_file(path):
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise DurableWriteError('durable sync target is not a regular file')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory_fd = os.open(
+            os.path.dirname(os.path.abspath(path)),
+            os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
     def _run(self):
         while True:
             job = self.queue.get()
@@ -112,7 +130,10 @@ class DurableWriteWorker(object):
                 return
             job.started = time.monotonic()
             try:
-                self._write_file(job.path, job.payload, job.mode)
+                if job.sync:
+                    self._sync_file(job.path)
+                else:
+                    self._write_file(job.path, job.payload, job.mode)
                 job.result = True
                 self.stats['writes'] += 1
             except Exception as exc:
@@ -132,7 +153,10 @@ class DurableWriteWorker(object):
         return bool(getattr(self.reactor, '_process', False) and
                     getattr(self.reactor, '_pipe_fds', None) is not None)
 
-    def write(self, path, payload, mode=0o600, timeout=30.0):
+    def sync(self, path, timeout=30.0):
+        return self.write(path, b'', mode=None, timeout=timeout, sync=True)
+
+    def write(self, path, payload, mode=0o600, timeout=30.0, sync=False):
         if self.closed:
             raise DurableWriteError('durable writer is closed')
         if isinstance(payload, str):
@@ -141,7 +165,7 @@ class DurableWriteWorker(object):
             raise DurableWriteError('durable payload must be bytes or text')
         completion_factory = getattr(self.reactor, 'completion', None)
         completion = completion_factory() if callable(completion_factory) else None
-        job = _Job(path, bytes(payload), mode, completion)
+        job = _Job(path, bytes(payload), mode, completion, sync=sync)
         try:
             self.queue.put_nowait(job)
         except queue.Full:

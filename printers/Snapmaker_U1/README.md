@@ -328,6 +328,18 @@ From the console:
 ./collect-logs --include-last-gcode
 ```
 
+`RESTART` and `FIRMWARE_RESTART` restart Klipper internally. They do not restart the BMCU sidecar processes. A Klipper service restart or printer reboot runs the service hooks.
+
+If the U1 planner is missing or unresponsive, BMCU attempts to restart it automatically. If recovery fails, check `bmcu-planner.log` and, over SSH:
+
+```sh
+ps | grep '[b]mcu_'
+```
+
+BMCU remembers the native feeder AUTO setting before taking ownership of a shared path and restores it when the last BMCU route is detached. If needed, use **Enable native auto feed** in the panel or [`BMCU_SNAP_FEEDER ... TAKEOVER=0 AUTO=1`](../../docs/COMMANDS.md#bmcu_snap_feeder).
+
+Do not edit `u1_ownership` by hand to clear a route mismatch. Use the panel's route confirmation/recovery controls instead.
+
 ## After a U1 firmware update
 
 After every Snapmaker firmware update:
@@ -347,6 +359,10 @@ sh ./uninstall
 ```
 
 The uninstaller removes managed BMCU components from `printer.cfg`, Klipper modules, runtime, serial-port access and the U1 hook.
+
+Normal uninstall requires Klipper READY, an idle printer and empty BMCU routes. The native feeder state is restored before the managed U1 components are removed.
+
+If Klipper cannot reach READY, see the [host recovery mode](../../README.md#uninstallation). Host recovery leaves Klipper stopped and cannot restore native AUTO while Klipper is unavailable.
 
 For the 24 V configuration, helper backups are stored in:
 
