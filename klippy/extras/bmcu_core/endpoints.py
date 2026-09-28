@@ -2382,6 +2382,16 @@ class SnapmakerU1Endpoint(Endpoint):
                                 for item in colors[:nums])):
                         error = 'unsupported U1 print_task_config schema: filament_color_multi[%d] is invalid' % head
                         break
+                if error is None and 'filament_spool_id' in config:
+                    spool_ids = config.get('filament_spool_id')
+                    if not isinstance(spool_ids, list) or len(spool_ids) < 4:
+                        error = 'unsupported U1 print_task_config schema: filament_spool_id length must be >= 4'
+                    else:
+                        for head, spool_id in enumerate(spool_ids[:4]):
+                            if (not isinstance(spool_id, int) or isinstance(spool_id, bool) or
+                                    spool_id < 0):
+                                error = 'unsupported U1 print_task_config schema: filament_spool_id[%d] is invalid' % head
+                                break
                 if error is None:
                     for logical, physical in enumerate(config['extruder_map_table'][:32]):
                         if (not isinstance(physical, int) or isinstance(physical, bool) or
@@ -2411,7 +2421,7 @@ class SnapmakerU1Endpoint(Endpoint):
         value = config['filament_color_multi'][head]
         colors = tuple(str(item or '').lstrip('#').upper()
                        for item in value.get('colors', [])[:5])
-        return (
+        result = (
             str(config['filament_vendor'][head]),
             str(config['filament_type'][head]),
             str(config['filament_sub_type'][head]),
@@ -2427,6 +2437,10 @@ class SnapmakerU1Endpoint(Endpoint):
             bool(config['filament_exist'][head]),
             bool(config['filament_edit'][head]),
         )
+        spool_ids = config.get('filament_spool_id')
+        if isinstance(spool_ids, list) and head < len(spool_ids):
+            result += (int(spool_ids[head]),)
+        return result
 
     @staticmethod
     def _projection_color_coherent(config, head):
@@ -2443,13 +2457,16 @@ class SnapmakerU1Endpoint(Endpoint):
         return int(config['filament_color'][head]) == expected
 
     @staticmethod
-    def _projection_fields():
-        return (
+    def _projection_fields(config=None):
+        fields = (
             'filament_vendor', 'filament_type', 'filament_sub_type',
             'filament_soft', 'filament_color', 'filament_color_rgba',
             'filament_color_multi', 'filament_official', 'filament_sku',
             'filament_exist', 'filament_edit',
         )
+        if isinstance(config, dict) and 'filament_spool_id' in config:
+            fields += ('filament_spool_id',)
+        return fields
 
     def _wait_native_filament_quiescent(self, required=None):
         if required is None:
@@ -2561,6 +2578,8 @@ class SnapmakerU1Endpoint(Endpoint):
             len(color_list), 255, tuple(color_list), color_mode,
             False, 0, True, True,
         )
+        if 'filament_spool_id' in config:
+            desired += (0,)
         current = self._projection_tuple(config, head)
         if current == desired:
             self._last_runtime_metadata = desired
@@ -2573,7 +2592,7 @@ class SnapmakerU1Endpoint(Endpoint):
             return False
 
         snapshot = {key: copy.deepcopy(config[key][head])
-                    for key in self._projection_fields()}
+                    for key in self._projection_fields(config)}
         material_changed = current[:4] != desired[:4]
         try:
             config['filament_vendor'][head] = vendor
@@ -2588,6 +2607,8 @@ class SnapmakerU1Endpoint(Endpoint):
             }
             config['filament_official'][head] = False
             config['filament_sku'][head] = 0
+            if 'filament_spool_id' in config:
+                config['filament_spool_id'][head] = 0
             config['filament_exist'][head] = True
             config['filament_edit'][head] = True
             self._backup_head(task, head)
@@ -2619,7 +2640,7 @@ class SnapmakerU1Endpoint(Endpoint):
             'head': head,
             'projection': {
                 key: copy.deepcopy(config[key][head])
-                for key in self._projection_fields()
+                for key in self._projection_fields(config)
             },
             'projection_tuple': self._projection_tuple(config, head),
             'runtime_metadata': copy.deepcopy(self._last_runtime_metadata),
@@ -2634,11 +2655,11 @@ class SnapmakerU1Endpoint(Endpoint):
         target_tuple = snapshot.get('projection_tuple')
         if not isinstance(projection, dict) or not isinstance(target_tuple, tuple):
             raise EndpointError('invalid U1 filament projection snapshot')
-        fields = self._projection_fields()
-        if any(key not in projection for key in fields):
-            raise EndpointError('incomplete U1 filament projection snapshot')
 
         task, config = self._task_config(strict=True)
+        fields = self._projection_fields(config)
+        if any(key not in projection for key in fields):
+            raise EndpointError('incomplete U1 filament projection snapshot')
         head = self._head()
         current_projection = {
             key: copy.deepcopy(config[key][head]) for key in fields
@@ -2700,8 +2721,10 @@ class SnapmakerU1Endpoint(Endpoint):
             'NONE', 'NONE', 'NONE', False, 0xFFFFFFFF, 'FFFFFFFF',
             1, 255, ('FFFFFF',), 0, False, 0, False, True,
         )
+        if 'filament_spool_id' in config:
+            empty += (0,)
         snapshot = {key: copy.deepcopy(config[key][head])
-                    for key in self._projection_fields()}
+                    for key in self._projection_fields(config)}
         previous_source = self._last_runtime_source
         previous_metadata = self._last_runtime_metadata
         previous_cache_dirty = self._native_cache_dirty
@@ -2722,6 +2745,8 @@ class SnapmakerU1Endpoint(Endpoint):
             }
             config['filament_official'][head] = False
             config['filament_sku'][head] = 0
+            if 'filament_spool_id' in config:
+                config['filament_spool_id'][head] = 0
             config['filament_exist'][head] = False
             config['filament_edit'][head] = True
             self._backup_head(task, head)
@@ -3293,19 +3318,35 @@ class SnapmakerU1Endpoint(Endpoint):
         profile = self._capture_signal_profile(
             context.get('material', material))
 
-        presence_threshold = max(100.0, float(profile['threshold']) / 3.0)
+        presence_divisor = 3.0 if soft else 3.75
+        presence_threshold = max(
+            100.0, float(profile['threshold']) / presence_divisor)
         path_baseline = _coerce_finite_float(
             context.get('coil_path_baseline'))
 
         started = self.manager.reactor.monotonic()
         self.extrude(remaining, speed)
+        self.manager.reactor.pause(
+            self.manager.reactor.monotonic() + 0.100)
         final_end = self.capture_signal()
-        elapsed = max(0.0, self.manager.reactor.monotonic() - started)
+        final_reads = 1
 
         path_delta = None
         if path_baseline is not None and final_end is not None:
             path_delta = abs(float(final_end) - float(path_baseline))
 
+        if path_delta is None or path_delta < presence_threshold:
+            self.manager.reactor.pause(
+                self.manager.reactor.monotonic() + 0.100)
+            retry_end = self.capture_signal()
+            final_reads = 2
+            if path_baseline is not None and retry_end is not None:
+                retry_delta = abs(float(retry_end) - float(path_baseline))
+                if path_delta is None or retry_delta > path_delta:
+                    final_end = retry_end
+                    path_delta = retry_delta
+
+        elapsed = max(0.0, self.manager.reactor.monotonic() - started)
         coil_delta = path_delta
         coil_confirmed = bool(
             coil_delta is not None and coil_delta >= presence_threshold)
@@ -3324,6 +3365,7 @@ class SnapmakerU1Endpoint(Endpoint):
         self.config['_u1_last_coil_path_delta'] = (
             None if path_delta is None else float(path_delta))
         self.config['_u1_last_coil_confirmed'] = bool(coil_confirmed)
+        self.config['_u1_last_coil_final_reads'] = int(final_reads)
         self.config['_u1_last_toolhead_verify_elapsed_s'] = float(elapsed)
 
         logging.info(
@@ -3331,21 +3373,22 @@ class SnapmakerU1Endpoint(Endpoint):
             'stock_total=%.1fmm already_confirmed=%.1fmm remaining=%.1fmm '
             'speed=%.1fmm/min material=%s soft=%d nozzle=%.3f '
             'path_start=%s final_end=%s path_delta=%s gentle_threshold=%.1f '
-            'confirmed=%d coil_queries=2 elapsed=%.3fs',
+            'confirmed=%d final_reads=%d elapsed=%.3fs',
             self._head() + 1, total_distance, confirmed_advance, remaining,
             speed, context.get('material', 'UNKNOWN'), 1 if soft else 0,
             nozzle,
             'unavailable' if path_baseline is None else '%.1f' % path_baseline,
             'unavailable' if final_end is None else '%.1f' % final_end,
             'unavailable' if path_delta is None else '%.1f' % path_delta,
-            presence_threshold, 1 if coil_confirmed else 0, elapsed)
+            presence_threshold, 1 if coil_confirmed else 0, final_reads, elapsed)
         if getattr(self.manager, 'debug_enabled', False):
             self.manager._debug_log(
                 'U1 %s minimal coil evidence path_start=%s final_end=%s '
-                'path_delta=%s threshold=%.1f confirmed=%d '
+                'path_delta=%s threshold=%.1f confirmed=%d final_reads=%d '
+                'settle_ms=100 retry_ms=100 '
                 'boundary_queries_skipped=BITE,CAPTURE,FINAL_START',
                 self.name, path_baseline, final_end, path_delta,
-                presence_threshold, 1 if coil_confirmed else 0)
+                presence_threshold, 1 if coil_confirmed else 0, final_reads)
             live_context = (
                 self._load_temperature_context
                 if isinstance(self._load_temperature_context, dict) else {})
@@ -3361,13 +3404,12 @@ class SnapmakerU1Endpoint(Endpoint):
             raise EndpointError(
                 'U1_TOOLHEAD_NOT_LOADED: Head %d saw no convincing downstream '
                 'start-to-finish coil response during the normal BEFORE_ON_USE '
-                'path (path_delta=%s, gentle_required>=%.1f). Exactly two '
-                'read-only stock coil queries were used and no extra movement, '
-                'dwell, retry or sampling loop was added; BMCU pressure and '
-                'Head motion were stopped before prime.' %
+                'path (path_delta=%s, gentle_required>=%.1f) after %d final '
+                'read(s). BMCU pressure and Head motion were stopped before '
+                'prime.' %
                 (self._head() + 1,
                  'unavailable' if path_delta is None else '%.1f' % path_delta,
-                 presence_threshold))
+                 presence_threshold, final_reads))
 
         logging.info(
             'BMCU Snapmaker Head %d minimal coil evidence accepted; '
@@ -3384,8 +3426,70 @@ class SnapmakerU1Endpoint(Endpoint):
                 None if path_baseline is None else float(path_baseline)),
             'remaining_mm': float(remaining),
             'elapsed_s': float(elapsed),
-            'sampling_delay_s': 0.0,
+            'sampling_delay_s': 0.100 * final_reads,
+            'coil_final_reads': int(final_reads),
             'extra_verification_motion_mm': 0.0,
+        }
+
+    def verify_loaded_after_pause(self, material='', baseline=None, threshold=None):
+        baseline = _coerce_finite_float(baseline)
+        threshold = _coerce_finite_float(threshold)
+        if baseline is None or threshold is None or threshold < 100.0:
+            raise EndpointError(
+                'U1_TOOLHEAD_RECOVERY_EVIDENCE_MISSING: Head %d has no valid '
+                'coil baseline/threshold for automatic recovery' %
+                (self._head() + 1))
+
+        started = self.manager.reactor.monotonic()
+        self.manager.reactor.pause(
+            self.manager.reactor.monotonic() + 0.100)
+        final_end = self.capture_signal()
+        reads = 1
+        delta = (None if final_end is None else
+                 abs(float(final_end) - float(baseline)))
+        if delta is None or delta < threshold:
+            self.manager.reactor.pause(
+                self.manager.reactor.monotonic() + 0.100)
+            retry_end = self.capture_signal()
+            reads = 2
+            if retry_end is not None:
+                retry_delta = abs(float(retry_end) - float(baseline))
+                if delta is None or retry_delta > delta:
+                    final_end = retry_end
+                    delta = retry_delta
+
+        confirmed = bool(delta is not None and delta >= threshold)
+        self.config['_u1_last_coil_delta'] = (
+            None if delta is None else float(delta))
+        self.config['_u1_last_coil_path_delta'] = (
+            None if delta is None else float(delta))
+        self.config['_u1_last_coil_confirmed'] = bool(confirmed)
+        self.config['_u1_last_coil_final_reads'] = int(reads)
+        self.config['_u1_last_toolhead_verify_elapsed_s'] = max(
+            0.0, self.manager.reactor.monotonic() - started)
+        logging.info(
+            'BMCU Snapmaker Head %d paused BEFORE_ON_USE recovery: '
+            'baseline=%.1f final=%s delta=%s threshold=%.1f confirmed=%d '
+            'reads=%d',
+            self._head() + 1, baseline,
+            'unavailable' if final_end is None else '%.1f' % final_end,
+            'unavailable' if delta is None else '%.1f' % delta,
+            threshold, 1 if confirmed else 0, reads)
+        if not confirmed:
+            raise EndpointError(
+                'U1_TOOLHEAD_NOT_LOADED: Head %d still has no convincing '
+                'coil response during automatic RESUME recovery '
+                '(path_delta=%s, required>=%.1f)' %
+                (self._head() + 1,
+                 'unavailable' if delta is None else '%.1f' % delta,
+                 threshold))
+        self.run_macro('load_ready_macro', endpoint=self.name, material=material)
+        return {
+            'coil_confirmed': True,
+            'coil_delta': float(delta),
+            'coil_threshold': float(threshold),
+            'coil_baseline': float(baseline),
+            'coil_final_reads': int(reads),
         }
 
     def _native_preextrude(self, material='', refill=False, temperature_profile=None):

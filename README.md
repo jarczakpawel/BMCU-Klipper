@@ -4,6 +4,12 @@ BMCU is an open **Multi Color Unit**, originally designed for Bambu Lab printers
 
 BMCU-Klipper is an integration with an open system, so channel routing, toolhead assignments, load/unload, refill, prestaging, tip forming and source planning can be adapted precisely to a specific printer. You do not need to adapt the printer to a closed ecosystem - here you can change both BMCU behavior and the way it works with the printer, and every part of the integration can later be improved or modified for your own needs.
 
+### Snapmaker U1 - video guide
+
+[Watch the complete BMCU-Klipper installation, configuration and real-world demonstration on Snapmaker U1](https://www.youtube.com/watch?v=mTMcayuyzYw).
+
+BMCU-Klipper is also compatible with PAXX12 Extended Firmware on Snapmaker U1. Installation is the same as on the stock firmware.
+
 One of the most important goals of the project was to keep the integration as lightweight as possible so that BMCU also works on weaker Klipper hosts. Each module has its own process handling USB/UART transport, while G-code analysis and planning of future source changes run in a separate process. The module running in Klipper only receives small batches of prepared data - by default at most 2 packets, 256 B and 0.5 ms of work per reactor entry - and then returns control to Klipper. Subsequent state updates are merged, background tasks are deferred while the printer is moving, and BMCU reactor activity is completely suppressed during homing and probing. When nothing is happening, the manager automatically reduces its polling frequency. Motors, the buffer and current filament transport are controlled by BMCU firmware, so the printer's main MCU does not receive this workload.
 
 In my tests, the impact of the integration is unnoticeable. It was meant to be feather-light, and in my opinion that goal has been achieved.

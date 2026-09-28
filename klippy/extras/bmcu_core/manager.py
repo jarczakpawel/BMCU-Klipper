@@ -296,6 +296,7 @@ class BMCUManager(object):
         self._u1_planner_last_scan_ms = 0.0
         self._u1_pending_temperature_profile = None
         self._u1_background_jobs = {}
+        self._u1_toolchange_resume_pending = {}
         self.last_error = None
         self.last_diagnostic = None
         self._last_poll = {}
@@ -3369,6 +3370,8 @@ class BMCUManager(object):
                 self.print_stock_reset_observed),
             'u1_cross_refill_pending': copy.deepcopy(
                 self.u1_cross_refill_pending),
+            'u1_toolchange_resume_pending': copy.deepcopy(
+                self._u1_toolchange_resume_pending),
             'print_refill_backups': {
                 str(tool): [dict(item) for item in items]
                 for tool, items in getattr(self.refill, 'print_backups', {}).items()
@@ -8174,6 +8177,7 @@ class BMCUManager(object):
         self.print_transaction_phase = ''
         self._u1_preextrude_primed_tools.clear()
         self._u1_prepared_heads.clear()
+        self._u1_toolchange_resume_pending.clear()
         self._reset_u1_lookahead(stop_jobs=False)
         if not preserve_loaded:
             self.print_loaded_routes.clear()
@@ -12034,6 +12038,36 @@ class BMCUManager(object):
                         logging.exception(
                             'BMCU could not roll back Endpoint %s material projection',
                             endpoint.name)
+            if (endpoint.driver == 'snapmaker_u1' and tool >= 0 and
+                    target_physically_captured and phase == 'BEFORE_ON_USE' and
+                    self._print_state() in ('printing', 'paused', 'pause') and
+                    'U1_TOOLHEAD_NOT_LOADED:' in str(exc)):
+                try:
+                    device.refresh()
+                    recovery_route_state = self._route_states_from_status(
+                        device.status)[channel]
+                    if recovery_route_state in (
+                            protocol.ROUTE_UNCERTAIN, protocol.ROUTE_LOADED):
+                        self._u1_toolchange_resume_pending = {
+                            'kind': 'before_on_use',
+                            'phase': 'verify',
+                            'tool': int(tool),
+                            'device': device.name,
+                            'channel': int(channel),
+                            'endpoint': endpoint.name,
+                            'route_state': int(recovery_route_state),
+                            'coil_baseline': endpoint.config.get(
+                                '_u1_last_coil_baseline'),
+                            'coil_threshold': endpoint.config.get(
+                                '_u1_last_coil_threshold'),
+                        }
+                        logging.warning(
+                            'BMCU armed automatic U1 T%d BEFORE_ON_USE recovery '
+                            'for %s Channel %d on normal RESUME',
+                            int(tool), device.name, channel + 1)
+                except Exception:
+                    logging.exception(
+                        'BMCU could not arm automatic U1 BEFORE_ON_USE recovery')
             preserve_target_hold = bool(
                 getattr(exc, 'preserve_bmcu_hold', False))
             if (source_device is not None and
@@ -14409,6 +14443,145 @@ class BMCUManager(object):
                 'BMCU selected generic External T0; manual filament is not tracked')
         return True
 
+    def _resume_u1_toolchange_before_on_use(
+            self, tool, plan_index, temperature_profile, gcmd=None):
+        pending = self._u1_toolchange_resume_pending
+        if not isinstance(pending, dict) or pending.get('kind') != 'before_on_use':
+            return False
+        if int(pending.get('tool', -1)) != int(tool):
+            raise BMCUError(
+                'U1 toolchange recovery for T%d is pending before T%d' %
+                (int(pending.get('tool', -1)), int(tool)))
+        if self.active_operations or self._u1_background_jobs:
+            raise BMCUError(
+                'U1 toolchange recovery cannot run while BMCU motion is active')
+        if (self._critical_motion_active or self._critical_motion_depth):
+            raise BMCUError(
+                'U1 toolchange recovery cannot run during printer motion')
+
+        device, channel, endpoint = self._resolve_tool(int(tool))
+        if (device.name != pending.get('device') or
+                int(channel) != int(pending.get('channel', -1)) or
+                endpoint.name != pending.get('endpoint')):
+            raise BMCUError(
+                'U1 toolchange recovery route changed while the print was paused')
+
+        recovery_phase = str(pending.get('phase', 'verify') or 'verify')
+        if recovery_phase not in ('verify', 'primed', 'loaded'):
+            raise BMCUError('invalid U1 toolchange recovery phase')
+        self._lock(
+            device, endpoint, 'RESUME BEFORE_ON_USE T%d' % int(tool),
+            channel=channel)
+        load_temperature_finalized = False
+        try:
+            device.refresh()
+            route_state = self._route_states_from_status(device.status)[channel]
+            expected_route = (protocol.ROUTE_LOADED if recovery_phase == 'loaded'
+                              else int(pending.get(
+                                  'route_state', protocol.ROUTE_UNCERTAIN)))
+            if expected_route not in (
+                    protocol.ROUTE_UNCERTAIN, protocol.ROUTE_LOADED):
+                raise BMCUError('invalid U1 toolchange recovery route state')
+            if route_state != expected_route:
+                raise BMCUError(
+                    '%s Channel %d recovery expected %s route, got %s' %
+                    (device.name, channel + 1,
+                     protocol.ROUTE_NAMES.get(expected_route, 'UNKNOWN'),
+                     protocol.ROUTE_NAMES.get(route_state, 'UNKNOWN')))
+            present = device.status.get('present', [])
+            if (not isinstance(present, (list, tuple)) or
+                    channel >= len(present) or not bool(present[channel])):
+                raise BMCUError(
+                    '%s Channel %d input no longer detects filament' %
+                    (device.name, channel + 1))
+
+            endpoint.select()
+            endpoint.verify_selected()
+            material = self._channel_metadata(device, channel).get('material', '')
+
+            if recovery_phase == 'verify':
+                self._set_phase(device, 'RESUME_BEFORE_ON_USE_VERIFY')
+                endpoint.verify_loaded_after_pause(
+                    material=material,
+                    baseline=pending.get('coil_baseline'),
+                    threshold=pending.get('coil_threshold'))
+                endpoint.suspend_managed_sensors()
+                self._endpoint_temperature_call(
+                    endpoint, 'prepare_load', material, temperature_profile,
+                    discard_position_prepared=True)
+                self._set_phase(device, 'RESUME_PRIME')
+                self._endpoint_temperature_call(
+                    endpoint, 'prime', material, temperature_profile)
+                pending['phase'] = 'primed'
+                recovery_phase = 'primed'
+
+            if recovery_phase == 'primed':
+                self._set_phase(device, 'RESUME_ON_USE')
+                device.set_motion(channel, protocol.MOTION_ON_USE)
+                device.refresh()
+                if self._route_states_from_status(
+                        device.status)[channel] != protocol.ROUTE_LOADED:
+                    raise BMCUError(
+                        '%s Channel %d did not commit LOADED during recovery' %
+                        (device.name, channel + 1))
+                pending['phase'] = 'loaded'
+
+            self._clear_u1_tail_detached(
+                endpoint, device, channel,
+                'resumed BEFORE_ON_USE completed')
+            self._commit_u1_route_ownership(
+                device, channel, protocol.ROUTE_LOADED)
+            endpoint.activate_runtime_sensor_takeover()
+            if hasattr(endpoint, 'sync_active_filament'):
+                endpoint.sync_active_filament(
+                    self._channel_metadata(device, channel))
+            route_key = self._route_key(device, channel)
+            self.loaded_tools[route_key] = int(tool)
+            self.active_tool = int(tool)
+            self._mark_print_route_loaded(device, channel, int(tool))
+            self.prestaged.pop(route_key, None)
+            self._u1_toolchange_resume_pending.clear()
+
+            finish_load_temperature = getattr(
+                endpoint, 'finish_load_temperature', None)
+            if callable(finish_load_temperature):
+                if not finish_load_temperature(success=True):
+                    raise BMCUError(
+                        'Snapmaker Head %d did not restore its working '
+                        'temperature after recovered load' %
+                        (endpoint._head() + 1))
+                load_temperature_finalized = True
+            finish_load_position = getattr(endpoint, 'finish_load_position', None)
+            if callable(finish_load_position) and not finish_load_position():
+                raise BMCUError(
+                    'Snapmaker Head %d did not reach the stock XY idle '
+                    'position after recovered load' % (endpoint._head() + 1))
+
+            self._u1_preextrude_primed_tools[int(tool)] = (
+                self.reactor.monotonic())
+            self._mark_u1_head_prepared(
+                endpoint.get('head_index', -1),
+                source='recovered BMCU T%d' % int(tool))
+            self._activate_u1_logical_tool(int(tool), endpoint)
+            self._commit_u1_toolchange(plan_index)
+            self._save_runtime()
+            if gcmd is not None:
+                gcmd.respond_info(
+                    'BMCU recovered interrupted T%d toolchange and resumed '
+                    'from BEFORE_ON_USE' % int(tool))
+            return True
+        finally:
+            finish_load_temperature = getattr(
+                endpoint, 'finish_load_temperature', None)
+            if (not load_temperature_finalized and
+                    callable(finish_load_temperature)):
+                try:
+                    finish_load_temperature(success=False)
+                except Exception:
+                    logging.exception(
+                        'BMCU could not restore U1 temperature after recovery failure')
+            self._unlock(device, endpoint)
+
     def cmd_TOOL_CHANGE(self, gcmd):
         self._require_standalone_operation('BMCU_TOOL_CHANGE', gcmd)
         tool = gcmd.get_int('TOOL', minval=0, maxval=255)
@@ -14429,6 +14602,10 @@ class BMCUManager(object):
                 if is_snapmaker else -1
             temperature_profile = (self._u1_temperature_profile(
                 plan_index, tool=tool) if is_snapmaker else None)
+            if (is_snapmaker and self._u1_toolchange_resume_pending and
+                    self._resume_u1_toolchange_before_on_use(
+                        tool, plan_index, temperature_profile, gcmd=gcmd)):
+                return
             target_route = self._u1_logical_route(tool) \
                 if is_snapmaker else None
             if is_snapmaker and target_route is not None:
