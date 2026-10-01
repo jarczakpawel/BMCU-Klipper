@@ -39,8 +39,6 @@ curl -fsSL https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/inst
 
 If BMCU-Klipper is already installed, the same command performs an update. After updating the printer firmware or operating system, run the installer again.
 
-When updating from v1.0.2, finish any BMCU operation, clear prestage/refill recovery and unload all BMCU routes. Stop the Klipper service, then run `sh ./install --assume-idle` from the extracted v1.0.3 package. `FIRMWARE_RESTART` is not enough because it does not stop the Klipper service. From v1.0.3 onward, use the normal installer command for updates.
-
 Panel:
 
 ```text

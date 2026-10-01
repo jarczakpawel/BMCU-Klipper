@@ -325,7 +325,7 @@ BMCU_PRINT_COMMIT</pre>
   <dialog id="calibrationSafetyDialog" class="dialog">
     <form method="dialog" class="dialog-card">
       <div class="dialog-head"><div><h2 id="calibrationSafetyTitle">Prepare channels for calibration</h2></div><button class="icon-button" value="cancel" type="submit" aria-label="Close">×</button></div>
-      <p class="dialog-copy">Completely remove filament from every selected connected channel. Calibration measures the empty buffer path only. The magnetic filament-movement sensor is verified automatically during autoload or a real load. The status below updates automatically.</p>
+      <p class="dialog-copy">Before calibration, completely remove all filament from every selected connected channel, including from the BMCU input openings. No filament may touch or press the input detector switch used for automatic filament loading, because its no-filament reference is also calibrated during this procedure. During calibration, follow the LEDs exactly: when the channel lights BLUE, press the buffer fully DOWN to its lower end and release it; when it lights RED, pull the buffer fully UP to its upper end and release it. The status below updates automatically.</p>
       <div class="flash-safety-table-wrap">
         <table class="flash-safety-table">
           <thead><tr><th>Channel</th><th>Input detector</th><th>Route</th></tr></thead>

@@ -1317,12 +1317,11 @@ def prepare_live_update(base, moonraker_gcode):
 
     version = str(bmcu.get('package_version', '') or 'unknown')
     if 'BMCU_PREPARE_UPDATE' not in commands:
-        raise InstallError(
-            'running BMCU %s does not provide the safe live-update barrier; '
-            'when upgrading from public release 1.0.2, finish BMCU operations '
-            'and refill recovery, clear prestage and unload the routes, stop '
-            'the Klipper OS service, then rerun sh ./install --assume-idle. '
-            'FIRMWARE_RESTART does not stop the service' % version)
+        return {
+            'mode': 'service-stop',
+            'cancel': '',
+            'version': version,
+        }
     command = 'BMCU_PREPARE_UPDATE'
     cancel = 'BMCU_PREPARE_UPDATE ACTION=CANCEL'
     mode = 'update'
@@ -2789,7 +2788,13 @@ def repair_existing(snapshot, plan, service, target_user, target_group, target_p
             update_preparation = prepare_live_update(
                 moonraker, moonraker_gcode)
             if isinstance(update_preparation, dict):
-                print('BMCU motion quiesced for host update.')
+                if update_preparation.get('mode') == 'service-stop':
+                    print(
+                        'Running BMCU %s has no live-update barrier; using the '
+                        'automatic service-stop update path.' %
+                        update_preparation.get('version', 'unknown'))
+                else:
+                    print('BMCU motion quiesced for host update.')
             else:
                 print(
                     'Running Klipper has no BMCU object; continuing repair '

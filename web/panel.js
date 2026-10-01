@@ -90,9 +90,9 @@ function cloneState(value) {
 const CAL_STAGE = {
   0: 'Preparing',
   1: 'Release all buffers - reading neutral position',
-  2: 'Move the lit buffer to one end, then release it',
+  2: 'BLUE light: press the lit buffer fully DOWN to the lower end, then release it',
   3: 'Release the lit buffer',
-  4: 'Move the lit buffer to the opposite end, then release it',
+  4: 'RED light: pull the lit buffer fully UP to the upper end, then release it',
   5: 'Release the lit buffer',
   6: 'Testing motor and magnetic encoder, then saving',
 };

@@ -17236,15 +17236,16 @@ class BMCUManager(object):
                 input_present = bool(present_values[channel])
 
                 durable_tail = self._durable_tail_route(device, channel)
-                if durable_tail is not None:
-                    if not durable_tail.get('routed'):
-                        raise gcmd.error(
-                            '%s Channel %d has a detached tail but its original '
-                            'Endpoint is missing or no longer assigned; restore '
-                            'that routing first' % (device.name, channel + 1))
+                if durable_tail is not None and not durable_tail.get('routed'):
+                    raise gcmd.error(
+                        '%s Channel %d has a detached tail but its original '
+                        'Endpoint is missing or no longer assigned; restore '
+                        'that routing first' % (device.name, channel + 1))
+                if (durable_tail is not None and
+                        (endpoint is None or endpoint.driver != 'snapmaker_u1')):
                     raise gcmd.error(
                         '%s Channel %d still has a detached tail in the downstream '
-                        'path; finish the tail handoff before confirming an empty toolhead route' %
+                        'path; finish the tail handoff before confirming an empty route' %
                         (device.name, channel + 1))
 
                 if state == 'EMPTY' and input_present:
@@ -17259,7 +17260,11 @@ class BMCUManager(object):
 
                 if endpoint is not None and endpoint.driver == 'snapmaker_u1':
                     try:
-                        native_sensor_snapshot = endpoint.entry_sensor_snapshot()
+                        native_sensor_snapshot = (
+                            endpoint.require_entry_sensor_snapshot(
+                                timeout=1.25, expected=False)
+                            if durable_tail is not None else
+                            endpoint.entry_sensor_snapshot())
                         native_path = endpoint.native_path_status(
                             sensor_snapshot=native_sensor_snapshot,
                             route_empty_verified=True)
