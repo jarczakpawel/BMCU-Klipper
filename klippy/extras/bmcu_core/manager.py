@@ -2431,7 +2431,8 @@ class BMCUManager(object):
         started = self.reactor.monotonic()
         try:
             self._reconcile_u1_leases(eventtime)
-            self._next_u1_lease_check = 0.0
+            self._next_u1_lease_check = (
+                self.reactor.monotonic() + 2.0 if self._u1_lease_dirty else 0.0)
         except Exception:
             self._u1_lease_dirty = True
 
@@ -5755,96 +5756,116 @@ class BMCUManager(object):
 
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
+        path_group = endpoint.shared_path_group()
+        if (endpoint.name in self.endpoint_locks or
+                path_group in self.path_locks):
+            raise BMCUError('%s has an active transition or path lock' % endpoint.name)
+        self.endpoint_locks.add(endpoint.name)
+        self.path_locks.add(path_group)
         record = self._u1_ownership_record(endpoint.name)
-        if self._endpoint_has_loaded_or_active_route(endpoint.name):
-            raise BMCUError(
-                '%s still has a loaded/active BMCU route' % endpoint.name)
-        self._refresh_u1_disconnect_hazards(endpoint.name)
-        if self._u1_disconnect_hazards.get(endpoint.name):
-            raise BMCUError(
-                '%s has an unresolved BMCU disconnect hazard' % endpoint.name)
-        assigned = self._assigned_routes_for_endpoint(endpoint.name)
-        unverified = [
-            device.name for device, _channel in assigned
-            if device.name not in self._u1_devices_reconciled_once]
-        if unverified:
-            raise BMCUError(
-                '%s route snapshot is not verified for: %s' %
-                (endpoint.name, ', '.join(sorted(set(unverified)))))
-        path = endpoint.native_path_status()
-        if not path.get('known') or path.get('busy'):
-            raise BMCUError(
-                '%s shared path is not positively EMPTY (%s)' %
-                (endpoint.name, path.get('channel_state', 'unknown')))
-
-        generation_open = bool(record.get('generation_open', False))
-        if auto is not None:
-            previous = dict(record)
-            record['baseline_captured'] = True
-            record['baseline_disabled'] = not bool(auto)
-            record['generation_open'] = True
-            record['native_auto_override_active'] = True
-            try:
-                self.state.save()
-            except Exception:
-                record.clear()
-                record.update(previous)
-                raise
-            endpoint.restore_native_feeder(save=True, enabled=bool(auto))
-        elif (record.get('baseline_captured') and
-              (generation_open or record.get('native_auto_override_active'))):
-            enabled = not bool(record.get('baseline_disabled', False))
-
-            endpoint.restore_native_feeder(save=True, enabled=enabled)
-        elif (record.get('persistent_hold') or
-              record.get('native_auto_override_active')):
-
-            raise BMCUError(
-                '%s has a persistent BMCU hold without an open captured '
-                'baseline generation; exact recovery is required' % endpoint.name)
-        else:
-            feeder = self._u1_native_feeder_status(endpoint, strict=True)
-            if require_restore and bool(feeder.get('disable_auto', False)):
-                raise BMCUError(
-                    '%s native AUTO is disabled and no open baseline is '
-                    'available; to enable it explicitly use '
-                    'BMCU_SNAP_FEEDER ENDPOINT=%s TAKEOVER=0 AUTO=1' %
-                    (endpoint.name, endpoint.name))
-        endpoint.release_runtime_sensor_takeover()
-        previous = dict(record)
-        record['persistent_hold'] = False
-        record['native_auto_override_active'] = False
-        record['tail_detached'] = False
-        record['tail_sensor_cleared'] = False
-        record['follower_pending'] = False
-        record['follower_kind'] = 'bmcu'
-        record['follower_device'] = ''
-        record['follower_uid'] = ''
-        record['follower_channel'] = -1
-        record['follower_tool'] = -1
-        record['route_state'] = 'EMPTY'
-        record['device'] = ''
-        record['device_uid'] = ''
-        record['channel'] = -1
-        if close_generation:
-
-            record['generation_open'] = False
-            record['baseline_captured'] = False
-            record['baseline_disabled'] = False
-            record['baseline_filament'] = {}
-        record['reason'] = str(reason or 'verified EMPTY handoff')[:160]
+        original_record = copy.deepcopy(record)
+        restore_disabled = None
+        restore_attempted = False
         try:
+            if self._endpoint_has_loaded_or_active_route(endpoint.name):
+                raise BMCUError(
+                    '%s still has a loaded/active BMCU route' % endpoint.name)
+            self._refresh_u1_disconnect_hazards(endpoint.name)
+            if self._u1_disconnect_hazards.get(endpoint.name):
+                raise BMCUError(
+                    '%s has an unresolved BMCU disconnect hazard' % endpoint.name)
+            assigned = self._assigned_routes_for_endpoint(endpoint.name)
+            unverified = [
+                device.name for device, _channel in assigned
+                if device.name not in self._u1_devices_reconciled_once]
+            if unverified:
+                raise BMCUError(
+                    '%s route snapshot is not verified for: %s' %
+                    (endpoint.name, ', '.join(sorted(set(unverified)))))
+            endpoint.require_entry_sensor_snapshot(timeout=1.25, expected=False)
+            if (self._endpoint_has_loaded_or_active_route(endpoint.name) or
+                    self._u1_disconnect_hazards.get(endpoint.name)):
+                raise BMCUError(
+                    '%s route changed during EMPTY verification' % endpoint.name)
+            path = endpoint.native_path_status()
+            if not path.get('known') or path.get('busy'):
+                raise BMCUError(
+                    '%s shared path is not positively EMPTY (%s)' %
+                    (endpoint.name, path.get('channel_state', 'unknown')))
+
+            generation_open = bool(record.get('generation_open', False))
+            restore_enabled = None
+            if auto is not None:
+                restore_enabled = bool(auto)
+            elif (record.get('baseline_captured') and
+                  (generation_open or record.get('native_auto_override_active'))):
+                restore_enabled = not bool(record.get('baseline_disabled', False))
+            elif (record.get('persistent_hold') or
+                  record.get('native_auto_override_active')):
+                raise BMCUError(
+                    '%s has a persistent BMCU hold without an open captured '
+                    'baseline generation; exact recovery is required' % endpoint.name)
+            else:
+                feeder = self._u1_native_feeder_status(endpoint, strict=True)
+                if require_restore and bool(feeder.get('disable_auto', False)):
+                    raise BMCUError(
+                        '%s native AUTO is disabled and no open baseline is '
+                        'available; to enable it explicitly use '
+                        'BMCU_SNAP_FEEDER ENDPOINT=%s TAKEOVER=0 AUTO=1' %
+                        (endpoint.name, endpoint.name))
+
+            if restore_enabled is not None:
+                restore_disabled = bool(self._u1_native_feeder_status(
+                    endpoint, strict=True).get('disable_auto', False))
+                restore_attempted = True
+                endpoint.restore_native_feeder(
+                    save=True, enabled=restore_enabled)
+
+            endpoint.release_runtime_sensor_takeover()
+            record['persistent_hold'] = False
+            record['native_auto_override_active'] = False
+            record['tail_detached'] = False
+            record['tail_sensor_cleared'] = False
+            record['follower_pending'] = False
+            record['follower_kind'] = 'bmcu'
+            record['follower_device'] = ''
+            record['follower_uid'] = ''
+            record['follower_channel'] = -1
+            record['follower_tool'] = -1
+            record['route_state'] = 'EMPTY'
+            record['device'] = ''
+            record['device_uid'] = ''
+            record['channel'] = -1
+            if close_generation:
+                record['generation_open'] = False
+                record['baseline_captured'] = False
+                record['baseline_disabled'] = False
+                record['baseline_filament'] = {}
+            record['reason'] = str(reason or 'verified EMPTY handoff')[:160]
             self.state.save()
+            self._set_u1_lease_state(
+                endpoint.name, 'native', record['reason'],
+                path=path, online=bool(
+                    self._assigned_routes_for_endpoint(endpoint.name)))
+            self._u1_persistent_reasserted.discard(endpoint.name)
+            return True
         except Exception:
             record.clear()
-            record.update(previous)
+            record.update(original_record)
+            self._u1_lease_dirty = True
+            if restore_attempted and restore_disabled is not None:
+                try:
+                    endpoint.set_native_feeder_enabled(
+                        not restore_disabled, save=True)
+                except Exception:
+                    self._u1_persistent_reasserted.discard(endpoint.name)
+                    logging.exception(
+                        'BMCU could not roll back native AUTO for %s',
+                        endpoint.name)
             raise
-        self._set_u1_lease_state(
-            endpoint.name, 'native', record['reason'],
-            path=path, online=bool(
-                self._assigned_routes_for_endpoint(endpoint.name)))
-        self._u1_persistent_reasserted.discard(endpoint.name)
-        return True
+        finally:
+            self.endpoint_locks.discard(endpoint.name)
+            self.path_locks.discard(path_group)
 
     def _u1_tail_detached_matches(self, endpoint, device, channel):
         if (endpoint is None or endpoint.driver != 'snapmaker_u1' or
@@ -6118,11 +6139,17 @@ class BMCUManager(object):
         if device is not None and channel is not None and not \
                 self._u1_tail_detached_matches(endpoint, device, int(channel)):
             return False
+        previous = dict(record)
         record['tail_detached'] = False
         record['tail_sensor_cleared'] = False
         self._clear_u1_follower_commit(record)
         record['reason'] = str(reason or 'verified route empty')[:160]
-        self.state.save()
+        try:
+            self.state.save()
+        except Exception:
+            record.clear()
+            record.update(previous)
+            raise
         return True
 
     def _u1_operation_source(self, endpoint_name):
@@ -6614,6 +6641,11 @@ class BMCUManager(object):
         for endpoint in tuple(self.endpoints.values()):
             if endpoint.driver != 'snapmaker_u1':
                 continue
+            if (endpoint.name in self.endpoint_locks or
+                    endpoint.shared_path_group() in self.path_locks or
+                    self._u1_endpoint_transition_reserved(endpoint.name)):
+                self._u1_lease_dirty = True
+                continue
             endpoint_started = self.reactor.monotonic()
             assigned = self._assigned_routes_for_endpoint(endpoint.name)
             online = [(device, channel) for device, channel in assigned
@@ -6756,9 +6788,11 @@ class BMCUManager(object):
                         native_disabled = True
                     if (persistent_hold and not active and not hazards and
                             path.get('known') and not path.get('busy')):
-                        self._release_u1_persistent_hold_if_safe(
-                            endpoint,
-                            'online BMCU confirmed every route EMPTY')
+                        if self._release_u1_persistent_hold_if_safe(
+                                endpoint,
+                                'online BMCU confirmed every route EMPTY',
+                                close_generation=True):
+                            continue
                         ownership = self._u1_ownership_record(endpoint.name)
                         persistent_hold = bool(
                             ownership.get('persistent_hold', False))
@@ -6840,6 +6874,12 @@ class BMCUManager(object):
                         details=str(exc))
                     self._safe_pause()
             finally:
+                ownership = self._u1_ownership_record(endpoint.name)
+                if (not self._endpoint_has_loaded_or_active_route(endpoint.name) and
+                        any(ownership.get(key) for key in (
+                            'persistent_hold', 'generation_open',
+                            'native_auto_override_active', 'baseline_captured'))):
+                    self._u1_lease_dirty = True
                 endpoint_ms = max(
                     0.0, (self.reactor.monotonic() - endpoint_started) * 1000.0)
                 self._u1_lease_endpoint_max_ms[endpoint.name] = max(
@@ -6864,7 +6904,7 @@ class BMCUManager(object):
         unresolved = [
             value for value in self._u1_lease_state.values()
             if isinstance(value, dict) and
-            value.get('owner') == 'safety_hold']
+            value.get('owner') in ('safety_hold', 'error')]
         if unresolved or any(self._u1_disconnect_hazards.values()):
             return False
         self.last_error = None
@@ -6882,7 +6922,8 @@ class BMCUManager(object):
                     routes.append((device, channel))
         return routes
 
-    def _assign_channel_endpoint(self, device, channel, endpoint_name, save=True):
+    def _assign_channel_endpoint(self, device, channel, endpoint_name, save=True,
+                                 restored=None):
         channel = int(channel)
         route_key = self._route_key(device, channel)
         endpoint_name = str(endpoint_name or '').strip()
@@ -6976,52 +7017,79 @@ class BMCUManager(object):
                     'endpoint %s is incomplete: %s' %
                     (endpoint_name,
                      '; '.join(validation.get('errors', []))))
-        snapshot = copy.deepcopy(self.state.data)
         previous = self.endpoints.get(previous_name)
+        previous_still_assigned = bool(
+            previous_name and self._assigned_routes_for_endpoint(
+                previous_name, excluded_route=route_key))
+        self._lock_channel_input(device, 'SET_OUTPUT', channel)
         try:
+            if (previous is not None and previous.driver == 'snapmaker_u1' and
+                    not previous_still_assigned):
+                ownership = self._u1_ownership_record(previous_name)
+                if any(ownership.get(key) for key in (
+                        'persistent_hold', 'generation_open',
+                        'native_auto_override_active', 'baseline_captured')):
+                    try:
+                        self._handoff_u1_to_native(
+                            previous, 'last BMCU channel reassigned',
+                            save=True, close_generation=True)
+                        if restored is not None:
+                            restored.append(previous_name)
+                    except Exception as exc:
+                        raise BMCUError(
+                            'Cannot detach the last BMCU Channel from %s: %s. '
+                            'Routing is unchanged; empty the head path before retrying' %
+                            (previous_name, exc))
+            snapshot = copy.deepcopy(self.state.data)
+            try:
 
-            if selected is not None and selected.driver == 'snapmaker_u1':
-                selected.config['u1_native_feeder_takeover'] = True
-                self.state.data['endpoints'][endpoint_name][
-                    'u1_native_feeder_takeover'] = True
-            channel_record['endpoint'] = endpoint_name
-            if not restoring_tail_route:
+                if selected is not None and selected.driver == 'snapmaker_u1':
+                    selected.config['u1_native_feeder_takeover'] = True
+                    self.state.data['endpoints'][endpoint_name][
+                        'u1_native_feeder_takeover'] = True
+                channel_record['endpoint'] = endpoint_name
+                if not restoring_tail_route:
 
-                channel_record.update({
-                    'path_length_mm': 0.0,
-                    'path_length_endpoint': '',
-                    'path_length_source': 'none',
-                    'path_measure_pending': True,
-                    'tail_detached': False,
-                    'tail_endpoint': '',
-                    'tail_path_length_mm': 0.0,
-                    'tail_follower_pending': False,
-                    'tail_follower_device': '',
-                    'tail_follower_uid': '',
-                    'tail_follower_channel': -1,
-                    'tail_follower_tool': -1,
-                })
-                self._clear_path_learning_observation(device, channel)
-            previous_still_assigned = bool(
-                previous_name and self._assigned_routes_for_endpoint(
-                    previous_name, excluded_route=route_key))
-            if previous is not None and previous_name != endpoint_name and not previous_still_assigned:
-                previous.release_runtime_sensor_takeover()
-                if (previous.driver == 'snapmaker_u1' and
-                        previous.get('u1_native_feeder_takeover', False)):
-                    previous.config['u1_native_feeder_takeover'] = False
-                    if previous_name in self.state.data['endpoints']:
-                        self.state.data['endpoints'][previous_name][
-                            'u1_native_feeder_takeover'] = False
-            if save:
-                self.state.save()
-            self._u1_lease_dirty = True
-        except Exception as exc:
-            self.state.data = snapshot
-            self._load_endpoints()
-            if isinstance(exc, BMCUError):
-                raise
-            raise BMCUError(str(exc))
+                    channel_record.update({
+                        'path_length_mm': 0.0,
+                        'path_length_endpoint': '',
+                        'path_length_source': 'none',
+                        'path_measure_pending': True,
+                        'tail_detached': False,
+                        'tail_endpoint': '',
+                        'tail_path_length_mm': 0.0,
+                        'tail_follower_pending': False,
+                        'tail_follower_device': '',
+                        'tail_follower_uid': '',
+                        'tail_follower_channel': -1,
+                        'tail_follower_tool': -1,
+                    })
+                    self._clear_path_learning_observation(device, channel)
+                if previous is not None and previous_name != endpoint_name and not previous_still_assigned:
+                    previous.release_runtime_sensor_takeover()
+                    if (previous.driver == 'snapmaker_u1' and
+                            previous.get('u1_native_feeder_takeover', False)):
+                        previous.config['u1_native_feeder_takeover'] = False
+                        if previous_name in self.state.data['endpoints']:
+                            self.state.data['endpoints'][previous_name][
+                                'u1_native_feeder_takeover'] = False
+                if save:
+                    self.state.save()
+                self._u1_lease_dirty = True
+            except Exception as exc:
+                self.state.data = snapshot
+                self._load_endpoints()
+                self._u1_lease_dirty = True
+                if save:
+                    try:
+                        self.state.save()
+                    except Exception:
+                        logging.exception('BMCU could not persist routing rollback')
+                if isinstance(exc, BMCUError):
+                    raise
+                raise BMCUError(str(exc))
+        finally:
+            self._unlock_channel_input(device)
 
     def _devices_using_endpoint(self, endpoint_name, excluded_device=None):
         routed = []
@@ -13332,7 +13400,10 @@ class BMCUManager(object):
             for name in removed_or_changed:
                 old = existing.get(name, {})
                 if (str(old.get('driver', '')).lower() == 'snapmaker_u1' and
-                        old.get('u1_native_feeder_takeover', False)):
+                        (old.get('u1_native_feeder_takeover', False) or
+                         any(self._u1_ownership_record(name).get(key) for key in (
+                             'persistent_hold', 'generation_open',
+                             'native_auto_override_active', 'baseline_captured')))):
                     endpoint = self.endpoints.get(name) or create_endpoint(self, name, old)
                     self._handoff_u1_to_native(
                         endpoint, 'endpoint removed by preset', save=False,
@@ -13354,8 +13425,11 @@ class BMCUManager(object):
                         'DEVICE, CHANNEL and ENDPOINT/HEAD are all required for one-step routing')
                 device = self._require_device(gcmd, device_name)
                 self._assign_channel_endpoint(
-                    device, channel, endpoint_name, save=True)
+                    device, channel, endpoint_name, save=True, restored=restored)
         except Exception as exc:
+            for name in restored:
+                snapshot.setdefault('u1_ownership', {})[name] = copy.deepcopy(
+                    self._u1_ownership_record(name))
             self.state.data = snapshot
             self._load_endpoints()
             self._u1_lease_dirty = True
@@ -13868,7 +13942,10 @@ class BMCUManager(object):
             current['u1_native_feeder_takeover'] = False
             new_takeover = False
         old_ownership_must_end = (
-            old_is_u1 and old_takeover and
+            old_is_u1 and (old_takeover or any(
+                self._u1_ownership_record(name).get(key) for key in (
+                    'persistent_hold', 'generation_open',
+                    'native_auto_override_active', 'baseline_captured'))) and
             (not new_is_u1 or not new_takeover or old_target != new_target))
         if old_ownership_must_end and routed:
             raise gcmd.error(
@@ -17189,6 +17266,9 @@ class BMCUManager(object):
                  getattr(refill, '_pending', set()))):
             raise gcmd.error(
                 'route confirmation is unavailable during refill recovery')
+        if self.u1_cross_refill_pending:
+            raise gcmd.error(
+                'route confirmation is unavailable during cross-head refill recovery')
 
         if getattr(self, '_u1_background_jobs', {}):
             raise gcmd.error(
@@ -17204,6 +17284,16 @@ class BMCUManager(object):
         route_key = self._route_key(device, channel)
         endpoint = self._endpoint_for_channel(device, channel)
 
+        try:
+            if endpoint is None:
+                self._lock_channel_input(device, 'ROUTE_CONFIRM', channel)
+            else:
+                if route_empty and endpoint.driver == 'snapmaker_u1':
+                    self._require_exclusive_endpoint_route(device, endpoint, channel)
+                self._lock(device, endpoint, 'ROUTE_CONFIRM', channel=channel)
+        except BMCUError as exc:
+            raise gcmd.error(str(exc))
+        route_locked = True
         self._required_transport_users += 1
         try:
             try:
@@ -17236,6 +17326,13 @@ class BMCUManager(object):
                 input_present = bool(present_values[channel])
 
                 durable_tail = self._durable_tail_route(device, channel)
+                if (endpoint is not None and endpoint.driver == 'snapmaker_u1' and
+                        self._u1_ownership_record(endpoint.name).get('tail_detached') and
+                        durable_tail is None):
+                    raise gcmd.error(
+                        '%s has a detached tail owned by another BMCU Channel; '
+                        'recover that Channel before confirming this route EMPTY' %
+                        endpoint.name)
                 if durable_tail is not None and not durable_tail.get('routed'):
                     raise gcmd.error(
                         '%s Channel %d has a detached tail but its original '
@@ -17260,11 +17357,8 @@ class BMCUManager(object):
 
                 if endpoint is not None and endpoint.driver == 'snapmaker_u1':
                     try:
-                        native_sensor_snapshot = (
-                            endpoint.require_entry_sensor_snapshot(
-                                timeout=1.25, expected=False)
-                            if durable_tail is not None else
-                            endpoint.entry_sensor_snapshot())
+                        native_sensor_snapshot = endpoint.require_entry_sensor_snapshot(
+                            timeout=1.25, expected=False)
                         native_path = endpoint.native_path_status(
                             sensor_snapshot=native_sensor_snapshot,
                             route_empty_verified=True)
@@ -17281,8 +17375,7 @@ class BMCUManager(object):
                     channel_state = str(
                         native_path.get('channel_state', 'unknown') or
                         'unknown').lower()
-                    if (native_path.get('busy') and
-                            not native_path.get('stale_load_finish')):
+                    if native_path.get('busy'):
                         raise gcmd.error(
                             '%s does not positively confirm an empty toolhead '
                             'path (%s)' % (endpoint.name, channel_state))
@@ -17441,9 +17534,12 @@ class BMCUManager(object):
                     if endpoint is not None and not post_commit_errors:
                         self._refresh_u1_disconnect_hazards(endpoint.name)
 
+                        self._unlock(device, endpoint)
+                        route_locked = False
                         self._u1_lease_dirty = True
                         self._release_u1_persistent_hold_if_safe(
-                            endpoint, 'manual %s route confirmation' % state)
+                            endpoint, 'manual %s route confirmation' % state,
+                            close_generation=True)
                         self._clear_resolved_u1_startup_error()
                     if not self.print_loaded_routes:
                         self.print_terminal_unload_pending = False
@@ -17482,6 +17578,11 @@ class BMCUManager(object):
             gcmd.respond_info('%s Channel %d confirmed %s' %
                               (device.name, channel + 1, state))
         finally:
+            if route_locked:
+                if endpoint is None:
+                    self._unlock_channel_input(device)
+                else:
+                    self._unlock(device, endpoint)
             self._required_transport_users = max(
                 0, self._required_transport_users - 1)
 
@@ -17662,7 +17763,9 @@ class BMCUManager(object):
 
         if (self._u1_disconnect_hazards.get(endpoint_name) or
                 self._u1_endpoint_transition_reserved(endpoint_name) or
-                endpoint_name in self.endpoint_locks):
+                endpoint_name in self.endpoint_locks or
+                endpoint.shared_path_group() in self.path_locks or
+                self.u1_cross_refill_pending):
             raise gcmd.error(
                 '%s still has an active transition, lock or disconnect hazard' %
                 endpoint_name)
@@ -17675,45 +17778,64 @@ class BMCUManager(object):
                 '%s still has a prestaged BMCU source' % endpoint_name)
 
         assigned = self._assigned_routes_for_endpoint(endpoint_name)
-        if not assigned:
+        if not assigned and not any(
+                self._u1_ownership_record(endpoint_name).get(key) for key in (
+                    'persistent_hold', 'generation_open',
+                    'native_auto_override_active', 'baseline_captured')):
             raise gcmd.error(
-                '%s has no configured BMCU Channels' % endpoint_name)
-        checked_devices = set()
-        for device, channel in assigned:
-            if device.name not in checked_devices:
-                try:
-                    status = dict(device.refresh())
-                except Exception as exc:
-                    raise gcmd.error(
-                        '%s status is unavailable: %s' % (device.name, exc))
-                checked_devices.add(device.name)
-                if (not device.ready or not device.runtime_configured or
-                        not device.status_reconciled):
-                    raise gcmd.error(
-                        '%s is not fully Ready/reconciled' % device.name)
-            else:
-                status = device.status
-            route = self._route_states_from_status(status)[int(channel)]
-            if route != protocol.ROUTE_EMPTY:
-                raise gcmd.error(
-                    '%s Channel %d is not firmware EMPTY' %
-                    (device.name, int(channel) + 1))
-            if self._durable_tail_route(device, int(channel)) is not None:
-                raise gcmd.error(
-                    '%s Channel %d still has a detached downstream tail' %
-                    (device.name, int(channel) + 1))
-
+                '%s has no BMCU Channels or ownership to recover' % endpoint_name)
+        locked_devices = []
+        path_group = endpoint.shared_path_group()
+        self.endpoint_locks.add(endpoint_name)
+        self.path_locks.add(path_group)
+        self._required_transport_users += 1
         try:
-            snapshot = endpoint.require_entry_sensor_snapshot(timeout=1.25)
+            checked_devices = set()
+            for device, _channel in assigned:
+                if device not in locked_devices:
+                    self._lock_channel_input(device, 'HEAD_CONFIRM_EMPTY', 0xff)
+                    locked_devices.append(device)
+            for device, channel in assigned:
+                if device.name not in checked_devices:
+                    try:
+                        status = dict(device.refresh())
+                    except Exception as exc:
+                        raise gcmd.error(
+                            '%s status is unavailable: %s' % (device.name, exc))
+                    checked_devices.add(device.name)
+                    if (not device.ready or not device.runtime_configured or
+                            not device.status_reconciled):
+                        raise gcmd.error(
+                            '%s is not fully Ready/reconciled' % device.name)
+                else:
+                    status = device.status
+                route = self._route_states_from_status(status)[int(channel)]
+                if route != protocol.ROUTE_EMPTY:
+                    raise gcmd.error(
+                        '%s Channel %d is not firmware EMPTY' %
+                        (device.name, int(channel) + 1))
+                if self._durable_tail_route(device, int(channel)) is not None:
+                    raise gcmd.error(
+                        '%s Channel %d still has a detached downstream tail' %
+                        (device.name, int(channel) + 1))
+
+            snapshot = endpoint.require_entry_sensor_snapshot(timeout=1.25, expected=False)
+            path = endpoint.native_path_status()
+            if (not path.get('known') or path.get('busy') or
+                    self._endpoint_has_loaded_or_active_route(endpoint_name) or
+                    self._u1_disconnect_hazards.get(endpoint_name)):
+                raise BMCUError('%s shared path is not positively EMPTY' % endpoint_name)
             changed = endpoint.commit_native_path_empty(
                 sensor_snapshot=snapshot, manual_confirmation=True)
             self._clear_endpoint_projection(endpoint)
             self._refresh_u1_disconnect_hazards(endpoint_name)
             self._u1_lease_dirty = True
-            self._release_u1_persistent_hold_if_safe(
-                endpoint, 'operator physically confirmed complete Head EMPTY')
-            self._reconcile_u1_leases(
-                self.reactor.monotonic(), force=True)
+            self._u1_devices_reconciled_once.update(checked_devices)
+            self.endpoint_locks.discard(endpoint_name)
+            self.path_locks.discard(path_group)
+            self._handoff_u1_to_native(
+                endpoint, 'operator physically confirmed complete Head EMPTY',
+                save=True, close_generation=True)
             self._clear_resolved_u1_startup_error()
             self._save_runtime()
         except Exception as exc:
@@ -17723,6 +17845,14 @@ class BMCUManager(object):
             raise gcmd.error(
                 '%s EMPTY confirmation failed safely: %s' %
                 (endpoint_name, exc))
+
+        finally:
+            self.endpoint_locks.discard(endpoint_name)
+            self.path_locks.discard(path_group)
+            for device in locked_devices:
+                self._unlock_channel_input(device)
+            self._u1_lease_dirty = True
+            self._required_transport_users = max(0, self._required_transport_users - 1)
 
         gcmd.respond_info(
             '%s (Head %d) physically confirmed EMPTY; stock native '
