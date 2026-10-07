@@ -444,8 +444,26 @@ function toast(message, kind = '') {
   const node = document.createElement('div');
   node.className = `toast ${kind}`.trim();
   node.textContent = String(message || '');
-  $('toastRegion').appendChild(node);
-  setTimeout(() => node.remove(), 5000);
+  const dialogs = Array.from(document.querySelectorAll('dialog[open]'));
+  const dialog = dialogs[dialogs.length - 1];
+  if (dialog) {
+    let region = dialog.querySelector('.dialog-toast-region');
+    if (!region) {
+      region = document.createElement('div');
+      region.className = 'dialog-toast-region';
+      const head = dialog.querySelector('.dialog-head');
+      if (head) head.insertAdjacentElement('afterend', region);
+      else dialog.prepend(region);
+    }
+    region.appendChild(node);
+  } else {
+    $('toastRegion').appendChild(node);
+  }
+  setTimeout(() => {
+    const region = node.parentElement;
+    node.remove();
+    if (region?.classList.contains('dialog-toast-region') && !region.children.length) region.remove();
+  }, 5000);
 }
 
 function gcodeValue(value) {
@@ -508,7 +526,11 @@ function channelOperation(device, channel) {
       return local;
     }
   }
-  const active = status().active_operations?.[device.name];
+  const background = Object.values(status().active_operations || {}).find((item) =>
+    item?.background &&
+    ((String(item.source_device) === String(device.name) && Number(item.source_channel) === Number(channel.channel)) ||
+     (String(item.target_device) === String(device.name) && Number(item.target_channel) === Number(channel.channel))));
+  const active = background || status().active_operations?.[device.name];
   if (!plainObject(active)) return null;
   const phase = String(active.phase || '').toUpperCase();
   if (active.background) {
@@ -516,7 +538,7 @@ function channelOperation(device, channel) {
       Number(active.source_channel) === Number(channel.channel);
     const targetMatch = String(active.target_device || '') === String(device.name) &&
       Number(active.target_channel) === Number(channel.channel);
-    if (sourceMatch && ['BACKGROUND_RELEASE', 'BACKGROUND_PULLBACK'].includes(phase)) {
+    if (sourceMatch && phase !== 'BACKGROUND_PRESTAGE') {
       return {kind: 'unloading', label: 'Preparing next filament - unloading', started: Date.now(), remote: true};
     }
     if (targetMatch && phase === 'BACKGROUND_PRESTAGE') {
@@ -935,6 +957,7 @@ function renderNotices() {
           ? 'BMCU control link unavailable'
           : 'BMCU operation failed'),
       copy: String(lastError.details || lastError.message || 'BMCU reported an error.'),
+      action: ['dismiss-last-error', 'Dismiss'],
     });
   }
   syncKeyed($('noticeRegion'), notices, (item) => item.key, (item) => {
@@ -1475,8 +1498,14 @@ function updateChannelDiagnostic(node, item) {
     ['Buffer raw', finite(channel.buffer_raw) ? `${Number(channel.buffer_raw).toFixed(4)} V` : 'unknown'],
     ['Calibration', channel.calibration_valid ? 'valid' : 'required'],
     ['Current raw', finite(cal.current_raw) ? `${Number(cal.current_raw).toFixed(4)} V` : 'unknown'],
-    ['Cal min / neutral / max', [cal.minimum, cal.neutral, cal.maximum].every(finite) ? `${Number(cal.minimum).toFixed(3)} / ${Number(cal.neutral).toFixed(3)} / ${Number(cal.maximum).toFixed(3)} V` : 'unknown'],
-    ['Cal offset / polarity', `${finite(cal.offset) ? Number(cal.offset).toFixed(4) : 'unknown'} / ${cal.polarity ?? 'unknown'}`],
+    ['Cal RAW min / neutral / max', channel.calibration_valid
+      ? ([cal.raw_minimum, cal.raw_neutral, cal.raw_maximum].every(finite)
+        ? `${Number(cal.raw_minimum).toFixed(3)} / ${Number(cal.raw_neutral).toFixed(3)} / ${Number(cal.raw_maximum).toFixed(3)} V`
+        : 'unknown')
+      : 'unknown - calibration required'],
+    ['Cal offset / polarity', channel.calibration_valid
+      ? `${finite(cal.offset) ? Number(cal.offset).toFixed(4) : 'unknown'} / ${cal.polarity ?? 'unknown'}`
+      : 'unknown - calibration required'],
     ['Motor PWM', channel.motor_pwm ?? 0],
     ['Motor motion', motionLabel(channel.motion)],
     ['Measured filament travel', `${finite(channel.travel_meters) ? Number(channel.travel_meters).toFixed(3) : '0.000'} m`],
@@ -1642,11 +1671,19 @@ function managedUpdateDevices() {
     device?.name && device?.uid && (device?.transport_port || device?.port)));
 }
 
+function managedFlashDevices() {
+  return managedUpdateDevices().filter((device) =>
+    device?.firmware_compatible === true || device?.firmware_compatible === false);
+}
+
 function rawSerialCandidates(mode = selectedFlashMode()) {
 
   const candidates = serialCandidates();
   const managed = managedUpdateDevices();
-  const claimed = managed.map((device) => String(device.transport_port || device.port || '')).filter(Boolean);
+  const claimed = managed
+    .filter((device) => device?.firmware_compatible === true || device?.firmware_compatible === false)
+    .map((device) => String(device.transport_port || device.port || ''))
+    .filter(Boolean);
 
   if (ui.suppressUnknownPort) {
     const managedAgain = managed.some((device) =>
@@ -1669,17 +1706,15 @@ function rawSerialCandidates(mode = selectedFlashMode()) {
 function syncDeviceSelect(select) {
   if (ui.updateInProgress) return;
   const mode = selectedFlashMode();
-  const managed = managedUpdateDevices();
+  const managed = managedFlashDevices();
   const options = managed.map((device) => [device.name, `${deviceLabel(device)} - firmware ${device.firmware || 'unknown'}`]);
-  if (mode === 'ttl') {
-    options.unshift(['', 'None / unassigned']);
-  } else {
-    for (const candidate of rawSerialCandidates()) {
-      const identity = [candidate.usb_vid && candidate.usb_pid ? `${candidate.usb_vid}:${candidate.usb_pid}` : '', candidate.driver].filter(Boolean).join(' ');
-      options.push([`raw:${candidate.path}`, `USB-TTL - unknown firmware${identity ? ` [${identity}]` : ''} - ${candidate.path}`]);
-    }
+  for (const candidate of rawSerialCandidates(mode)) {
+    const identity = [candidate.usb_vid && candidate.usb_pid ? `${candidate.usb_vid}:${candidate.usb_pid}` : '', candidate.driver].filter(Boolean).join(' ');
+    const type = mode === 'usb' ? 'USB automatic' : 'TTL / manual serial';
+    options.push([`raw:${candidate.path}`, `${type} - unknown firmware${identity ? ` [${identity}]` : ''} - ${candidate.path}`]);
   }
-  const empty = mode === 'usb' ? 'No BMCU or USB-TTL adapter detected' : 'None / unassigned';
+  if (mode === 'ttl') options.unshift(['', 'None / unassigned']);
+  const empty = mode === 'usb' ? 'No USB serial device detected' : 'No serial device detected';
   syncSelectOptions(select, options.length ? options : [['', empty]]);
 }
 
@@ -2957,12 +2992,15 @@ function updateBmcuSettingsDevice(node, device) {
   const firmwareSuffix = ready && targetFirmware && versionNewer(targetFirmware, actualFirmware)
     ? ` - Update available: ${targetFirmware}`
     : '';
+  const firmwareOnly = Boolean(device.connected && device.firmware_compatible === false);
   text(state, ready
     ? `Connected - firmware ${actualFirmware}${firmwareSuffix}`
-    : `Disconnected - ${device.port || 'last configured serial port'}`);
+    : firmwareOnly
+      ? `Connected - firmware ${actualFirmware}; update to ${store.state.config.required_firmware_version || 'required firmware'} before use`
+      : `Disconnected - ${device.port || 'last configured serial port'}`);
   const badge = node.querySelector('.bmcu-settings-device-badge');
   badge.className = `badge bmcu-settings-device-badge ${ready ? 'good' : 'bad'}`;
-  text(badge, ready ? 'Ready' : 'Disconnected');
+  text(badge, ready ? 'Ready' : firmwareOnly ? 'Firmware update required' : 'Disconnected');
 
   updateLoadingHandoffSetting(node.querySelector('.bmcu-handoff-setting'), device);
   updateLoadPressureSetting(node.querySelector('.bmcu-pressure-setting'), device);
@@ -3766,7 +3804,7 @@ async function continueCalibration() {
 }
 
 function selectedUpdateDevice() {
-  const managed = managedUpdateDevices();
+  const managed = managedFlashDevices();
   const mode = selectedFlashMode();
   const value = $('updateDevice').value || '';
   if (value.startsWith('raw:')) {
@@ -3811,7 +3849,7 @@ function managedDeviceForSerialPort(port) {
   if (!value) return null;
   const candidates = serialCandidates();
   const selectedCandidate = candidates.find((candidate) => candidateMatchesPort(candidate, value));
-  return managedUpdateDevices().find((device) => {
+  return managedFlashDevices().find((device) => {
     const devicePort = String(device.transport_port || device.port || '');
     if (!devicePort) return false;
     if (devicePort === value) return true;
@@ -3825,7 +3863,10 @@ function syncTtlDeviceFromPort() {
   const deviceSelect = $('updateDevice');
   const port = String($('updatePort')?.value || '');
   const matched = managedDeviceForSerialPort(port);
-  const next = matched ? matched.name : '';
+  const raw = !matched && port
+    ? rawSerialCandidates('ttl').find((candidate) => candidateMatchesPort(candidate, port))
+    : null;
+  const next = matched ? matched.name : (raw ? `raw:${raw.path}` : '');
   if (deviceSelect.value !== next) deviceSelect.value = next;
   setClass($('unknownCh340Notice'), 'hidden', Boolean(matched) || !port);
 }
@@ -3839,7 +3880,14 @@ function syncTtlPortFromDevice() {
     renderFirmwareVersionSummary();
     return;
   }
-  const device = managedUpdateDevices().find((item) => item.name === value);
+  if (value.startsWith('raw:')) {
+    const path = value.slice(4);
+    const candidate = rawSerialCandidates('ttl').find((item) => item.path === path);
+    $('updatePort').value = candidate ? candidate.path : path;
+    setClass($('unknownCh340Notice'), 'hidden', false);
+    return;
+  }
+  const device = managedFlashDevices().find((item) => item.name === value);
   if (!device) return;
   const devicePort = String(device.transport_port || device.port || '');
   const candidate = serialCandidates().find((item) => candidateMatchesPort(item, devicePort));
@@ -3951,6 +3999,7 @@ function firmwareFlashRequest(online = false) {
 function firmwareSafetySnapshot(deviceName) {
   const device = devices().find((item) => item.name === deviceName);
   const ready = deviceReady(device);
+  const firmwareOnly = Boolean(device?.connected && device?.firmware_compatible === false);
   const channels = [];
   for (let index = 0; index < 4; index += 1) {
     const channel = device?.channels?.find((item) => Number(item.channel) === index);
@@ -3960,7 +4009,7 @@ function firmwareSafetySnapshot(deviceName) {
     const safe = ready && sensorKnown && present === false && route === 'EMPTY';
     channels.push({index, present, route, safe});
   }
-  return {device, ready, channels, allSafe: channels.every((channel) => channel.safe)};
+  return {device, ready, firmwareOnly, channels, allSafe: channels.every((channel) => channel.safe)};
 }
 
 function firmwareDestructiveRequirements(request) {
@@ -3986,6 +4035,8 @@ function renderFirmwareSafetyDialog() {
   const request = ui.pendingFirmwareUpload;
   if (!request) return;
   const raw = Boolean(request.raw);
+  const snapshot = raw ? null : firmwareSafetySnapshot(request.deviceName);
+  const firmwareOnly = Boolean(snapshot?.firmwareOnly);
   const required = firmwareDestructiveRequirements(request);
   setClass($('flashConfirmations'), 'hidden', false);
   setClass($('flashUnknownTargetRow'), 'hidden', !required.unknownTarget);
@@ -4002,21 +4053,27 @@ function renderFirmwareSafetyDialog() {
     : 'Optional. Leave unchecked to preserve the verified 4096-byte BMCU calibration area.');
   text($('flashReplaceNvmTitle'), 'Calibration data will be replaced');
   text($('flashReplaceNvmHelp'), 'A complete 65536-byte image contains its own final 4096-byte NVM area.');
-  setClass($('flashSafetyTableWrap'), 'hidden', raw);
-  text($('flashSafetyTitle'), raw ? 'Danger - confirm the exact serial device' : 'Remove all filament before flashing');
+  setClass($('flashSafetyTableWrap'), 'hidden', raw || firmwareOnly);
+  text($('flashSafetyTitle'), raw
+    ? 'Danger - confirm the exact serial device'
+    : firmwareOnly ? 'Firmware update required - remove all filament'
+    : 'Remove all filament before flashing');
   text($('flashSafetyCopy'), raw
     ? 'The current firmware cannot be queried. A raw flash targets the selected serial device directly. Unplug the intended adapter, refresh and confirm the selected port disappears. Reconnect it, refresh and confirm the same port returns. Continue only if you know exactly what device you selected and all filament is completely removed.'
-    : 'Completely remove every filament from the BMCU, including filament still inside its input path. Verify the selected physical target before continuing. The status below updates automatically.');
+    : firmwareOnly
+      ? 'This BMCU was identified by its managed UID and serial transport, but its firmware is not allowed to operate with this package. Live channel safety data is intentionally unavailable. Completely remove every filament from the BMCU before flashing the required firmware.'
+      : 'Completely remove every filament from the BMCU, including filament still inside its input path. Verify the selected physical target before continuing. The status below updates automatically.');
   const statusNode = $('flashSafetyStatus');
-  if (raw) {
+  if (raw || firmwareOnly) {
     $('flashSafetyChannels').replaceChildren();
     statusNode.className = 'flash-safety-status warn';
-    text(statusNode, 'Unknown firmware - live channel verification is unavailable. The wrong serial port may reprogram another device. Continue only after physically identifying the target and removing all filament.');
+    text(statusNode, raw
+      ? 'Unknown firmware - live channel verification is unavailable. The wrong serial port may reprogram another device. Continue only after physically identifying the target and removing all filament.'
+      : `Firmware ${snapshot?.device?.firmware || 'unknown'} is blocked for operation. The managed BMCU identity is known, so firmware flashing remains available. Remove all filament before continuing.`);
     $('flashSafetyContinue').disabled = ui.firmwareUploadRunning || !firmwareConfirmationsReady(request);
     return;
   }
 
-  const snapshot = firmwareSafetySnapshot(request.deviceName);
   syncKeyed($('flashSafetyChannels'), snapshot.channels, (channel) => channel.index, () => {
     const row = document.createElement('tr');
     row.innerHTML = '<th scope="row"></th><td class="flash-sensor"></td><td class="flash-route"></td>';
@@ -4132,7 +4189,7 @@ async function continueFirmwareUpload() {
   if (!request.raw) {
     const snapshot = firmwareSafetySnapshot(request.deviceName);
     renderFirmwareSafetyDialog();
-    if (!snapshot.allSafe) return;
+    if (!snapshot.allSafe && !snapshot.firmwareOnly) return;
   }
   ui.pendingFirmwareUpload = null;
   closeDialog($('flashSafetyDialog'));
@@ -4442,6 +4499,10 @@ async function handleAction(target) {
           renderSettings();
         }
       });
+  }
+  else if (action === 'dismiss-last-error') {
+    await run('BMCU_CLEAR_ERROR HOST_ONLY=1', {success: 'Error banner dismissed', noRefresh: true});
+    await transport.refreshNow();
   }
   else if (action === 'open-calibration-settings') {
     setView('settings');

@@ -250,7 +250,7 @@ def _http_bytes(url, maximum, timeout, label):
     return data
 
 def remote_firmware_version():
-    data = _http_bytes(REMOTE_VERSION_URL, MAX_VERSION_BYTES, 10, 'version file')
+    data = _http_bytes(REMOTE_VERSION_URL, MAX_VERSION_BYTES, 120, 'version file')
     try:
         text = data.decode('utf-8')
     except UnicodeDecodeError as exc:
@@ -278,14 +278,14 @@ def remote_firmware_version():
 def download_online_firmware(cache_dir, reporter):
     version = remote_firmware_version()
     remote_tuple = tuple(int(part) for part in version.split('.'))
-    if remote_tuple < REQUIRED_FIRMWARE:
+    if remote_tuple != REQUIRED_FIRMWARE:
         raise ReleaseUnavailable(
             'outdated',
-            'Published BMCU firmware %s is older than this package target %s; '
+            'Published BMCU firmware %s does not match this package target %s; '
             'publish the matching release or flash the bundled/local firmware instead' %
             (version, REQUIRED_FIRMWARE_TEXT))
     reporter.log('INFO', 'Downloading fresh published BMCU firmware %s' % version)
-    firmware = _http_bytes(REMOTE_FIRMWARE_URL, APP_SIZE, 60, 'firmware')
+    firmware = _http_bytes(REMOTE_FIRMWARE_URL, APP_SIZE, 300, 'firmware')
     if not firmware:
         raise RuntimeError('online firmware is empty')
     path = Path(cache_dir) / ('firmware-%s.bin' % version)
@@ -373,7 +373,7 @@ def read_json_file(path, maximum):
         raise RuntimeError('JSON object required: %s' % path)
     return value
 
-def moonraker_gcode(moonraker, script, timeout=20):
+def moonraker_gcode(moonraker, script, timeout=300):
     url = moonraker.rstrip('/') + '/printer/gcode/script'
     data = json.dumps({'script': script}, separators=(',', ':')).encode('utf-8')
     request = urllib.request.Request(
@@ -478,7 +478,7 @@ def _host_transport_context():
     metadata = host_bootstrap.read_metadata(metadata_path)
     return metadata_path, metadata, _BMCU_DIR
 
-def _sidecar_control_request(path, command, timeout=3.0):
+def _sidecar_control_request(path, command, timeout=60.0):
     command = bytes(command)
     if len(command) != 1:
         raise RuntimeError('invalid BMCU sidecar control command')
@@ -550,7 +550,7 @@ def live_host_transport_status(device):
     if not socket_path:
         raise RuntimeError('host transport control socket is unavailable for %s' % device)
     status = _sidecar_control_request(
-        socket_path + '.ctl', transport.CTRL_STATUS, timeout=3.0)
+        socket_path + '.ctl', transport.CTRL_STATUS, timeout=60.0)
     if str(status.get('name') or '') != device:
         raise RuntimeError('host transport status belongs to another BMCU')
     if int(status.get('pid', 0) or 0) != int(record.get('pid', 0) or 0):
@@ -613,7 +613,7 @@ def raw_flash_guard_release(args, devices):
     if errors:
         raise RuntimeError('could not release serial flash guard: %s' % '; '.join(errors))
 
-def printer_is_idle(moonraker, timeout=5):
+def printer_is_idle(moonraker, timeout=120):
     url = moonraker.rstrip('/') + '/printer/objects/query?print_stats'
     request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -702,7 +702,7 @@ def serial_port_holder_pids(identity):
                 break
     return sorted(holders)
 
-def wait_serial_port_free(identity, timeout=5.0):
+def wait_serial_port_free(identity, timeout=60.0):
     deadline = time.monotonic() + float(timeout)
     flags = os.O_RDWR | getattr(os, 'O_NOCTTY', 0) | getattr(os, 'O_NONBLOCK', 0)
     flags |= getattr(os, 'O_CLOEXEC', 0)
@@ -727,7 +727,7 @@ def wait_serial_port_free(identity, timeout=5.0):
             raise RuntimeError('serial port remained busy after BMCU transport release: %s' % last)
         time.sleep(0.05)
 
-def moonraker_bmcu_status(moonraker, timeout=5):
+def moonraker_bmcu_status(moonraker, timeout=120):
     url = moonraker.rstrip('/') + '/printer/objects/query?bmcu'
     request = urllib.request.Request(url, headers={
         'Accept': 'application/json',
@@ -764,8 +764,10 @@ def managed_device_status(args):
 
 def managed_runtime_port(args, status=None):
     item = managed_device_status(args) if status is None else status
-    if not item.get('connected') or not item.get('ready') or item.get('update_suspended'):
-        raise RuntimeError('%s is not ready for firmware access' % args.device)
+    firmware_only = item.get('firmware_compatible') is False
+    if (not item.get('connected') or item.get('update_suspended') or
+            (not item.get('ready') and not firmware_only)):
+        raise RuntimeError('%s is not identified for firmware access' % args.device)
     socket_path = str(item.get('transport_socket') or '')
     if not socket_path.startswith('/') or not socket_path.endswith('.sock'):
         raise RuntimeError('BMCU runtime has no transport identity; restart Klipper after updating')
@@ -778,7 +780,7 @@ def managed_runtime_port(args, status=None):
         raise RuntimeError('BMCU serial identity changed; refresh the device before flashing')
     return freeze_serial_port(str(live.get('port') or ''))
 
-def wait_managed_ready(args, runtime_uid, timeout=60.0):
+def wait_managed_ready(args, runtime_uid, timeout=300.0):
     deadline = time.monotonic() + timeout
     last = ''
     while time.monotonic() < deadline:
@@ -912,7 +914,7 @@ class Updater:
             moonraker_gcode(
                 self.args.moonraker,
                 'BMCU_UPDATE_ACCESS DEVICE=%s ACTION=EXPORT TOKEN=%s' %
-                (self.args.device, token), timeout=75)
+                (self.args.device, token), timeout=300)
             data = read_regular_file(binary, NVM_SIZE)
             meta = read_json_file(metadata, MAX_METADATA_BYTES)
             if meta.get('schema') != 1 or str(meta.get('uid', '')).upper() != runtime_uid:
@@ -947,19 +949,18 @@ class Updater:
                 'managed USB port changed before direct NVM export')
 
         self.reporter.log(
-            'WARN',
-            'Klipper NVM export timed out after bounded retries; '
-            'switching to direct runtime NVM export on the verified live port')
+            'INFO',
+            'Using direct runtime NVM export on the verified live BMCU port')
 
         stopped = stop_host_transports_except(())
         if stopped:
             self.reporter.log(
                 'INFO', 'Stopped target BMCU transport for direct NVM export')
         assert_frozen_serial_port(runtime_port)
-        wait_serial_port_free(runtime_port, timeout=8.0)
+        wait_serial_port_free(runtime_port, timeout=60.0)
 
         client = RuntimeClient(
-            runtime_port['resolved'], baud=115200, timeout=4.0)
+            runtime_port['resolved'], baud=115200, timeout=30.0)
         cancel_sent = False
         session_ready = False
         try:
@@ -969,7 +970,7 @@ class Updater:
                 client.serial.reset_input_buffer()
             except Exception:
                 pass
-            hello = client.handshake()
+            hello = client.handshake(require_compatible=False)
             session_ready = True
             direct_uid = str(hello.get('uid') or '').upper()
             if direct_uid != runtime_uid:
@@ -1047,13 +1048,18 @@ class Updater:
                 'INFO',
                 'Using preserved calibration NVM from the interrupted flash; firmware application bytes come from the newly selected/downloaded source')
         elif managed:
-            try:
-                current_nvm, metadata = self._export_managed_nvm(runtime_uid)
-            except Exception as exc:
-                if not self._is_managed_nvm_read_timeout(exc):
-                    raise
+            status = managed_device_status(self.args)
+            if status.get('firmware_compatible') is False:
                 current_nvm, metadata = self._export_managed_nvm_direct(
                     runtime_uid)
+            else:
+                try:
+                    current_nvm, metadata = self._export_managed_nvm(runtime_uid)
+                except Exception as exc:
+                    if not self._is_managed_nvm_read_timeout(exc):
+                        raise
+                    current_nvm, metadata = self._export_managed_nvm_direct(
+                        runtime_uid)
             backup_path = str(
                 self._backup_nvm(runtime_uid, current_nvm, metadata))
 
@@ -1446,7 +1452,7 @@ class Updater:
                 if managed:
                     start_host_transports(
                         preferred_device=self.args.device,
-                        preferred_online_timeout=(180.0 if self.args.mode == 'ttl' else 35.0))
+                        preferred_online_timeout=(600.0 if self.args.mode == 'ttl' else 300.0))
                 else:
                     start_host_transports()
                 service_active = False
@@ -1456,7 +1462,7 @@ class Updater:
                 if managed:
                     wait_managed_ready(
                         self.args, runtime_uid,
-                        180.0 if self.args.mode == 'ttl' else 75.0)
+                        600.0 if self.args.mode == 'ttl' else 300.0)
                 self.reporter.log(
                     'INFO', 'BMCU runtime reconnect completed in %.3f s' %
                     max(0.0, time.monotonic() - reconnect_started))
@@ -1589,7 +1595,7 @@ def build_parser():
     parser.add_argument('--confirm-ttl-target', action='store_true')
     parser.add_argument('--expected-size', type=int, default=None)
     parser.add_argument('--expected-sha256', default='')
-    parser.add_argument('--manual-timeout', type=float, default=180.0)
+    parser.add_argument('--manual-timeout', type=float, default=600.0)
     parser.add_argument('--json-lines', action='store_true')
     return parser
 

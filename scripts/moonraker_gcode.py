@@ -24,7 +24,7 @@ def validate_base_url(value):
         raise ValueError('--url must be an HTTP(S) base URL without credentials, query or fragment')
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip('/'), '', ''))
 
-def request_gcode(command, base_url, api_key='', timeout=15.0):
+def request_gcode(command, base_url, api_key='', timeout=60.0):
     if not isinstance(command, str) or not command.strip():
         raise ValueError('G-code command must not be empty')
     try:

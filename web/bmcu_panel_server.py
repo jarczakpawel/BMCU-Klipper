@@ -30,8 +30,8 @@ PROXY_PREFIX = '/moonraker'
 ALLOWED_PROXY_PATHS = {'/printer/objects/query', '/printer/gcode/script'}
 MAX_PROXY_REQUEST = 1024 * 1024
 MAX_PROXY_RESPONSE = 4 * 1024 * 1024
-PROXY_QUERY_TIMEOUT = 10.0
-PROXY_COMMAND_TIMEOUT = 60.0
+PROXY_QUERY_TIMEOUT = 120.0
+PROXY_COMMAND_TIMEOUT = 300.0
 PROXY_MOTION_TIMEOUT = 600.0
 MAX_UPDATE_REQUEST = 64 * 1024
 MAX_FIRMWARE_BYTES = 64 * 1024
@@ -40,10 +40,10 @@ MAX_UPDATE_OUTPUT_LINE = 64 * 1024
 MAX_UPDATE_LOG_MESSAGE = 2048
 MAX_TRANSACTION_BYTES = 64 * 1024
 MAX_HTTP_CONNECTIONS = 8
-HTTP_CONNECTION_TIMEOUT = 15.0
+HTTP_CONNECTION_TIMEOUT = 120.0
 MAX_PANEL_GCODE = 40 * 1024
 MAX_ORCA_TEMPLATE_BYTES = 512 * 1024
-DIAGNOSTICS_EXPORT_TIMEOUT = 180.0
+DIAGNOSTICS_EXPORT_TIMEOUT = 300.0
 REMOTE_VERSION_URL = 'https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/version'
 MAX_VERSION_BYTES = 4096
 _RUNTIME_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -99,7 +99,7 @@ def _reject_json_constant(value):
 def _remote_release_versions():
     request = urllib.request.Request(
         REMOTE_VERSION_URL, headers={'User-Agent': 'BMCU-Klipper/%s' % PACKAGE_VERSION})
-    with urllib.request.urlopen(request, timeout=6) as response:
+    with urllib.request.urlopen(request, timeout=120) as response:
         data = response.read(MAX_VERSION_BYTES + 1)
     if len(data) > MAX_VERSION_BYTES:
         raise ValueError('remote version file is too large')
@@ -1022,7 +1022,7 @@ class UpdateJobs:
                 data=body,
                 headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
                 method='POST')
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=120) as response:
                 payload = response.read(MAX_PROXY_RESPONSE + 1)
             if len(payload) > MAX_PROXY_RESPONSE:
                 raise RuntimeError('Moonraker response is too large')
@@ -1058,7 +1058,7 @@ class UpdateJobs:
             headers={'Content-Type': 'application/json',
                      'Accept': 'application/json'},
             method='POST')
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             payload = response.read(MAX_PROXY_RESPONSE + 1)
         if len(payload) > MAX_PROXY_RESPONSE:
             raise RuntimeError('Moonraker response is too large')
@@ -1074,7 +1074,7 @@ class UpdateJobs:
             [sys.executable, '-I', '-S', str(bootstrap), '--sync-transports',
              '--metadata', str(metadata), '--quiet'],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=30, close_fds=True,
+            text=True, timeout=180, close_fds=True,
             env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
                  'LANG': 'C', 'LC_ALL': 'C'})
         if result.returncode != 0:
@@ -1101,7 +1101,7 @@ class UpdateJobs:
                     self.status['percent'] = 99
                     self.status['stage'] = 'ttl-reset'
                     self.status['message'] = 'Flash verified - press RESET on the BMCU now'
-        candidate_deadline = time.monotonic() + (90.0 if mode == 'ttl' else 15.0)
+        candidate_deadline = time.monotonic() + (300.0 if mode == 'ttl' else 120.0)
         candidates = []
         while time.monotonic() < candidate_deadline:
             candidates = [candidate for candidate in serial_port_candidates(
@@ -1128,7 +1128,7 @@ class UpdateJobs:
         token = uuid.uuid4().hex
         detected = pathlib.Path(self.state_dir, 'detected-%s.cfg' % token)
         try:
-            deadline = time.monotonic() + (90.0 if mode == 'ttl' else 35.0)
+            deadline = time.monotonic() + (300.0 if mode == 'ttl' else 120.0)
             last = ''
             while time.monotonic() < deadline:
                 command = [
@@ -1139,7 +1139,7 @@ class UpdateJobs:
                     result = subprocess.run(
                         command, stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT, text=True,
-                        timeout=8, close_fds=True,
+                        timeout=120, close_fds=True,
                         env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
                              'LANG': 'C', 'LC_ALL': 'C'})
                     last = (result.stdout or '').strip()[-1024:]
@@ -1160,7 +1160,7 @@ class UpdateJobs:
                  '--detected', str(detected),
                  '--backup-dir', str(self.backup_dir)],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, timeout=12, close_fds=True,
+                text=True, timeout=120, close_fds=True,
                 env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
                      'LANG': 'C', 'LC_ALL': 'C'})
             if result.returncode != 0:
@@ -1206,10 +1206,10 @@ class UpdateJobs:
         if process.poll() is None:
             process.terminate()
             try:
-                process.wait(timeout=2)
+                process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=2)
+                process.wait(timeout=30)
         else:
             process.wait(timeout=0)
 
@@ -1274,7 +1274,7 @@ class UpdateJobs:
                         self.status['result'] = item
                 if kind == 'log':
                     self._append_log(item.get('level', 'INFO'), item.get('message', ''), job_id)
-            code = process.wait(timeout=5)
+            code = process.wait(timeout=60)
             adoption = None
             adoption_error = ''
             with self.lock:
@@ -1491,7 +1491,7 @@ class PanelHandler(http.server.SimpleHTTPRequestHandler):
             raise ValueError('JSON object required')
         return value
 
-    def _moonraker_gcode(self, script, timeout=30):
+    def _moonraker_gcode(self, script, timeout=300):
         body = json.dumps({'script': str(script)}, separators=(',', ':')).encode('utf-8')
         request = urllib.request.Request(
             self.moonraker.rstrip('/') + '/printer/gcode/script',
@@ -1557,7 +1557,7 @@ class PanelHandler(http.server.SimpleHTTPRequestHandler):
                      '--cfg', str(bmcu_cfg), '--remove', device,
                      '--backup-dir', str(backup_dir)],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, timeout=12, close_fds=True,
+                    text=True, timeout=120, close_fds=True,
                     env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
                          'LANG': 'C', 'LC_ALL': 'C'})
                 if result.returncode != 0:
@@ -1587,7 +1587,7 @@ class PanelHandler(http.server.SimpleHTTPRequestHandler):
                         [sys.executable, '-I', '-S', str(bootstrap), '--sync-transports',
                          '--metadata', str(metadata), '--quiet'],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, timeout=30, close_fds=True,
+                        text=True, timeout=180, close_fds=True,
                         env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
                              'LANG': 'C', 'LC_ALL': 'C'})
                     if result.returncode != 0:

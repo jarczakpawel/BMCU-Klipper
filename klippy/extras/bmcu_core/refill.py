@@ -958,8 +958,9 @@ class AutoRefillController(object):
         timeout_s = float(endpoint.get('refill_timeout', 75.0) or 75.0)
         timeout_s = self._effective_feed_timeout(
             device, maximum_mm, timeout_s)
-        op_id = device.start_feed_to_contact(
-            channel, maximum_mm, contact_pct, int(timeout_s * 1000.0))
+        op_id = manager._start_u1_async_feed(
+            device, channel, device.start_feed_to_contact,
+            maximum_mm, contact_pct, int(timeout_s * 1000.0))
 
         result = manager._wait_feed_operation(
             device, op_id, timeout_s + 2.0, None, '')
@@ -1864,11 +1865,15 @@ class AutoRefillController(object):
                 self.manager._lock_refill(
                     source_device,
                     candidate.get('device') if candidate else None,
-                    endpoint, 'AUTO_REFILL T%d' % source_tool)
+                    endpoint, 'AUTO_REFILL T%d' % source_tool,
+                    source_channel=source_channel,
+                    replacement_channel=candidate.get('channel') if candidate else None)
             else:
                 self.manager._lock_refill(
                     source_device, candidate.get('device'), endpoint,
-                    'AUTO_REFILL T%d' % source_tool, replacement_endpoint)
+                    'AUTO_REFILL T%d' % source_tool, replacement_endpoint,
+                    source_channel=source_channel,
+                    replacement_channel=candidate.get('channel'))
             locked = True
             endpoint.ensure_runtime_sensor_takeover()
             continuous_attempted = False
@@ -1993,16 +1998,17 @@ class AutoRefillController(object):
                     task.perform_auto_replenish = False
 
             stopped = set()
-            for motion_device in (
-                    source_device, candidate.get('device') if candidate else None):
-                if motion_device is None or motion_device.name in stopped:
+            for motion_device, motion_channel in (
+                    (source_device, source_channel),
+                    (candidate.get('device'), candidate.get('channel'))
+                    if candidate else (None, None)):
+                if motion_device is None or motion_channel is None:
                     continue
-                stopped.add(motion_device.name)
-                try:
-                    motion_device.stop_all()
-                except Exception:
-                    logging.exception('BMCU could not stop %s after refill failure',
-                                      motion_device.name)
+                key = (motion_device.name, int(motion_channel))
+                if key in stopped:
+                    continue
+                stopped.add(key)
+                self.manager._stop_channel_motion(motion_device, motion_channel)
 
             projection_restored = False
             projection_endpoint = transaction.get('_projection_endpoint', endpoint)

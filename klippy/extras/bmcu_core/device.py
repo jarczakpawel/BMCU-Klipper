@@ -875,6 +875,14 @@ class BMCUDevice(object):
             self.close()
 
     def send(self, msg_type, payload=b'', cmd_id=None):
+        if ((not self.hello_validated or self.firmware_compatible is not True)
+                and msg_type not in (
+                protocol.MSG_HELLO, protocol.MSG_SESSION_CONFIRM,
+                protocol.MSG_PING, protocol.MSG_GET_STATUS,
+                protocol.MSG_STOP_ALL, protocol.MSG_UPDATE_PREPARE,
+                protocol.MSG_UPDATE_CANCEL, protocol.MSG_NVM_READ)):
+            raise RuntimeError(self.firmware_error or
+                               'Matching BMCU firmware is required before operation')
         if self._reactor_quiesced:
             waiter = getattr(
                 self.manager, '_await_required_transport_release', None)
@@ -1288,35 +1296,45 @@ class BMCUDevice(object):
         if self.expected_uid and uid != self.expected_uid:
             raise RuntimeError('UID mismatch expected=%s got=%s' %
                                (self.expected_uid, uid))
-        firmware_tuple = tuple(hello.get('firmware_tuple', (0, 0, 0)))
-        protocol_ok = hello.get('protocol') == protocol.PROTO_VERSION
-        firmware_ok = protocol.firmware_is_compatible(firmware_tuple)
-        if not protocol_ok or not firmware_ok:
-            reported = hello.get('firmware') or 'unknown'
-            minimum = '.'.join(str(part) for part in protocol.MIN_COMPATIBLE_FIRMWARE)
-            message = (
-                'BMCU firmware %s is outside the supported %s..%s range; '
-                'flash bundled firmware %s' %
-                (reported, minimum, protocol.REQUIRED_FIRMWARE_TEXT,
-                 protocol.REQUIRED_FIRMWARE_TEXT))
-            self.firmware_compatible = False
-            self.firmware_error = message
-            logging.warning(
-                'BMCU %s incompatible handshake firmware=%s protocol=%s',
-                self.name, reported, hello.get('protocol'))
-            raise RuntimeError(message)
         if int(hello.get('channels', 0)) != 4:
             raise RuntimeError('unsupported BMCU channel count %s; expected 4' %
                                hello.get('channels'))
-        self.firmware_compatible = True
-        self.firmware_error = ''
-        return uid, old_uid
+        firmware_tuple = tuple(hello.get('firmware_tuple', (0, 0, 0)))
+        protocol_ok = hello.get('protocol') == protocol.PROTO_VERSION
+        firmware_ok = protocol.firmware_is_compatible(firmware_tuple)
+        compatible = bool(protocol_ok and firmware_ok)
+        if compatible:
+            self.firmware_compatible = True
+            self.firmware_error = ''
+        else:
+            reported = hello.get('firmware') or 'unknown'
+            message = (
+                'BMCU firmware %s is not supported for operation; firmware %s '
+                'is required. Flash the bundled firmware %s.' %
+                (reported, protocol.REQUIRED_FIRMWARE_TEXT,
+                 protocol.REQUIRED_FIRMWARE_TEXT))
+            if not protocol_ok:
+                message = (
+                    'BMCU protocol %s / firmware %s is not supported for '
+                    'operation; firmware %s is required. Flash the bundled '
+                    'firmware %s.' %
+                    (hello.get('protocol'), reported,
+                     protocol.REQUIRED_FIRMWARE_TEXT,
+                     protocol.REQUIRED_FIRMWARE_TEXT))
+            self.firmware_compatible = False
+            self.firmware_error = message
+            logging.warning(
+                'BMCU %s identified for firmware update only: firmware=%s '
+                'protocol=%s required=%s',
+                self.name, reported, hello.get('protocol'),
+                protocol.REQUIRED_FIRMWARE_TEXT)
+        return uid, old_uid, compatible
 
     def _finalize_hello(self, seq):
         hello = self.hello_candidate
         if not hello:
             raise RuntimeError('missing BMCU HELLO candidate')
-        uid, old_uid = self._validate_hello_candidate(hello)
+        uid, old_uid, compatible = self._validate_hello_candidate(hello)
         old_session = self.status.get('session_id', 0)
         self.uid = uid
         if old_session and old_session != hello['session_id']:
@@ -1334,7 +1352,13 @@ class BMCUDevice(object):
         self.hello_candidate = None
         self.reconnect_delay = self.manager.reconnect_interval
         self.next_connect_at = 0.0
-        self._request_initial_snapshot()
+        if compatible:
+            self._request_initial_snapshot()
+        else:
+            self.ready = False
+            self.runtime_configured = False
+            self.runtime_config_sync_pending = False
+            self.status_reconciled = False
 
     def _handle_packet(self, msg_type, seq, cmd_id, payload):
         try:
@@ -1431,7 +1455,8 @@ class BMCUDevice(object):
                         self.missed_events += delta - 1
 
                 self._complete_pending(msg_type, cmd_id, self.status)
-                self._queue_status_notification(previous, self.status)
+                if self.firmware_compatible is True:
+                    self._queue_status_notification(previous, self.status)
                 return True
             elif msg_type == protocol.MSG_CALIBRATION:
                 if not self._response_expected(msg_type, cmd_id):

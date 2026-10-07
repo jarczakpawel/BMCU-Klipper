@@ -2,6 +2,7 @@
 #include "Motion_control.h"
 #include "ADC_DMA.h"
 #include "Flash_saves.h"
+#include "bmcu_config.h"
 #include "app_api.h"
 #include "hal/time_hw.h"
 #include <math.h>
@@ -44,6 +45,7 @@ struct AutoCalibration
     uint8_t state;
     uint8_t reason;
     uint8_t result_pending;
+    uint8_t motor_test_done;
     uint32_t op_id;
     uint64_t started_ticks;
     uint32_t stage_started_ticks;
@@ -235,26 +237,46 @@ void MC_PULL_calibration_boot()
 
     if (Flash_MC_PULL_cal_read(offs, vmin, vmax, polarity, &valid))
     {
+        valid &= 0x0Fu;
         for (uint8_t ch = 0u; ch < 4u; ch++)
+        {
+            const uint8_t bit = (uint8_t)(1u << ch);
+            if (!(valid & bit)) continue;
+            if (!isfinite(offs[ch]) || !finite_voltage(1.65f - offs[ch]) ||
+                !finite_voltage(vmin[ch]) || !finite_voltage(vmax[ch]) ||
+                polarity[ch] == 0 ||
+                !(vmin[ch] < 1.65f && 1.65f < vmax[ch]) ||
+                (1.65f - vmin[ch]) < CAL_MIN_HALF_RANGE_V ||
+                (vmax[ch] - 1.65f) < CAL_MIN_HALF_RANGE_V ||
+                (vmax[ch] - vmin[ch]) < CAL_MIN_TOTAL_RANGE_V)
+                valid &= (uint8_t)~bit;
+        }
+    }
+    else
+    {
+        valid = 0u;
+    }
+
+    for (uint8_t ch = 0u; ch < 4u; ch++)
+    {
+        const uint8_t bit = (uint8_t)(1u << ch);
+        if (valid & bit)
         {
             MC_PULL_V_OFFSET[ch] = offs[ch];
             MC_PULL_V_MIN[ch] = vmin[ch];
             MC_PULL_V_MAX[ch] = vmax[ch];
             MC_PULL_POLARITY[ch] = polarity[ch] < 0 ? -1 : 1;
         }
-        g_valid_mask = (uint8_t)(valid & 0x0Fu);
-        return;
+        else
+        {
+            const float raw = MC_PULL_calibration_raw(ch);
+            MC_PULL_V_OFFSET[ch] = finite_voltage(raw) ? (1.65f - raw) : 0.0f;
+            MC_PULL_V_MIN[ch] = 1.50f;
+            MC_PULL_V_MAX[ch] = 1.80f;
+            MC_PULL_POLARITY[ch] = 1;
+        }
     }
-
-    for (uint8_t ch = 0u; ch < 4u; ch++)
-    {
-        const float raw = MC_PULL_calibration_raw(ch);
-        MC_PULL_V_OFFSET[ch] = finite_voltage(raw) ? (1.65f - raw) : 0.0f;
-        MC_PULL_V_MIN[ch] = 1.50f;
-        MC_PULL_V_MAX[ch] = 1.80f;
-        MC_PULL_POLARITY[ch] = 1;
-    }
-    g_valid_mask = 0u;
+    g_valid_mask = valid;
 }
 
 bool MC_PULL_calibration_capture(uint8_t ch, uint8_t point, float* raw_out)
@@ -458,9 +480,14 @@ bool MC_PULL_calibration_auto_abort()
 
 static bool sample_due(uint32_t now)
 {
+    static uint32_t last_generation = 0u;
     if (elapsed_ms32(g_auto.last_sample_ticks, now) < CAL_SAMPLE_MS) return false;
     g_auto.last_sample_ticks = now;
     ADC_DMA_poll();
+    (void)ADC_DMA_get_value();
+    const uint32_t generation = ADC_DMA_generation();
+    if (!ADC_DMA_ready() || generation == last_generation) return false;
+    last_generation = generation;
     return true;
 }
 
@@ -588,6 +615,7 @@ static void complete_current_channel(uint32_t now, float second_normalized)
     g_auto.channel = 0xFFu;
     g_auto.stage = BMCU_AUTO_CAL_SAVING;
     g_auto.stage_started_ticks = now;
+    g_auto.stable_started_ticks = 0u;
 }
 
 static void run_channel(uint32_t now)
@@ -670,34 +698,71 @@ static void run_channel(uint32_t now)
 
 static void save_transaction()
 {
-    Motion_control_prepare_calibration();
-    if (!Motion_control_calibrate_motor_encoder(
-            g_auto.selected_mask, g_auto.staged_motor_direction))
+    const uint32_t now = time_ticks32();
+    if (elapsed_ms32(g_auto.stage_started_ticks, now) >= CAL_STAGE_TIMEOUT_MS)
     {
-        auto_fail(AUTO_REASON_ENCODER_IO);
+        auto_fail(AUTO_REASON_TIMEOUT);
         return;
     }
+    if (!sample_due(now)) return;
+    for (uint8_t ch = 0u; ch < 4u; ch++)
+    {
+        const uint8_t bit = (uint8_t)(1u << ch);
+        if (!(g_auto.selected_mask & bit)) continue;
+        if (!(g_auto.done_mask & bit) || !Motion_control_channel_connected(ch))
+        {
+            auto_fail(AUTO_REASON_SENSOR);
+            return;
+        }
+        if (g_auto.motor_test_done && !Motion_control_encoder_io_ok(ch))
+        {
+            auto_fail(AUTO_REASON_ENCODER_IO);
+            return;
+        }
+        const float value = adjusted_raw(ch);
+        const float key = adc_key_raw_ch(ch, ADC_DMA_get_value());
+        if (!isfinite(value) || !centered(value) || !isfinite(key) ||
+            key < 0.0f || key >= 0.01f * (float)g_auto.staged_key_none_cv[ch])
+        {
+            g_auto.stable_started_ticks = 0u;
+            return;
+        }
+    }
+    if (!g_auto.stable_started_ticks) g_auto.stable_started_ticks = now;
+    if (elapsed_ms32(g_auto.stable_started_ticks, now) < CAL_STABLE_MS) return;
+    if (!g_auto.motor_test_done)
+    {
+        Motion_control_prepare_calibration();
+        if (!Motion_control_calibrate_motor_encoder(
+                g_auto.selected_mask, g_auto.staged_motor_direction))
+        {
+            auto_fail(AUTO_REASON_ENCODER_IO);
+            return;
+        }
+        g_auto.motor_test_done = 1u;
+        g_auto.stable_started_ticks = 0u;
+        return;
+    }
+
+    const BmcuMotionNvm previous = g_bmcu_nvm;
+    for (uint8_t ch = 0u; ch < 4u; ch++)
+    {
+        if (!(g_auto.selected_mask & (uint8_t)(1u << ch))) continue;
+        g_bmcu_nvm.Motion_control_dir[ch] = g_auto.staged_motor_direction[ch];
+        g_bmcu_nvm.dm_key_none_cv[ch] = g_auto.staged_key_none_cv[ch];
+    }
+    g_bmcu_nvm.check = 0x40614061u;
 
     if (!Flash_MC_PULL_cal_write_all(g_auto.staged_offset, g_auto.staged_min,
                                       g_auto.staged_max,
                                       g_auto.staged_polarity,
                                       g_auto.staged_valid_mask))
     {
+        g_bmcu_nvm = previous;
         auto_fail(AUTO_REASON_NVM);
         return;
     }
-
-    if (!Motion_control_commit_hardware_calibration(
-            g_auto.selected_mask, g_auto.staged_key_none_cv,
-            g_auto.staged_motor_direction))
-    {
-
-        (void)Flash_MC_PULL_cal_write_all(
-            MC_PULL_V_OFFSET, MC_PULL_V_MIN, MC_PULL_V_MAX,
-            MC_PULL_POLARITY, g_valid_mask);
-        auto_fail(AUTO_REASON_NVM);
-        return;
-    }
+    Motion_control_apply_hardware_calibration();
 
     for (uint8_t ch = 0u; ch < 4u; ch++)
     {

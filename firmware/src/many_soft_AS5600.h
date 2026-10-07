@@ -23,7 +23,7 @@ public:
               int num);
 
     void updata_stu();
-    void updata_angle();
+    uint8_t updata_angle();
 
     bool*               online;
     _AS5600_magnet_stu* magnet_stu;

@@ -4,6 +4,8 @@
 #include "ch32v20x_gpio.h"
 #include "ch32v20x_usart.h"
 #include "ch32v20x_dma.h"
+#include "ch32v20x_misc.h"
+#include "hal/irq_wch.h"
 #include "hal/time_hw.h"
 #include <string.h>
 
@@ -19,8 +21,11 @@ struct TxSlot
     uint8_t data[BMCU_UART_TX_FRAME_MAX];
 };
 
-static uint8_t rx_dma_buf[BMCU_UART_RX_SIZE] __attribute__((aligned(4)));
-static volatile uint16_t rx_tail = 0;
+static volatile uint8_t rx_dma_buf[BMCU_UART_RX_SIZE] __attribute__((aligned(4)));
+static volatile uint32_t rx_wraps = 0u;
+static volatile bool rx_fault = false;
+static uint32_t rx_consumed = 0u;
+static bool rx_lost = false;
 
 static TxSlot tx_critical[BMCU_UART_TX_CRITICAL_SLOTS];
 static TxSlot tx_normal[BMCU_UART_TX_NORMAL_SLOTS];
@@ -37,26 +42,63 @@ static uint32_t tx_dropped = 0u;
 static uint32_t tx_errors = 0u;
 static uint32_t tx_started_tick = 0u;
 
-static inline uint16_t rx_head(void)
+static uint32_t rx_produced(void)
 {
-    return (uint16_t)((BMCU_UART_RX_SIZE - DMA1_Channel5->CNTR) & BMCU_UART_RX_MASK);
+    const uint32_t irq = irq_save_wch();
+    uint32_t count = rx_consumed;
+    for (uint8_t retry = 0u; retry < 4u; retry++)
+    {
+        const uint32_t before = DMA1->INTFR & DMA1_FLAG_TC5;
+        const uint32_t remaining = DMA1_Channel5->CNTR;
+        const uint32_t after = DMA1->INTFR & DMA1_FLAG_TC5;
+        if (before != after || !remaining || remaining > BMCU_UART_RX_SIZE) continue;
+        count = (rx_wraps + (after ? 1u : 0u)) * BMCU_UART_RX_SIZE +
+                BMCU_UART_RX_SIZE - remaining;
+        break;
+    }
+    __asm__ volatile("fence iorw, iorw" ::: "memory");
+    irq_restore_wch(irq);
+    return count;
 }
 
 static inline void uart_rx_dma_restart(void)
 {
+    const uint32_t irq = irq_save_wch();
     DMA1_Channel5->CFGR &= (uint16_t)(~DMA_CFGR1_EN);
+    DMA1->INTFCR = DMA1_FLAG_GL5;
     DMA1_Channel5->MADDR = (uint32_t)(uintptr_t)rx_dma_buf;
     DMA1_Channel5->CNTR = BMCU_UART_RX_SIZE;
+    rx_wraps = 0u;
+    rx_consumed = 0u;
+    rx_fault = false;
     DMA1_Channel5->CFGR |= DMA_CFGR1_EN;
-    rx_tail = 0;
+    irq_restore_wch(irq);
 }
 
 static inline void uart_clear_error_flags(void)
 {
     const uint32_t sr = USART1->STATR;
-    if (sr & (USART_FLAG_ORE | USART_FLAG_NE | USART_FLAG_FE | USART_FLAG_PE))
+    if (rx_fault || (sr & (USART_FLAG_ORE | USART_FLAG_NE | USART_FLAG_FE | USART_FLAG_PE)))
     {
         (void)USART1->DATAR;
+        uart_rx_dma_restart();
+        rx_lost = true;
+    }
+}
+
+extern "C" void DMA1_Channel5_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void DMA1_Channel5_IRQHandler(void)
+{
+    const uint32_t flags = DMA1->INTFR;
+    if (flags & DMA1_FLAG_TC5)
+    {
+        DMA1->INTFCR = DMA1_FLAG_TC5;
+        ++rx_wraps;
+    }
+    if (flags & DMA1_FLAG_TE5)
+    {
+        DMA1->INTFCR = DMA1_FLAG_TE5;
+        rx_fault = true;
     }
 }
 
@@ -152,6 +194,14 @@ void bmcu_uart_init(uint32_t baud)
     dma.DMA_Priority = DMA_Priority_VeryHigh;
     dma.DMA_M2M = DMA_M2M_Disable;
     DMA_Init(DMA1_Channel5, &dma);
+    DMA_ClearFlag(DMA1_FLAG_GL5);
+    DMA_ITConfig(DMA1_Channel5, DMA_IT_TC | DMA_IT_TE, ENABLE);
+    NVIC_InitTypeDef nvic = {0};
+    nvic.NVIC_IRQChannel = DMA1_Channel5_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 0u;
+    nvic.NVIC_IRQChannelSubPriority = 0u;
+    nvic.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&nvic);
 
     DMA_DeInit(DMA1_Channel4);
     dma.DMA_PeripheralBaseAddr = (uint32_t)(uintptr_t)&USART1->DATAR;
@@ -172,6 +222,7 @@ void bmcu_uart_init(uint32_t baud)
     USART1->CTLR3 |= USART_DMAReq_Rx | USART_DMAReq_Tx;
     USART_Cmd(USART1, ENABLE);
     uart_rx_dma_restart();
+    rx_lost = false;
 
     tx_critical_head = tx_critical_tail = tx_critical_count = 0u;
     tx_normal_head = tx_normal_tail = tx_normal_count = 0u;
@@ -182,15 +233,26 @@ void bmcu_uart_init(uint32_t baud)
 
 bool bmcu_uart_read_byte(uint8_t *out)
 {
-    const uint16_t head = rx_head();
-    if (rx_tail == head)
+    uart_clear_error_flags();
+    if (rx_lost) return false;
+    const uint32_t head = rx_produced();
+    if ((uint32_t)(head - rx_consumed) >= BMCU_UART_RX_SIZE)
     {
-        uart_clear_error_flags();
+        rx_consumed = head;
+        rx_lost = true;
         return false;
     }
-    *out = rx_dma_buf[rx_tail];
-    rx_tail = (uint16_t)((rx_tail + 1u) & BMCU_UART_RX_MASK);
+    if (rx_consumed == head) return false;
+    *out = rx_dma_buf[rx_consumed & BMCU_UART_RX_MASK];
+    ++rx_consumed;
     return true;
+}
+
+bool bmcu_uart_take_rx_loss(void)
+{
+    const bool lost = rx_lost;
+    rx_lost = false;
+    return lost;
 }
 
 bool bmcu_uart_write(const uint8_t *data, uint16_t len, bool critical)

@@ -236,6 +236,9 @@ class BMCUManager(object):
         self.path_locks = set()
 
         self.active_operations = {}
+        self._u1_background_channel_locks = {}
+        self._u1_background_async_slots = {}
+        self._u1_foreground_async_waiters = {}
 
         self._required_transport_users = 0
         self._control_plane_requests = 0
@@ -794,6 +797,8 @@ class BMCUManager(object):
 
     def _active_operation_owns_route(self, device, channel):
 
+        if (device.name, int(channel)) in self._u1_background_channel_locks:
+            return True
         operation = self.active_operations.get(device.name)
         if not isinstance(operation, dict):
             return False
@@ -1070,7 +1075,9 @@ class BMCUManager(object):
 
     def _send_device_runtime_config(
             self, device, channel_retract_override=None):
-
+        if device.firmware_compatible is not True:
+            raise BMCUError(device.firmware_error or
+                            'Matching BMCU firmware is required before operation')
         device_state = self._device_state(device)
         logical_values = self._motion_wire_values(device_state)
         wire_values = dict(logical_values)
@@ -1132,8 +1139,11 @@ class BMCUManager(object):
         if device.ready and device.runtime_configured:
             device.runtime_config_sync_pending = False
             return
-        if not device.connected or not device.hello_validated:
+        if (not device.connected or not device.hello_validated or
+                device.firmware_compatible is not True):
             device.runtime_config_sync_pending = False
+            device.ready = False
+            device.runtime_configured = False
             return
         try:
             self._send_device_runtime_config(device)
@@ -1664,7 +1674,7 @@ class BMCUManager(object):
         state = self._print_state()
         if state not in ('printing', 'paused', 'pause'):
             return False, 'printer state %s is not an active cancel state' % (state or 'unknown')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             return False, 'a BMCU operation is already active'
         stats = self.printer.lookup_object('print_stats', None)
         details = getattr(stats, 'exception_details', {}) if stats is not None else {}
@@ -2400,7 +2410,8 @@ class BMCUManager(object):
             pass
 
     def _manager_needs_fast_tick(self, eventtime):
-        if self.active_operations or self._autoload_pending:
+        if (self.active_operations or self._u1_background_channel_locks or
+                self._autoload_pending):
             return True
         if any(not job.get('done') and not job.get('cancelled')
                for job in self._u1_background_jobs.values()):
@@ -2684,6 +2695,8 @@ class BMCUManager(object):
             self._safe_pause(defer_to_virtual_sd=True)
 
     def device_status_changed(self, device, previous, current):
+        if device.firmware_compatible is not True:
+            return
         if self._print_state() not in ('printing', 'paused', 'pause'):
             self._status_cache = None
         lease_previous = (
@@ -2811,11 +2824,10 @@ class BMCUManager(object):
                                 reinsert_before_boundary = True
                 if detached_reinsert and reinsert_before_boundary:
                     self._autoload_observation.pop(key, None)
-                    try:
-                        device.stop_all()
-                    except Exception:
-                        logging.exception(
-                            'BMCU could not stop premature detached-tail reinsert')
+                    if not self._stop_channel_motion(device, channel):
+                        logging.error(
+                            'BMCU could not stop premature detached-tail reinsert on %s Channel %d',
+                            device.name, channel + 1)
                     self._record_error(
                         'TAIL_REINSERT_CONFLICT', device=device.name,
                         channel=channel, endpoint=(
@@ -2858,7 +2870,7 @@ class BMCUManager(object):
                     if (self.owns_filament_callbacks and endpoint is not None and
                             source_tool is not None and int(source_tool) >= 0 and
                             previous_routes[channel] == protocol.ROUTE_LOADED and
-                            device.name not in self.active_operations and
+                            not self._active_operation_owns_route(device, channel) and
                             previous_motion[channel] in (
                                 protocol.MOTION_BEFORE_ON_USE,
                                 protocol.MOTION_ON_USE)):
@@ -2883,7 +2895,8 @@ class BMCUManager(object):
 
             route_state = current_routes[channel]
             uncertain_expected = (
-                device.name in self.active_operations or route_key in self.prestaged)
+                self._active_operation_owns_route(device, channel) or
+                route_key in self.prestaged)
             if route_state == protocol.ROUTE_LOADED:
                 self._uncertain_routes.discard(route_key)
                 mapped_tool = self._tool_for_channel(device, channel)
@@ -2974,6 +2987,7 @@ class BMCUManager(object):
         if device.session_changed:
             was_controlling_filament = (
                 device.name in self.active_operations or
+                self._u1_background_channel_conflict(device) or
                 any(value != protocol.ROUTE_EMPTY for value in previous_routes) or
                 any(value != protocol.ROUTE_EMPTY for value in current_routes))
             self._drop_prestage_record(device.name, release_sensor=True)
@@ -2992,7 +3006,7 @@ class BMCUManager(object):
     def _resume_follow_after_reconcile(self, device, channel):
         if self.controller_mode != 'standalone':
             return False
-        if device.name in self.active_operations:
+        if self._active_operation_owns_route(device, channel):
             return False
         if self._print_state() not in ('printing', 'paused'):
             return False
@@ -3127,16 +3141,19 @@ class BMCUManager(object):
                     'automatic channel insertion')
             autoload_mm = float(
                 self._channel_metadata(device, channel).get('autoload_mm', 120.0))
-            op_id = device.start_distance_operation(
-                protocol.MSG_CHANNEL_AUTOLOAD, channel, autoload_mm)
+            op_id = self._start_u1_async_feed(
+                device, channel, lambda ch: device.start_distance_operation(
+                    protocol.MSG_CHANNEL_AUTOLOAD, ch, autoload_mm))
             timeout_s = self._distance_wait_timeout(device, autoload_mm, 6.0)
-            result = device.wait_for_op(op_id, timeout=timeout_s)
+            result = self._wait_feed_operation(device, op_id, timeout_s)
             if not result.get('ok'):
                 self._record_error(
                     'CHANNEL_AUTOLOAD_FAILED', device.name, channel,
                     endpoint.name, 'CHANNEL_AUTOLOAD', result.get('reason', ''),
                     result)
         except Exception as exc:
+            if locked:
+                self._stop_channel_motion(device, channel)
             logging.exception('BMCU automatic Channel autoload failed')
             self._record_error('CHANNEL_AUTOLOAD_FAILED', device.name, channel,
                                endpoint.name if endpoint else '',
@@ -3432,6 +3449,21 @@ class BMCUManager(object):
         return bool(self._preferences_status()[
             'leave_final_filament_loaded'])
 
+    def _public_active_operations(self):
+        operations = dict(self.active_operations)
+        for endpoint_name, job in self._u1_background_jobs.items():
+            if not job.get('locked'):
+                continue
+            operations['background:%s' % endpoint_name] = {
+                'name': 'SNAPMAKER BACKGROUND', 'background': True,
+                'endpoint': endpoint_name, 'phase': job.get('phase', ''),
+                'source_device': getattr(job.get('source_device'), 'name', ''),
+                'source_channel': job.get('source_channel'),
+                'target_device': getattr(job.get('target_device'), 'name', ''),
+                'target_channel': job.get('target_channel'),
+            }
+        return operations
+
     def _runtime_status_overlay(self):
         return {
             'print_tools': dict(self.print_tools),
@@ -3453,8 +3485,8 @@ class BMCUManager(object):
             'loaded_tools': dict(self.loaded_tools),
             'loaded_tool': (next(iter(self.loaded_tools.values()))
                             if len(self.loaded_tools) == 1 else -1),
-            'active_operations': dict(self.active_operations),
-            'active_operation': next(iter(self.active_operations.values()), None),
+            'active_operations': self._public_active_operations(),
+            'active_operation': next(iter(self._public_active_operations().values()), None),
             'last_error': self.last_error,
             'print_state': self._print_state(),
         }
@@ -3729,8 +3761,8 @@ class BMCUManager(object):
             'loaded_tools': dict(self.loaded_tools),
             'loaded_tool': (next(iter(self.loaded_tools.values()))
                             if len(self.loaded_tools) == 1 else -1),
-            'active_operations': dict(self.active_operations),
-            'active_operation': next(iter(self.active_operations.values()), None),
+            'active_operations': self._public_active_operations(),
+            'active_operation': next(iter(self._public_active_operations().values()), None),
             'prestaged': dict(self.prestaged),
             'last_error': self.last_error,
             'print_state': self._print_state(),
@@ -5421,7 +5453,11 @@ class BMCUManager(object):
             return False
 
     def _ensure_required_runtime_ready(self, device):
-
+        if device.firmware_compatible is False:
+            raise BMCUError(
+                str(device.firmware_error or
+                    ('%s requires BMCU firmware %s before operation' %
+                     (device.name, protocol.REQUIRED_FIRMWARE_TEXT))))
         if device.ready and getattr(device, 'runtime_configured', True):
             return True
         if getattr(device, 'suspended', False):
@@ -5752,7 +5788,9 @@ class BMCUManager(object):
 
     def _handoff_u1_to_native(self, endpoint, reason='verified EMPTY handoff',
                               save=False, close_generation=False,
-                              auto=None, require_restore=False):
+                              auto=None, require_restore=False,
+                              allow_unverified_devices=None,
+                              allow_settled_native_path=False):
 
         if endpoint is None or endpoint.driver != 'snapmaker_u1':
             return False
@@ -5775,9 +5813,11 @@ class BMCUManager(object):
                 raise BMCUError(
                     '%s has an unresolved BMCU disconnect hazard' % endpoint.name)
             assigned = self._assigned_routes_for_endpoint(endpoint.name)
+            allowed_unverified = set(allow_unverified_devices or ())
             unverified = [
                 device.name for device, _channel in assigned
-                if device.name not in self._u1_devices_reconciled_once]
+                if (device.name not in self._u1_devices_reconciled_once and
+                    device.name not in allowed_unverified)]
             if unverified:
                 raise BMCUError(
                     '%s route snapshot is not verified for: %s' %
@@ -5788,9 +5828,13 @@ class BMCUManager(object):
                 raise BMCUError(
                     '%s route changed during EMPTY verification' % endpoint.name)
             path = endpoint.native_path_status()
-            if not path.get('known') or path.get('busy'):
+            path_safe = bool(path.get('known') and not path.get('busy'))
+            if (allow_settled_native_path and
+                    self._u1_uninstall_native_path_settled(path)):
+                path_safe = True
+            if not path_safe:
                 raise BMCUError(
-                    '%s shared path is not positively EMPTY (%s)' %
+                    '%s shared path is not safe for native handoff (%s)' %
                     (endpoint.name, path.get('channel_state', 'unknown')))
 
             generation_open = bool(record.get('generation_open', False))
@@ -6316,8 +6360,13 @@ class BMCUManager(object):
                for key, value in self.prestaged.items()):
             return True
         operation = self.active_operations.get(device.name)
-        return bool(isinstance(operation, dict) and
-                    operation.get('endpoint') == endpoint_name)
+        if (isinstance(operation, dict) and
+                operation.get('endpoint') == endpoint_name):
+            return True
+        return any(
+            name == device.name and
+            self._channel_endpoint_name(device, channel) == endpoint_name
+            for name, channel in self._u1_background_channel_locks)
 
     def _set_u1_disconnect_hazard(self, endpoint_name, device_name,
                                   kind, message):
@@ -6937,7 +6986,7 @@ class BMCUManager(object):
                 'routing cannot change while a print plan is open or active')
         if self._print_state() in ('printing', 'paused', 'pause'):
             raise BMCUError('routing cannot change while the printer is active')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise BMCUError(
                 'routing cannot change during a BMCU operation')
         refill = getattr(self, 'refill', None)
@@ -7162,6 +7211,8 @@ class BMCUManager(object):
             operation_active = bool(
                 endpoint_name in operation_endpoints and
                 operation_channel in (-1, channel, 0xff))
+        if (device.name, channel) in self._u1_background_channel_locks:
+            operation_active = True
 
         ownership = self.state.data.get('u1_ownership', {}).get(
             endpoint_name, {})
@@ -7379,14 +7430,8 @@ class BMCUManager(object):
                             for device, channel in occupied)
         details = ('multiple independent BMCU Channels report the same occupied Endpoint %s: %s' %
                    (endpoint_name, summary))
-        stopped = set()
         for device, channel in occupied:
-            if device.name not in stopped:
-                try:
-                    device.stop_all()
-                except Exception:
-                    logging.exception('BMCU could not stop conflicting device %s', device.name)
-                stopped.add(device.name)
+            self._stop_channel_motion(device, channel)
             self.loaded_tools.pop(self._route_key(device, channel), None)
         self.active_tool = -1
         duplicate = (isinstance(self.last_error, dict) and
@@ -7415,9 +7460,291 @@ class BMCUManager(object):
             'endpoint %s is already occupied by %s; unload that route before loading another Channel' %
             (endpoint.name, summary))
 
+    def _u1_background_channel_conflict(self, device, channel=None, ignore_job=None):
+        name = str(device.name)
+        try:
+            channel_value = int(channel)
+        except (TypeError, ValueError, OverflowError):
+            channel_value = -1
+        if 0 <= channel_value <= 3:
+            owner = self._u1_background_channel_locks.get((name, channel_value))
+            return owner is not None and owner is not ignore_job
+        return any(
+            key[0] == name and owner is not ignore_job
+            for key, owner in self._u1_background_channel_locks.items())
+
+    def _reserve_u1_background_channel(self, job, device, channel):
+        if device is None or channel is None:
+            return None
+        channel = int(channel)
+        if channel < 0 or channel > 3:
+            raise BMCUError('invalid background Channel %d' % (channel + 1))
+        key = (device.name, channel)
+        if self._operation_conflicts_channel(device, channel):
+            raise BMCUError('%s Channel %d has a foreground operation' %
+                            (device.name, channel + 1))
+        owner = self._u1_background_channel_locks.get(key)
+        if owner is not None and owner is not job:
+            raise BMCUError(
+                '%s Channel %d is already reserved by another background operation' %
+                (device.name, channel + 1))
+        reservations = list(job.get('background_channel_reservations', []))
+        if key not in reservations:
+            reservations.append(key)
+        self._u1_background_channel_locks[key] = job
+        job['background_channel_reservations'] = reservations
+        return key
+
+    def _reserve_u1_background_channels(self, job):
+        job['background_channel_reservations'] = []
+        for device_key, channel_key in (
+                ('source_device', 'source_channel'),
+                ('target_device', 'target_channel')):
+            self._reserve_u1_background_channel(
+                job, job.get(device_key), job.get(channel_key))
+
+    def _release_u1_background_channels(self, job):
+        for key in list(job.get('background_channel_reservations', [])):
+            if self._u1_background_channel_locks.get(tuple(key)) is job:
+                self._u1_background_channel_locks.pop(tuple(key), None)
+        job['background_channel_reservations'] = []
+
+    def _operation_conflicts_channel(self, device, channel):
+        operation = self.active_operations.get(device.name)
+        if not isinstance(operation, dict):
+            return False
+        if operation.get('type') == protocol.OP_BUFFER_CALIBRATION:
+            return True
+        channels = set()
+        values = []
+        if operation.get('channel') is not None:
+            values.append(operation.get('channel'))
+        values.extend(operation.get('channels', []) or [])
+        for value in values:
+            try:
+                value = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if 0 <= value <= 3:
+                channels.add(value)
+        if not channels:
+            return True
+        return int(channel) in channels
+
+    def _lock_u1_background_resources(self, job):
+        if self._maintenance_prepared():
+            raise BMCUError(
+                'BMCU maintenance is prepared; background motion is blocked')
+        endpoint = job.get('endpoint')
+        if endpoint is None:
+            raise BMCUError('background operation has no endpoint')
+        pairs = []
+        for device_key, channel_key in (
+                ('source_device', 'source_channel'),
+                ('target_device', 'target_channel')):
+            device = job.get(device_key)
+            channel = job.get(channel_key)
+            if device is None or channel is None:
+                continue
+            key = (device.name, int(channel))
+            if key not in [(item.name, value) for item, value in pairs]:
+                pairs.append((device, int(channel)))
+        for device, channel in pairs:
+            if self._u1_background_channel_conflict(
+                    device, channel, ignore_job=job):
+                raise BMCUError(
+                    '%s Channel %d already has background filament motion' %
+                    (device.name, channel + 1))
+            if self._operation_conflicts_channel(device, channel):
+                raise BMCUError(
+                    '%s Channel %d is already used by a foreground operation' %
+                    (device.name, channel + 1))
+        if endpoint.name in self.endpoint_locks:
+            raise BMCUError('endpoint %s is busy' % endpoint.name)
+        path_group = endpoint.shared_path_group()
+        if path_group in self.path_locks:
+            raise BMCUError('shared path %s is busy' % path_group)
+        try:
+            self._reserve_u1_background_channels(job)
+            self.endpoint_locks.add(endpoint.name)
+            self.path_locks.add(path_group)
+            job['background_resources_locked'] = True
+            job['locked'] = True
+        except Exception:
+            self._release_u1_background_channels(job)
+            self.endpoint_locks.discard(endpoint.name)
+            self.path_locks.discard(path_group)
+            job['background_resources_locked'] = False
+            job['locked'] = False
+            raise
+
+    def _wait_u1_background_async_slot(self, job, device, channel, cancel_check=None):
+        deadline = self.reactor.monotonic() + self._u1_background_wait_timeout([job])
+        while True:
+            if (self._klippy_disconnecting or job.get('cancelled') or
+                    (callable(cancel_check) and cancel_check())):
+                raise BMCUError('BMCU background preparation was cancelled')
+            slot = self._u1_background_async_slots.get(device.name)
+            if (slot is None and
+                    not self._u1_foreground_async_waiters.get(device.name)):
+                slot = {'job': job, 'channel': int(channel),
+                        'op_id': 0, 'deadline': float(deadline)}
+                self._u1_background_async_slots[device.name] = slot
+                job['background_async_device'] = device.name
+                try:
+                    status = dict(device.refresh())
+                    state = status.get('active_op_state', protocol.OP_STATE_IDLE)
+                    load_active = any(
+                        value in (protocol.MOTION_SEND_OUT,
+                                  protocol.MOTION_BEFORE_ON_USE)
+                        for value in status.get('motion', []))
+                    if (state != protocol.OP_STATE_RUNNING and not load_active and
+                            not job.get('cancelled') and
+                            not self._u1_foreground_async_waiters.get(device.name)):
+                        return
+                except Exception:
+                    self._release_u1_background_async_slot(job)
+                    raise
+                self._release_u1_background_async_slot(job)
+            elif isinstance(slot, dict) and slot.get('job') is job:
+                return
+            if callable(cancel_check) and cancel_check():
+                raise BMCUError(
+                    'BMCU background preparation was cancelled while waiting '
+                    'for async transport slot')
+            if self.reactor.monotonic() >= deadline:
+                raise BMCUError(
+                    '%s async transport slot did not become available for '
+                    'background Channel %d' %
+                    (device.name, int(channel) + 1))
+            self.reactor.pause(
+                self.reactor.monotonic() + self._u1_background_poll_interval)
+
+    def _release_u1_background_async_slot(self, job):
+        device_name = str(job.get('background_async_device', '') or '')
+        if not device_name:
+            return
+        slot = self._u1_background_async_slots.get(device_name)
+        if isinstance(slot, dict) and slot.get('job') is job:
+            self._u1_background_async_slots.pop(device_name, None)
+        job['background_async_device'] = ''
+
+    def _acquire_u1_foreground_async_slot(self, device, channel):
+        waiters = self._u1_foreground_async_waiters
+        waiters[device.name] = waiters.get(device.name, 0) + 1
+        try:
+            self._wait_u1_background_async_clear(device)
+        finally:
+            remaining = waiters.get(device.name, 1) - 1
+            if remaining:
+                waiters[device.name] = remaining
+            else:
+                waiters.pop(device.name, None)
+        slot = self._u1_background_async_slots.get(device.name)
+        if isinstance(slot, dict):
+            raise BMCUError(
+                '%s async transport slot became busy before foreground start' %
+                device.name)
+        token = {
+            'job': None,
+            'foreground': True,
+            'channel': int(channel),
+            'op_id': 0,
+            'deadline': self.reactor.monotonic() + max(
+                10.0, float(self.contact_timeout) + 10.0),
+        }
+        self._u1_background_async_slots[device.name] = token
+        return token
+
+    def _bind_u1_foreground_async_slot(self, device, token, op_id):
+        if self._u1_background_async_slots.get(device.name) is not token:
+            raise BMCUError(
+                '%s foreground async transport reservation was lost' %
+                device.name)
+        token['op_id'] = int(op_id)
+
+    def _release_u1_foreground_async_slot(
+            self, device, op_id=None, token=None, channel=None):
+        slot = self._u1_background_async_slots.get(device.name)
+        if not isinstance(slot, dict) or not slot.get('foreground'):
+            return False
+        if token is not None and slot is not token:
+            return False
+        if channel is not None:
+            try:
+                slot_channel = int(slot.get('channel', -1))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if slot_channel != int(channel):
+                return False
+        if op_id is not None:
+            try:
+                slot_op_id = int(slot.get('op_id', 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if slot_op_id != int(op_id):
+                return False
+        self._u1_background_async_slots.pop(device.name, None)
+        return True
+
+    def _start_u1_async_feed(self, device, channel, starter, *args, **kwargs):
+        background_job = kwargs.pop('background_job', None)
+        token = None
+        if isinstance(background_job, dict):
+            slot = self._u1_background_async_slots.get(device.name)
+            if not isinstance(slot, dict) or slot.get('job') is not background_job:
+                raise BMCUError(
+                    '%s background async transport slot is not reserved' %
+                    device.name)
+        else:
+            token = self._acquire_u1_foreground_async_slot(device, channel)
+        try:
+            op_id = starter(channel, *args, **kwargs)
+            if token is not None:
+                self._bind_u1_foreground_async_slot(device, token, op_id)
+            else:
+                slot['op_id'] = int(op_id)
+            return op_id
+        except Exception:
+            self._stop_channel_motion(device, channel)
+            if token is not None:
+                self._release_u1_foreground_async_slot(
+                    device, token=token)
+            raise
+
+    def _wait_u1_background_async_clear(self, device, background_job=None):
+        deadline = None
+        while True:
+            if self._klippy_disconnecting or self._u1_cancel_requested:
+                raise BMCUError('BMCU foreground operation was cancelled')
+            slot = self._u1_background_async_slots.get(device.name)
+            if (not isinstance(slot, dict) or
+                    (background_job is not None and
+                     slot.get('job') is background_job)):
+                return
+            job = slot.get('job')
+            if deadline is None:
+                deadline = float(slot.get(
+                    'deadline',
+                    self.reactor.monotonic() + self.contact_timeout + 5.0))
+            if self.reactor.monotonic() >= deadline:
+                raise BMCUError(
+                    '%s background async transport did not finish in time' %
+                    device.name)
+            if isinstance(job, dict) and job.get('cancelled'):
+                deadline = min(
+                    deadline,
+                    self.reactor.monotonic() + max(
+                        1.0, 5.0 * self._u1_background_poll_interval))
+            self.reactor.pause(
+                self.reactor.monotonic() + self._u1_background_poll_interval)
+
     def _lock(self, device, endpoint, operation, channel=None):
         if self._maintenance_prepared():
             raise BMCUError('BMCU maintenance is prepared; new motion is blocked')
+        if self._u1_background_channel_conflict(device, channel):
+            raise BMCUError('%s Channel %s is busy with background filament motion' %
+                            (device.name, '?' if channel is None else int(channel) + 1))
         active = self.active_operations.get(device.name)
         if active is not None:
             raise BMCUError('%s is busy: %s' % (device.name, active))
@@ -7435,6 +7762,7 @@ class BMCUManager(object):
         self.path_locks.add(path_group)
 
     def _unlock(self, device, endpoint):
+        self._release_u1_foreground_async_slot(device)
         operation = self.active_operations.get(device.name, {})
         self.endpoint_locks.discard(endpoint.name)
         self.path_locks.discard(operation.get('shared_path_group', endpoint.shared_path_group()))
@@ -7443,6 +7771,9 @@ class BMCUManager(object):
     def _lock_channel_input(self, device, operation, channel):
         if self._maintenance_prepared():
             raise BMCUError('BMCU maintenance is prepared; new motion is blocked')
+        if self._u1_background_channel_conflict(device, channel):
+            raise BMCUError('%s Channel %d is busy with background filament motion' %
+                            (device.name, int(channel) + 1))
         active = self.active_operations.get(device.name)
         if active is not None:
             raise BMCUError('%s is busy: %s' % (device.name, active))
@@ -7453,21 +7784,39 @@ class BMCUManager(object):
         }
 
     def _unlock_channel_input(self, device):
+        self._release_u1_foreground_async_slot(device)
         self.active_operations.pop(device.name, None)
 
     def _lock_refill(self, source_device, replacement_device, endpoint, operation,
-                     replacement_endpoint=None):
+                     replacement_endpoint=None, source_channel=None,
+                     replacement_channel=None):
         if self._maintenance_prepared():
             raise BMCUError('BMCU maintenance is prepared; new refill motion is blocked')
         devices = []
-        for device in (source_device, replacement_device):
-            if device is not None and device.name not in [item.name for item in devices]:
+        device_channels = {}
+        for device, channel in ((source_device, source_channel),
+                                (replacement_device, replacement_channel)):
+            if device is None:
+                continue
+            if device.name not in [item.name for item in devices]:
                 devices.append(device)
+            channels = device_channels.setdefault(device.name, set())
+            if channel is not None:
+                channels.add(int(channel))
         endpoints = []
         for item in (endpoint, replacement_endpoint):
             if item is not None and item.name not in [value.name for value in endpoints]:
                 endpoints.append(item)
         for device in devices:
+            channels = device_channels.get(device.name, set())
+            if channels:
+                for channel in channels:
+                    if self._u1_background_channel_conflict(device, channel):
+                        raise BMCUError(
+                            '%s Channel %d has background filament motion' %
+                            (device.name, channel + 1))
+            elif self._u1_background_channel_conflict(device):
+                raise BMCUError('%s has background filament motion' % device.name)
             if device.name in self.active_operations:
                 raise BMCUError('%s is busy' % device.name)
         path_groups = []
@@ -7485,13 +7834,19 @@ class BMCUManager(object):
             self.path_locks.add(group)
         endpoint_names = [item.name for item in endpoints]
         for device in devices:
-            self.active_operations[device.name] = {
+            record = {
                 'name': operation, 'device': device.name,
                 'endpoint': endpoint_names[0] if endpoint_names else '',
                 'endpoints': list(endpoint_names),
                 'shared_path_group': path_groups[0] if path_groups else '',
                 'shared_path_groups': list(path_groups), 'refill': True,
             }
+            channels = sorted(device_channels.get(device.name, set()))
+            if len(channels) == 1:
+                record['channel'] = channels[0]
+            elif channels:
+                record['channels'] = channels
+            self.active_operations[device.name] = record
 
     def _unlock_refill(self, source_device, replacement_device, endpoint,
                        replacement_endpoint=None):
@@ -7511,6 +7866,7 @@ class BMCUManager(object):
                 path_groups.append(group)
         for device in devices:
             operation = self.active_operations.pop(device.name, {})
+            self._release_u1_foreground_async_slot(device)
             for name in operation.get('endpoints', []):
                 if name not in endpoint_names:
                     endpoint_names.append(name)
@@ -7526,8 +7882,26 @@ class BMCUManager(object):
         if self.debug_enabled:
             logging.info('BMCU DEBUG ' + message, *args)
 
-    def _set_phase(self, device, phase):
+    def _set_phase(self, device, phase, channel=None):
         operation = self.active_operations.get(device.name)
+        if operation is not None and channel is not None:
+            try:
+                wanted_channel = int(channel)
+            except (TypeError, ValueError, OverflowError):
+                wanted_channel = -1
+            operation_channels = set()
+            if operation.get('channel') is not None:
+                try:
+                    operation_channels.add(int(operation.get('channel')))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            for value in operation.get('channels', []):
+                try:
+                    operation_channels.add(int(value))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            if operation_channels and wanted_channel not in operation_channels:
+                operation = None
         if operation is not None:
             previous = str(operation.get('phase', '') or '')
             now = self.reactor.monotonic()
@@ -7714,7 +8088,7 @@ class BMCUManager(object):
 
     def _start_endpoint_arrival_operation(
             self, device, channel, endpoint, maximum_mm, contact_pct,
-            timeout_s, parked_precharge=False):
+            timeout_s, parked_precharge=False, background_job=None):
 
         timeout_ms = int(float(timeout_s) * 1000.0)
         sensor_authoritative = bool(
@@ -7734,25 +8108,27 @@ class BMCUManager(object):
                     'confirm an empty entry before SEND_OUT')
         if sensor_authoritative:
             target_pct = int(contact_pct) if parked_precharge else 98
-            deadline = self.reactor.monotonic() + timeout_s + 2.0
             start = (device.start_feed_to_contact if parked_precharge
                      else device.start_feed_distance)
-            op_id = start(
-                channel, maximum_mm, target_pct, timeout_ms)
+            op_id = self._start_u1_async_feed(
+                device, channel, start, maximum_mm, target_pct, timeout_ms,
+                background_job=background_job)
             return op_id, {
                 'sensor_authoritative': True,
                 'contact_authoritative': False,
                 'precharge_buffer_pct': target_pct,
                 'contact_pct': target_pct,
                 'operation_timeout_ms': timeout_ms,
-                'deadline': deadline,
+                'deadline': self.reactor.monotonic() + timeout_s + 2.0,
                 'parked_precharge': bool(parked_precharge),
                 'operation': ('u1_parked_neutral_precharge'
                               if parked_precharge else
                               'feed_to_endpoint_sensor'),
             }
-        op_id = device.start_feed_to_contact(
-            channel, maximum_mm, contact_pct, timeout_ms)
+        op_id = self._start_u1_async_feed(
+            device, channel, device.start_feed_to_contact,
+            maximum_mm, contact_pct, timeout_ms,
+            background_job=background_job)
         return op_id, {
             'sensor_authoritative': False,
             'contact_buffer_pct': int(contact_pct),
@@ -7859,10 +8235,7 @@ class BMCUManager(object):
                 deadline += max(
                     0.0, self.reactor.monotonic() - before)
             if cancel_requested:
-                try:
-                    device.stop_all()
-                except Exception:
-                    pass
+                self._stop_channel_motion(device, channel)
                 raise BMCUError(
                     'UNLOAD_BUFFER_CANCELLED: operation was cancelled')
             if not device.connected:
@@ -7923,10 +8296,7 @@ class BMCUManager(object):
                 deadline += max(
                     0.0, self.reactor.monotonic() - before)
             if cancel_requested:
-                try:
-                    device.stop_all()
-                except Exception:
-                    pass
+                self._stop_channel_motion(device, channel)
                 raise BMCUError('PULLBACK_CANCELLED: operation was cancelled')
             if not device.connected:
                 raise BMCUError('DEVICE_OFFLINE during BMCU pullback')
@@ -7963,10 +8333,7 @@ class BMCUManager(object):
                         if (extreme_samples >= 3 and
                                 extreme_since is not None and
                                 now - extreme_since >= 0.40):
-                            try:
-                                device.stop_all()
-                            except Exception:
-                                pass
+                            self._stop_channel_motion(device, channel)
                             raise BMCUError(
                                 'PARK_JAM: buffer remained at %d%% across '
                                 '%d fresh status frames; motors stopped' %
@@ -7976,10 +8343,7 @@ class BMCUManager(object):
                         extreme_samples = 0
 
             if now >= deadline:
-                try:
-                    device.stop_all()
-                except Exception:
-                    pass
+                self._stop_channel_motion(device, channel)
                 raise BMCUError(
                     'PARK_TIMEOUT: BMCU pullback did not finish')
             if now >= next_poll:
@@ -8009,6 +8373,7 @@ class BMCUManager(object):
         sensor_triggered = False
         motion_evidence = None
         interrupted = False
+        abort_requested = False
         cancel_requested = False
         next_query = self.reactor.monotonic() + 1.0
 
@@ -8028,114 +8393,121 @@ class BMCUManager(object):
                 result['reason'] = 'cancelled'
             return result
 
-        while True:
-            if (self._u1_cancel_requested or
-                    (callable(cancel_check) and cancel_check())):
-                cancel_requested = True
-            if (pause_for_critical and
-                    self._critical_control_plane_blocked()):
-                before = self.reactor.monotonic()
-                if self._wait_background_control_plane(
-                        cancel_check=lambda: bool(
-                            self._u1_cancel_requested or
-                            (callable(cancel_check) and cancel_check())),
-                        poll_interval=poll_interval):
+        try:
+            while True:
+                if (self._u1_cancel_requested or
+                        (callable(cancel_check) and cancel_check())):
                     cancel_requested = True
-                if deadline is not None:
-                    deadline += max(
-                        0.0, self.reactor.monotonic() - before)
-            if cancel_requested:
-                if device.connected:
-                    try:
-                        device.abort_operation()
-                    except Exception:
+                if (pause_for_critical and
+                        self._critical_control_plane_blocked()):
+                    before = self.reactor.monotonic()
+                    if self._wait_background_control_plane(
+                            cancel_check=lambda: bool(
+                                self._u1_cancel_requested or
+                                (callable(cancel_check) and cancel_check())),
+                            poll_interval=poll_interval):
+                        cancel_requested = True
+                    if deadline is not None:
+                        deadline += max(
+                            0.0, self.reactor.monotonic() - before)
+                if cancel_requested:
+                    if device.connected:
                         try:
-                            device.stop_all()
+                            self._abort_feed_operation(device, op_id)
                         except Exception:
-                            logging.exception(
-                                'BMCU could not stop SEND_OUT after U1 UI cancel')
+                            slot = self._u1_background_async_slots.get(device.name)
+                            if (isinstance(slot, dict) and
+                                    int(slot.get('op_id', 0)) == int(op_id)):
+                                self._stop_channel_motion(
+                                    device, int(slot['channel']),
+                                    expected_op_id=op_id)
 
+                    completed_result = (
+                        device.last_op
+                        if device.last_op and device.last_op.get('op_id') == op_id
+                        else None)
+                    return finish(completed_result or {
+                        'op_id': int(op_id),
+                        'state': protocol.OP_STATE_ABORTED,
+                        'ok': False,
+                        'reason': 'cancelled',
+                        'measured_mm': 0.0,
+                    })
                 completed_result = (
                     device.last_op
                     if device.last_op and device.last_op.get('op_id') == op_id
                     else None)
-                return finish(completed_result or {
-                    'op_id': int(op_id),
-                    'state': protocol.OP_STATE_ABORTED,
-                    'ok': False,
-                    'reason': 'cancelled',
-                    'measured_mm': 0.0,
-                })
-            completed_result = (
-                device.last_op
-                if device.last_op and device.last_op.get('op_id') == op_id
-                else None)
-            if not device.connected:
-                raise BMCUError('DEVICE_OFFLINE during feed operation')
+                if not device.connected:
+                    raise BMCUError('DEVICE_OFFLINE during feed operation')
 
-            now = self.reactor.monotonic()
-            detected = False
-            if endpoint is not None and sensor_role:
-                if (endpoint.driver == 'snapmaker_u1' and
-                        sensor_role in ('entry_sensor', 'motion_sensor')):
+                now = self.reactor.monotonic()
+                detected = False
+                if endpoint is not None and sensor_role:
+                    if (endpoint.driver == 'snapmaker_u1' and
+                            sensor_role in ('entry_sensor', 'motion_sensor')):
 
-                    snapshot = endpoint.entry_sensor_snapshot()
-                    detected = bool(
-                        snapshot.get('available') and
-                        snapshot.get('coherent') and
-                        snapshot.get('physical_detected') is True)
-                else:
-                    detected = endpoint.sensor_detected(sensor_role) is True
+                        snapshot = endpoint.entry_sensor_snapshot()
+                        detected = bool(
+                            snapshot.get('available') and
+                            snapshot.get('coherent') and
+                            snapshot.get('physical_detected') is True)
+                    else:
+                        detected = endpoint.sensor_detected(sensor_role) is True
 
-            if detected and not sensor_triggered:
+                if detected and not sensor_triggered:
 
-                sensor_triggered = True
-                if (endpoint is not None and
-                        endpoint.driver == 'snapmaker_u1'):
-                    motion_evidence = dict(snapshot)
-                try:
-                    device.abort_operation()
-                except Exception:
-
-                    pass
-                if device.last_op and device.last_op.get('op_id') == op_id:
-                    completed_result = device.last_op
-
-            if completed_result is not None:
-                return finish(completed_result)
-            if deadline is not None and now >= deadline:
-                break
-
-            if (not sensor_triggered and not interrupted and
-                    callable(interrupt_check)):
-                try:
-                    should_interrupt = bool(interrupt_check())
-                except Exception:
-                    logging.exception(
-                        'BMCU feed-operation interrupt predicate failed')
-                    should_interrupt = False
-                if should_interrupt:
-                    interrupted = True
+                    sensor_triggered = True
+                    if (endpoint is not None and
+                            endpoint.driver == 'snapmaker_u1'):
+                        motion_evidence = dict(snapshot)
+                if sensor_triggered and not abort_requested:
                     try:
-                        device.abort_operation()
+                        abort_requested = self._abort_feed_operation(device, op_id)
+                    except Exception:
+
+                        pass
+                    if device.last_op and device.last_op.get('op_id') == op_id:
+                        completed_result = device.last_op
+
+                if completed_result is not None:
+                    return finish(completed_result)
+                if deadline is not None and now >= deadline:
+                    break
+
+                if (not sensor_triggered and not interrupted and
+                        callable(interrupt_check)):
+                    try:
+                        should_interrupt = bool(interrupt_check())
+                    except Exception:
+                        logging.exception(
+                            'BMCU feed-operation interrupt predicate failed')
+                        should_interrupt = False
+                    if should_interrupt:
+                        interrupted = True
+                if interrupted and not abort_requested:
+                    try:
+                        abort_requested = self._abort_feed_operation(device, op_id)
                     except Exception:
                         pass
 
-            if now >= next_query:
-                try:
-                    result = device.query_operation(op_id, timeout=0.75)
-                    if result and result.get('op_id') == op_id:
-                        return finish(result)
-                except Exception:
-                    pass
-                next_query = now + 1.0
-            wake = now + poll_interval
-            self.reactor.pause(wake if deadline is None else min(deadline, wake))
-        try:
-            device.abort_operation()
-        except Exception:
-            pass
-        raise BMCUError('feed operation %d timed out' % op_id)
+                if now >= next_query:
+                    try:
+                        result = device.query_operation(op_id, timeout=0.75)
+                        if result and result.get('op_id') == op_id:
+                            return finish(result)
+                    except Exception:
+                        pass
+                    next_query = now + 1.0
+                wake = now + poll_interval
+                self.reactor.pause(wake if deadline is None else min(deadline, wake))
+            try:
+                self._abort_feed_operation(device, op_id)
+            except Exception:
+                pass
+            raise BMCUError('feed operation %d timed out' % op_id)
+        finally:
+            self._release_u1_foreground_async_slot(
+                device, op_id=op_id)
 
     def _wait_sensor_arrival(
             self, device, channel, endpoint, op_id, arrival_policy,
@@ -8162,6 +8534,28 @@ class BMCUManager(object):
         }
         logging.error('BMCU %s', self.last_error)
         self._sync_status_cache_runtime()
+
+    def _clear_matching_last_error(self, device, channel, endpoint=None):
+        error = self.last_error
+        if not isinstance(error, dict):
+            return False
+        error_device = str(error.get('device') or '')
+        try:
+            error_channel = int(error.get('channel', -1))
+        except (TypeError, ValueError):
+            error_channel = -1
+        error_endpoint = str(error.get('endpoint') or '')
+        if error_device and error_device != device.name:
+            return False
+        if error_channel >= 0 and error_channel != channel:
+            return False
+        if error_endpoint and (endpoint is None or error_endpoint != endpoint.name):
+            return False
+        if error_channel < 0 and not error_endpoint:
+            return False
+        self.last_error = None
+        self._sync_status_cache_runtime()
+        return True
 
     def _print_state(self):
         stats = self.printer.lookup_object('print_stats', None)
@@ -8381,9 +8775,82 @@ class BMCUManager(object):
                 'or complete exact recovery from the panel' %
                 pending.get('phase', 'unknown'))
 
+    def _abort_feed_operation(self, device, op_id):
+        slot = self._u1_background_async_slots.get(device.name)
+        if not isinstance(slot, dict) or int(slot.get('op_id', 0)) != int(op_id):
+            return False
+        status = dict(device.refresh())
+        if (self._u1_background_async_slots.get(device.name) is not slot or
+                status.get('active_op_state') != protocol.OP_STATE_RUNNING or
+                int(status.get('active_op_id', 0)) != int(op_id) or
+                status.get('active_op_channel') != slot.get('channel')):
+            return False
+        device.abort_operation()
+        return True
+
+    def _stop_channel_motion(self, device, channel, expected_op_id=None):
+        channel = int(channel)
+        if not 0 <= channel < 4:
+            return False
+        slot = self._u1_background_async_slots.get(device.name)
+        reserved = slot is None
+        if reserved:
+            slot = {'channel': channel, 'stopping': True,
+                    'deadline': self.reactor.monotonic() + 10.0}
+            self._u1_background_async_slots[device.name] = slot
+        try:
+            status = dict(device.refresh())
+            active_state_raw = status.get(
+                'active_op_state', protocol.OP_STATE_IDLE)
+            active_channel_raw = status.get('active_op_channel', 0xff)
+            active_op_id_raw = status.get('active_op_id', 0)
+            active_state = int(
+                protocol.OP_STATE_IDLE if active_state_raw is None else
+                active_state_raw)
+            active_channel = int(
+                0xff if active_channel_raw is None else active_channel_raw)
+            active_op_id = int(0 if active_op_id_raw is None else active_op_id_raw)
+            if (active_state == protocol.OP_STATE_RUNNING and
+                    active_channel == channel):
+                if (expected_op_id is not None and
+                        active_op_id != int(expected_op_id)):
+                    logging.error(
+                        '%s Channel %d has unexpected active operation %d' %
+                        (device.name, channel + 1, active_op_id))
+                    return False
+                if (self._u1_background_async_slots.get(device.name) is not slot or
+                        int(slot.get('channel', -1)) != channel):
+                    return False
+                device.abort_operation()
+                device.refresh()
+            device.set_motion(channel, protocol.MOTION_IDLE)
+            status = dict(device.refresh())
+            motions = status.get('motion', [])
+            if channel >= len(motions) or int(motions[channel]) != protocol.MOTION_IDLE:
+                raise BMCUError(
+                    '%s Channel %d did not stop cleanly' %
+                    (device.name, channel + 1))
+            return True
+        except Exception:
+            logging.exception(
+                'BMCU could not stop %s Channel %d independently',
+                device.name, channel + 1)
+            try:
+                device.stop_all()
+            except Exception:
+                logging.exception(
+                    'BMCU could not fail-safe stop %s after channel stop failure',
+                    device.name)
+            self._safe_pause(defer_to_virtual_sd=True)
+            return False
+        finally:
+            if (reserved and
+                    self._u1_background_async_slots.get(device.name) is slot):
+                self._u1_background_async_slots.pop(device.name, None)
+
     def _stop_on_failure(self, device, endpoint, exc, phase, channel,
                          pause_print=True, restore_sensors=True,
-                         wait_for_control_plane=False):
+                         wait_for_control_plane=False, channel_only=True):
         preserve_hold = bool(getattr(exc, 'preserve_bmcu_hold', False))
         if not preserve_hold:
             if (wait_for_control_plane and
@@ -8394,12 +8861,28 @@ class BMCUManager(object):
                 except Exception:
                     logging.exception(
                         'BMCU could not wait for printer motion before failure stop')
-            try:
-                device.stop_all()
-            except Exception:
-                logging.exception(
-                    'BMCU could not stop %s after failure during %s',
-                    device.name, phase)
+            if channel_only:
+                stopped_independently = self._stop_channel_motion(
+                    device, channel)
+                if not stopped_independently and not pause_print:
+                    self._safe_pause(defer_to_virtual_sd=True)
+            else:
+                if self._u1_background_jobs:
+                    try:
+                        self._cancel_u1_background_jobs(
+                            'foreground operation failed during %s' % phase,
+                            wait=False)
+                    except Exception:
+                        logging.exception(
+                            'BMCU could not cancel background preparation after '
+                            'foreground failure during %s', phase)
+                try:
+                    device.stop_all()
+                except Exception:
+                    logging.exception(
+                        'BMCU could not stop %s after failure during %s',
+                        device.name, phase)
+                self._release_u1_foreground_async_slot(device)
         else:
             logging.error(
                 'BMCU preserving firmware-local BEFORE_ON_USE pressure hold '
@@ -9061,12 +9544,12 @@ class BMCUManager(object):
                 return result
         return None
 
-    def _u1_background_controller_conflict(self, device_names, after_index,
+    def _u1_background_controller_conflict(self, route_keys, after_index,
                                            before_index, path_groups=()):
 
-        names = set(str(name) for name in device_names if name)
+        reserved_routes = set(tuple(value) for value in route_keys if value)
         groups = set(path_groups)
-        if not names and not groups:
+        if not reserved_routes and not groups:
             return None
         start = max(0, int(after_index) + 1)
         stop = min(len(self._u1_toolchange_plan), int(before_index))
@@ -9077,11 +9560,16 @@ class BMCUManager(object):
                 continue
             device = route.get('device')
             endpoint = route.get('endpoint')
-            if ((device is not None and device.name in names) or
+            route_key = None
+            if device is not None and route.get('channel') is not None:
+                route_key = (device.name, int(route.get('channel')))
+            if ((route_key is not None and route_key in reserved_routes) or
                     (endpoint is not None and
                      endpoint.shared_path_group() in groups)):
                 return {'index': index, 'tool': tool,
                         'device': device.name if device is not None else 'native',
+                        'channel': (int(route.get('channel'))
+                                    if route.get('channel') is not None else -1),
                         'shared_path_group': (
                             endpoint.shared_path_group() if endpoint is not None
                             else '')}
@@ -9089,38 +9577,18 @@ class BMCUManager(object):
 
     def _set_u1_background_phase(self, job, phase):
         job['phase'] = str(phase)
-        devices = [job.get('source_device'), job.get('target_device')]
-        for device in devices:
-            if device is None:
-                continue
-            operation = self.active_operations.get(device.name)
-            if operation is not None:
-                operation['phase'] = str(phase)
-                operation['background'] = True
-                operation['source_tool'] = int(job.get('source_tool', -1))
-                operation['source_device'] = str(
-                    getattr(job.get('source_device'), 'name', '') or '')
-                operation['source_channel'] = int(
-                    job.get('source_channel', -1))
-                operation['target_tool'] = int(job.get('target_tool', -1))
-                operation['target_kind'] = str(job.get('target_kind', '') or '')
-                operation['target_device'] = str(
-                    getattr(job.get('target_device'), 'name', '') or '')
-                operation['target_channel'] = int(
-                    job.get('target_channel', -1)
-                    if job.get('target_channel') is not None else -1)
+        self._sync_status_cache_runtime()
 
     def _unlock_u1_background_job(self, job):
-        if not job.get('locked'):
-            return
-        source_device = job.get('source_device')
-        target_device = job.get('target_device')
+        self._release_u1_background_async_slot(job)
         endpoint = job.get('endpoint')
-        if job.get('lock_kind') == 'refill':
-            self._unlock_refill(source_device, target_device, endpoint)
-        elif source_device is not None and endpoint is not None:
-            self._unlock(source_device, endpoint)
+        if job.get('background_resources_locked') and endpoint is not None:
+            self.endpoint_locks.discard(endpoint.name)
+            self.path_locks.discard(endpoint.shared_path_group())
+        self._release_u1_background_channels(job)
+        job['background_resources_locked'] = False
         job['locked'] = False
+        self._sync_status_cache_runtime()
 
     def _clear_ready_u1_background_job(self, endpoint_name, job, reason=''):
         if self._u1_background_jobs.get(endpoint_name) is not job:
@@ -9180,18 +9648,27 @@ class BMCUManager(object):
             if (not worker_pending and
                     state not in ('starting', 'running')):
                 continue
-            for device in (job.get('source_device'), job.get('target_device')):
-                if device is None or device.name in stopped:
-                    continue
-                stopped.add(device.name)
-                if self._critical_control_plane_blocked():
-                    self._wait_background_control_plane()
-                try:
-                    device.stop_all()
-                except Exception:
-                    logging.exception(
-                        'BMCU could not stop %s while cancelling Snapmaker background job',
-                        device.name)
+            source_device = job.get('source_device')
+            source_channel = job.get('source_channel')
+            if source_device is not None and source_channel is not None:
+                key = (source_device.name, int(source_channel))
+                if key not in stopped:
+                    stopped.add(key)
+                    if self._critical_control_plane_blocked():
+                        self._wait_background_control_plane()
+                    self._stop_channel_motion(source_device, int(source_channel))
+            target_device = job.get('target_device')
+            target_channel = job.get('target_channel')
+            if (job.get('background_prestage_motion_started') and
+                    target_device is not None and target_channel is not None):
+                key = (target_device.name, int(target_channel))
+                if key not in stopped:
+                    stopped.add(key)
+                    if self._critical_control_plane_blocked():
+                        self._wait_background_control_plane()
+                    self._stop_channel_motion(
+                        target_device, int(target_channel),
+                        expected_op_id=job.get('background_prestage_op_id'))
         if not wait:
             return
         deadline = self.reactor.monotonic() + self._u1_background_wait_timeout(
@@ -9266,7 +9743,8 @@ class BMCUManager(object):
                                      background=False,
                                      handoff_check=None,
                                      operation_started_callback=None,
-                                     target_selected=False):
+                                     target_selected=False,
+                                     background_job=None):
         if callable(cancel_check) and cancel_check():
             raise BMCUError('background prestage was cancelled before motion')
         if (background and
@@ -9354,7 +9832,8 @@ class BMCUManager(object):
             device, channel, endpoint, maximum_mm, contact_pct, timeout_s,
             parked_precharge=bool(
                 self._u1_has_authoritative_entry_sensor(endpoint) and
-                not target_selected))
+                not target_selected),
+            background_job=background_job)
         if callable(operation_started_callback):
             try:
                 operation_started_callback(
@@ -9385,19 +9864,13 @@ class BMCUManager(object):
                 self._wait_background_control_plane(
                     cancel_check=cancel_check,
                     poll_interval=self._u1_background_poll_interval)):
-            try:
-                device.stop_all()
-            except Exception:
-                pass
+            self._stop_channel_motion(device, channel, expected_op_id=op_id)
             raise BMCUError('background prestage was cancelled before commit')
         result = self._resolve_endpoint_arrival_result(
             device, channel, endpoint, result, arrival_policy,
             timeout_s, allow_partial=bool(background))
         if callable(cancel_check) and cancel_check():
-            try:
-                device.stop_all()
-            except Exception:
-                pass
+            self._stop_channel_motion(device, channel, expected_op_id=op_id)
             raise BMCUError('background prestage was cancelled before commit')
 
         entry_confirmed = (
@@ -9731,18 +10204,38 @@ class BMCUManager(object):
                         'selected' if target_selected else 'parked',
                         endpoint.name)
 
-                staged = self._prestage_u1_to_entry_locked(
-                    target_device, int(target_channel), endpoint, target_tool,
-                    cancel_check=lambda: bool(job.get('cancelled')),
-                    allowed_detached_source=(
-                        (source_device, source_channel)
-                        if job.get('source_tail_prepared') else None),
-                    background=True,
+                if job.get('defer_target_async_until_foreground'):
+                    while (not job.get('foreground_released') and
+                           not job.get('cancelled') and
+                           not self._klippy_disconnecting):
+                        self.reactor.pause(
+                            self.reactor.monotonic() +
+                            self._u1_background_poll_interval)
+                    if job.get('cancelled') or self._klippy_disconnecting:
+                        raise BMCUError(
+                            'Snapmaker background prestage was cancelled before '
+                            'the foreground controller lane became available')
+                self._wait_u1_background_async_slot(
+                    job, target_device, int(target_channel),
+                    cancel_check=lambda: bool(job.get('cancelled')))
+                try:
+                    staged = self._prestage_u1_to_entry_locked(
+                        target_device, int(target_channel), endpoint, target_tool,
+                        cancel_check=lambda: bool(job.get('cancelled')),
+                        allowed_detached_source=(
+                            (source_device, source_channel)
+                            if job.get('source_tail_prepared') else None),
+                        background=True,
 
-                    handoff_check=lambda: bool(
-                        isinstance(job.get('redirect_route'), dict)),
-                    operation_started_callback=publish_prestage_operation,
-                    target_selected=target_selected)
+                        handoff_check=lambda: bool(
+                            isinstance(job.get('redirect_route'), dict) or
+                            self._u1_foreground_async_waiters.get(
+                                target_device.name)),
+                        operation_started_callback=publish_prestage_operation,
+                        target_selected=target_selected,
+                        background_job=job)
+                finally:
+                    self._release_u1_background_async_slot(job)
                 if job.get('cancelled'):
                     raise BMCUError(
                         'Snapmaker background swap cancelled after prestage: %s' %
@@ -9793,7 +10286,7 @@ class BMCUManager(object):
             self._stop_on_failure(
                 failing_device, endpoint, exc, phase, failing_channel,
                 pause_print=False, restore_sensors=False,
-                wait_for_control_plane=True)
+                wait_for_control_plane=True, channel_only=True)
             if not job.get('cancelled'):
                 logging.exception(
                     'BMCU Snapmaker background swap failed on %s; active print continues',
@@ -9802,7 +10295,9 @@ class BMCUManager(object):
             self._unlock_u1_background_job(job)
             self._save_runtime()
 
-    def _start_u1_background_transition(self, source, target, gcmd=None):
+    def _start_u1_background_transition(
+            self, source, target, gcmd=None,
+            defer_target_async_until_foreground=False):
         if not isinstance(target, dict):
             return False
         if self._u1_same_physical_source(source, target):
@@ -9825,36 +10320,13 @@ class BMCUManager(object):
             raise BMCUError('invalid Snapmaker background target')
         self._preempt_refill_for_toolchange(
             source_device, source_channel, endpoint)
-        try:
-            if target_device is not None and target_device.name != source_device.name:
-                self._lock_refill(
-                    source_device, target_device, endpoint,
-                    'SNAPMAKER BACKGROUND T%d TO T%d' %
-                    (source_tool, target_tool))
-                lock_kind = 'refill'
-            else:
-                self._lock(
-                    source_device, endpoint,
-                    'SNAPMAKER BACKGROUND T%d' % source_tool,
-                    channel=source_channel)
-                lock_kind = 'single'
-        except Exception as exc:
-
-            logging.info(
-                'BMCU skipped optional background preparation on %s because '
-                'the required lock became unavailable: %s', endpoint.name, exc)
-            if gcmd is not None:
-                gcmd.respond_info(
-                    'BMCU left T%d loaded because background resources became busy' %
-                    source_tool)
-            return False
         job = {
             'state': 'starting', 'phase': 'BACKGROUND_RELEASE',
             'source_tool': source_tool, 'source_device': source_device,
             'source_channel': source_channel, 'target_tool': target_tool,
             'target_kind': target_kind, 'target_identity': target_identity,
             'target_device': target_device, 'target_channel': target_channel,
-            'endpoint': endpoint, 'lock_kind': lock_kind, 'locked': True,
+            'endpoint': endpoint, 'lock_kind': 'background', 'locked': False,
             'cancelled': False, 'worker_scheduled': False,
             'worker_started': False, 'worker_finished': False,
             'foreground_released': False, 'source_lane_ready': False,
@@ -9866,9 +10338,24 @@ class BMCUManager(object):
             'foreground_head_prefetched': False,
             'foreground_load_context_prepared': False,
             'foreground_discard_position_prepared': False,
+            'defer_target_async_until_foreground': bool(
+                defer_target_async_until_foreground),
         }
-        self._u1_background_jobs[endpoint.name] = job
-        self._set_u1_background_phase(job, 'BACKGROUND_RELEASE')
+        try:
+            self._lock_u1_background_resources(job)
+            self._u1_background_jobs[endpoint.name] = job
+            self._set_u1_background_phase(job, 'BACKGROUND_RELEASE')
+        except Exception as exc:
+            self._u1_background_jobs.pop(endpoint.name, None)
+            self._unlock_u1_background_job(job)
+            logging.info(
+                'BMCU skipped optional background preparation on %s because '
+                'Channel reservation became unavailable: %s', endpoint.name, exc)
+            if gcmd is not None:
+                gcmd.respond_info(
+                    'BMCU left T%d loaded because background Channel resources '
+                    'became busy' % source_tool)
+            return False
         try:
             if self._snapmaker_ungripped_tail(
                     source_device, source_channel, endpoint):
@@ -9926,7 +10413,8 @@ class BMCUManager(object):
             job['state'] = 'error'
             job['error'] = str(error)
             self._stop_on_failure(
-                source_device, endpoint, error, phase, source_channel)
+                source_device, endpoint, error, phase, source_channel,
+                channel_only=True)
             self._unlock_u1_background_job(job)
             self._u1_background_jobs.pop(endpoint.name, None)
             raise error
@@ -10037,36 +10525,57 @@ class BMCUManager(object):
             return False
         source['temperature_profile'] = self._u1_active_temperature_profile()
 
-        required_now = set()
-        if target_now.get('kind') == 'bmcu' and target_now.get('device') is not None:
-            required_now.add(target_now['device'].name)
-        background_devices = {source['device'].name}
+        background_routes = {
+            (source['device'].name, int(source['channel']))
+        }
         if next_route.get('kind') == 'bmcu' and next_route.get('device') is not None:
-            background_devices.add(next_route['device'].name)
-        if required_now.intersection(background_devices):
-            logging.info(
-                'BMCU skipped optional background swap on %s because the current '
-                'tool requires the same controller', endpoint.name)
-            return False
+            background_routes.add((
+                next_route['device'].name, int(next_route['channel'])))
+        if target_now.get('kind') == 'bmcu' and target_now.get('device') is not None:
+            current_route = (
+                target_now['device'].name, int(target_now['channel']))
+            if current_route in background_routes:
+                logging.info(
+                    'BMCU skipped optional background swap on %s because the current '
+                    'tool needs the same BMCU Channel', endpoint.name)
+                return False
         if endpoint.shared_path_group() == target_now['endpoint'].shared_path_group():
             logging.info(
                 'BMCU skipped optional background swap on %s because the '
                 'current tool requires the same shared filament path', endpoint.name)
             return False
-        if any(name in self.active_operations for name in background_devices):
-            logging.info(
-                'BMCU skipped optional background swap on %s because a '
-                'required controller is already busy', endpoint.name)
-            return False
+        for device_name, channel in background_routes:
+            device = self.devices_by_name.get(device_name)
+            if device is not None and self._u1_background_channel_conflict(
+                    device, channel):
+                logging.info(
+                    'BMCU skipped optional background swap on %s because %s '
+                    'Channel %d already has background filament motion',
+                    endpoint.name, device_name, channel + 1)
+                return False
+            operation = self.active_operations.get(device_name)
+            if isinstance(operation, dict):
+                try:
+                    operation_channel = int(operation.get('channel', -1))
+                except (TypeError, ValueError, OverflowError):
+                    operation_channel = -1
+                if operation_channel in (-1, 0xff, channel):
+                    logging.info(
+                        'BMCU skipped optional background swap on %s because %s '
+                        'Channel %d is already busy',
+                        endpoint.name, device_name, channel + 1)
+                    return False
         conflict = self._u1_background_controller_conflict(
-            background_devices, int(plan_index),
+            background_routes, int(plan_index),
             int(next_route.get('plan_index', len(self._u1_toolchange_plan))),
             path_groups=(endpoint.shared_path_group(),))
         if conflict is not None:
             logging.info(
                 'BMCU skipped optional background swap on %s because T%d '
-                'needs controller %s or its shared filament path first', endpoint.name,
-                int(conflict['tool']), conflict['device'])
+                'needs reserved route %s Channel %s or its shared filament path first',
+                endpoint.name, int(conflict['tool']), conflict['device'],
+                ('-' if int(conflict.get('channel', -1)) < 0 else
+                 int(conflict['channel']) + 1))
             return False
 
         if next_route.get('kind') == 'bmcu':
@@ -10101,8 +10610,18 @@ class BMCUManager(object):
                     'BMCU skipped optional native preparation on %s: %s',
                     endpoint.name, exc)
                 return False
+        foreground_device = (
+            target_now.get('device')
+            if target_now.get('kind') == 'bmcu' else None)
+        future_device = (
+            next_route.get('device')
+            if next_route.get('kind') == 'bmcu' else None)
+        defer_target_async = bool(
+            foreground_device is not None and future_device is not None and
+            foreground_device.name == future_device.name)
         return self._start_u1_background_transition(
-            source, next_route, gcmd=gcmd)
+            source, next_route, gcmd=gcmd,
+            defer_target_async_until_foreground=defer_target_async)
 
     def _redirect_ready_u1_background_job(self, job, route):
         endpoint = job.get('endpoint')
@@ -10273,7 +10792,9 @@ class BMCUManager(object):
             job['foreground_target_requested'] = True
             job['foreground_target_tool'] = int(route.get('tool', -1))
         if redirect:
-
+            if route.get('kind') == 'bmcu':
+                self._reserve_u1_background_channel(
+                    job, route.get('device'), route.get('channel'))
             job['redirect_route'] = route
             job['redirect_identity'] = target_identity
             logging.info(
@@ -10481,7 +11002,10 @@ class BMCUManager(object):
         if not device.connected:
             raise BMCUError(
                 'source BMCU disconnected before forward-only handoff')
-        device.stop_all()
+        if not self._stop_channel_motion(device, channel):
+            raise BMCUError(
+                '%s Channel %d could not stop before forward-only handoff' %
+                (device.name, channel + 1))
         device.mark_unloaded(channel)
         device.refresh()
         if self._route_states_from_status(device.status)[channel] != protocol.ROUTE_EMPTY:
@@ -10538,7 +11062,7 @@ class BMCUManager(object):
         started_in_print = self._print_state() in (
             'printing', 'paused', 'pause')
         phase = 'TAIL_FOLLOWER_HANDOFF'
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         endpoint.suspend_managed_sensors()
         endpoint.select()
         endpoint.verify_selected()
@@ -10996,7 +11520,10 @@ class BMCUManager(object):
             return False
 
         route_key = self._route_key(device, channel)
-        device.stop_all()
+        if not self._stop_channel_motion(device, channel):
+            raise BMCUError(
+                '%s Channel %d could not be stopped before incomplete-load rollback' %
+                (device.name, channel + 1))
         device.refresh()
         endpoint.verify_selected()
         channel_metadata = self._channel_metadata(device, channel)
@@ -11026,16 +11553,10 @@ class BMCUManager(object):
         current_mm = (max(current_segment_candidates)
                       if current_segment_candidates else 0.0)
 
-        try:
-            configured_mm = float(
-                channel_metadata.get('unload_retract_mm', 850.0) or 850.0)
-        except (TypeError, ValueError, OverflowError):
-            configured_mm = 850.0
-        if not math.isfinite(configured_mm):
-            configured_mm = 850.0
-        configured_mm = max(10.0, min(2000.0, configured_mm))
         fed_mm = staged_mm + current_mm
-        required_mm = max(configured_mm, fed_mm)
+        if not current_segment_candidates or fed_mm <= 0.0:
+            return False
+        required_mm = max(10.0, fed_mm)
 
         context = {
             'material': channel_metadata.get('material', ''),
@@ -11215,7 +11736,7 @@ class BMCUManager(object):
 
                 self._lock(device, endpoint, 'SELECT LOADED %s' % operation_label, channel=channel)
                 phase = 'SELECT_LOADED_ENDPOINT'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 try:
                     self._arm_u1_persistent_hold(
                         endpoint, device, channel, 'select loaded %s' % operation_label)
@@ -11238,6 +11759,7 @@ class BMCUManager(object):
                     else:
                         self.loaded_tools.pop(route_key, None)
                     self._save_runtime()
+                    self._clear_matching_last_error(device, channel, endpoint)
                     if gcmd:
                         gcmd.respond_info(
                             'BMCU selected already-loaded %s Channel %d on %s' %
@@ -11278,7 +11800,9 @@ class BMCUManager(object):
         multi_device_switch = (
             source_device is not None and source_device.name != device.name)
         if multi_device_switch:
-            self._lock_refill(source_device, device, endpoint, 'TOOL_SWITCH %s' % operation_label)
+            self._lock_refill(
+                source_device, device, endpoint, 'TOOL_SWITCH %s' % operation_label,
+                source_channel=source_channel, replacement_channel=channel)
         else:
             self._lock(device, endpoint, 'LOAD %s' % operation_label, channel=channel)
         phase = 'PRECHECK'
@@ -11298,7 +11822,7 @@ class BMCUManager(object):
         u1_hold_was_active = bool(
             endpoint.driver == 'snapmaker_u1' and
             self._u1_ownership_record(endpoint.name).get('persistent_hold'))
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         load_completed = False
         load_temperature_finalized = False
         try:
@@ -11335,7 +11859,7 @@ class BMCUManager(object):
                 phase = 'UNLOAD_SOURCE'
                 failure_device = source_device
                 failure_channel = source_channel
-                self._set_phase(source_device, phase)
+                self._set_phase(source_device, phase, channel=source_channel)
                 target_motion_started = True
                 if self._ungripped_tail(
                         source_device, source_channel, endpoint):
@@ -11375,7 +11899,7 @@ class BMCUManager(object):
                 failure_device = device
                 failure_channel = channel
                 phase = 'PRECHECK_TARGET'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
             target_state = self._route_state(device, channel)
             if target_state == protocol.ROUTE_UNCERTAIN and not staged_for_target:
                 raise BMCUError(
@@ -11383,7 +11907,7 @@ class BMCUManager(object):
                     (device.name, channel + 1))
 
             phase = 'SELECT_ENDPOINT'
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             endpoint.suspend_managed_sensors()
             if retain_selected_u1_head:
 
@@ -11446,7 +11970,7 @@ class BMCUManager(object):
                     **prepare_load_kwargs)
 
             phase = 'ARRIVAL_SEARCH'
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             is_prestaged = staged_for_target
             if is_prestaged:
                 try:
@@ -11529,10 +12053,10 @@ class BMCUManager(object):
 
                 if callable(prepare_load_position):
                     phase = 'POSITION_FOR_LOAD'
-                    self._set_phase(device, phase)
+                    self._set_phase(device, phase, channel=channel)
                     prepare_load_position(material, load_temperature_profile)
                     phase = 'ARRIVAL_SEARCH'
-                    self._set_phase(device, phase)
+                    self._set_phase(device, phase, channel=channel)
                 arrival = (copy.deepcopy(staged_record.get('result', {}))
                            if staged_at_entry else {})
                 arrival.update({
@@ -11574,10 +12098,10 @@ class BMCUManager(object):
 
                 if callable(prepare_load_position):
                     phase = 'POSITION_FOR_LOAD'
-                    self._set_phase(device, phase)
+                    self._set_phase(device, phase, channel=channel)
                     prepare_load_position(material, load_temperature_profile)
                     phase = 'ARRIVAL_SEARCH'
-                    self._set_phase(device, phase)
+                    self._set_phase(device, phase, channel=channel)
                 if arrival_policy.get('sensor_authoritative'):
                     arrival = self._wait_sensor_arrival(
                         device, channel, endpoint, op_id, arrival_policy,
@@ -11667,7 +12191,7 @@ class BMCUManager(object):
                 self._clear_path_learning_observation(device, channel)
             phase = ('TOOLHEAD_PREPARATION' if generic_contract
                      else 'PREPARE_BITE')
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             u1_pressure_evidence = None
             if self.debug_enabled and self._u1_has_authoritative_entry_sensor(endpoint):
                 snapshot = endpoint.entry_debug_snapshot()
@@ -11694,7 +12218,7 @@ class BMCUManager(object):
 
             if not generic_contract:
                 phase = 'BITE'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 if endpoint.driver == 'snapmaker_u1':
                     self._drop_prestage_record(route_key, release_sensor=False)
             bite_ok = False
@@ -11831,7 +12355,7 @@ class BMCUManager(object):
                     json.dumps(bite_evidence, sort_keys=True))
             if generic_contract:
                 phase = 'TOOLHEAD_PREPARATION'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 entry_sensor_after_capture = endpoint.sensor_detected('entry_sensor')
                 post_gears = endpoint.sensor_detected('post_gears_sensor')
                 if str(endpoint.get('post_gears_sensor', '') or '').strip() and post_gears is False:
@@ -11843,7 +12367,7 @@ class BMCUManager(object):
                 target_physically_captured = True
             else:
                 phase = 'CAPTURE'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 before_capture = device.status['meters'][channel]
                 u1_readonly_path = self._u1_has_authoritative_entry_sensor(endpoint)
                 capture_mm = float(self.capture_mm)
@@ -11909,7 +12433,7 @@ class BMCUManager(object):
             if detached_source_handoff:
 
                 phase = 'COMMIT_FOLLOWER_ROUTE'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 if endpoint.driver == 'snapmaker_u1':
                     self._arm_u1_follower_commit(
                         endpoint, source_device, source_channel,
@@ -11942,7 +12466,7 @@ class BMCUManager(object):
 
             phase = ('BEFORE_ON_USE'
                      if endpoint.driver == 'snapmaker_u1' else 'TOOLHEAD_PREPARATION')
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             load_ready_evidence = self._endpoint_temperature_call(
                 endpoint, 'load_ready', material, load_temperature_profile)
             if self.debug_enabled and endpoint.driver == 'snapmaker_u1':
@@ -11993,7 +12517,7 @@ class BMCUManager(object):
                 endpoint, 'finish_load_temperature', None)
             if callable(finish_load_temperature):
                 phase = 'RESTORE_WORKING_TEMPERATURE'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 if not finish_load_temperature(success=True):
                     raise BMCUError(
                         'Snapmaker Head %d did not restore its working '
@@ -12003,7 +12527,7 @@ class BMCUManager(object):
                 endpoint, 'finish_load_position', None)
             if callable(finish_load_position):
                 phase = 'SAFE_LOAD_EGRESS'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 if not finish_load_position():
                     raise BMCUError(
                         'Snapmaker Head %d did not reach the stock XY idle '
@@ -12015,6 +12539,7 @@ class BMCUManager(object):
                 self._u1_preextrude_primed_tools[tool] = (
                     self.reactor.monotonic())
             load_completed = True
+            self._clear_matching_last_error(device, channel, endpoint)
             if endpoint.driver == 'snapmaker_u1':
                 self._mark_u1_head_prepared(
                     endpoint.get('head_index', -1),
@@ -12066,6 +12591,20 @@ class BMCUManager(object):
                 self._u1_cancel_requested or
                 (isinstance(arrival, dict) and
                  arrival.get('cancel_requested')))
+            if (isinstance(arrival, dict) and
+                    arrival.get('reason') in (
+                        'busy', 'not_calibrated', 'no_filament', 'encoder_io') and
+                    arrival.get('measured_mm') == 0.0 and
+                    arrival.get('duration_ms') == 0 and
+                    arrival_preexisting_mm == 0.0 and
+                    not target_physically_captured):
+                try:
+                    device.refresh()
+                    if (self._route_states_from_status(device.status)[channel] ==
+                            protocol.ROUTE_EMPTY):
+                        target_motion_started = False
+                except Exception:
+                    logging.exception('BMCU could not verify rejected load state')
             if (endpoint.driver == 'snapmaker_u1' and
                     not cancel_during_load and
                     (target_motion_started or arrival_preexisting_mm > 0.0) and
@@ -12083,10 +12622,7 @@ class BMCUManager(object):
                             preexisting_mm=arrival_preexisting_mm))
                 except Exception as recovery_exc:
 
-                    try:
-                        device.stop_all()
-                    except Exception:
-                        pass
+                    self._stop_channel_motion(device, channel)
                     logging.exception(
                         'BMCU incomplete pre-BITE U1 load rollback failed for '
                         '%s Channel %d after %s: %s',
@@ -12141,10 +12677,9 @@ class BMCUManager(object):
             if (source_device is not None and
                     source_device is not failure_device and
                     not preserve_target_hold):
-                try:
-                    source_device.stop_all()
-                except Exception:
-                    logging.exception(
+                if not self._stop_channel_motion(
+                        source_device, source_channel):
+                    logging.error(
                         'BMCU could not stop source Channel after tool-switch failure')
             self._stop_on_failure(
                 failure_device, endpoint, exc, phase, failure_channel,
@@ -12203,7 +12738,7 @@ class BMCUManager(object):
             context['selected_confirmed_before_pullback'] = True
         if require_park:
             phase = 'WAIT_SOURCE_PARKED'
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             timeout = float(endpoint.get(
                 'u1_prestage_park_timeout', 20.0) or 20.0)
             endpoint.wait_parked_for_prestage(timeout=timeout)
@@ -12227,7 +12762,7 @@ class BMCUManager(object):
                 context['pullback_start_m'] = float(
                     device.status['meters'][channel])
             phase = 'BEFORE_PULLBACK'
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             device.set_motion(channel, protocol.MOTION_BEFORE_PULL_BACK)
             context['before_pullback_started'] = True
             self.reactor.pause(self.reactor.monotonic() + 0.2)
@@ -12235,10 +12770,7 @@ class BMCUManager(object):
                 self._wait_background_control_plane(
                     cancel_check=cancel_check,
                     poll_interval=self._u1_background_poll_interval)):
-            try:
-                device.stop_all()
-            except Exception:
-                pass
+            self._stop_channel_motion(device, channel)
             raise BMCUError('BMCU pullback was cancelled before motion')
         device.refresh()
         buffer_pct = int(device.status['buffer_pct'][channel])
@@ -12253,19 +12785,13 @@ class BMCUManager(object):
                 self._wait_background_control_plane(
                     cancel_check=cancel_check,
                     poll_interval=self._u1_background_poll_interval)):
-            try:
-                device.stop_all()
-            except Exception:
-                pass
+            self._stop_channel_motion(device, channel)
             raise BMCUError('BMCU pullback was cancelled before motion')
         if callable(cancel_check) and cancel_check():
-            try:
-                device.stop_all()
-            except Exception:
-                pass
+            self._stop_channel_motion(device, channel)
             raise BMCUError('BMCU pullback was cancelled before motion')
         phase = 'PULLBACK'
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         device.set_motion(channel, protocol.MOTION_PULL_BACK)
         context['pullback_started'] = True
         return context
@@ -12278,7 +12804,7 @@ class BMCUManager(object):
         self._arm_u1_persistent_hold(
             endpoint, device, channel, 'unload BMCU route')
         phase = 'PRECHECK_UNLOAD'
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         channel_metadata = self._channel_metadata(device, channel)
         material = channel_metadata.get('material', '')
         delegated_pullback = bool(
@@ -12295,7 +12821,8 @@ class BMCUManager(object):
                     'before heating the nozzle')
             tip_profile = self._u1_tip_profile_for_material(material)
         park_at_tip_marker = bool(
-            delegated_pullback and not retain_selected_endpoint)
+            delegated_pullback and reconcile_requires_park and
+            not retain_selected_endpoint)
         if park_at_tip_marker and self.release_retract_mm > 0:
 
             raise BMCUError(
@@ -12332,7 +12859,7 @@ class BMCUManager(object):
 
         try:
             phase = 'SELECT_ENDPOINT'
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
             endpoint.suspend_managed_sensors()
             if retain_selected_endpoint:
 
@@ -12355,7 +12882,7 @@ class BMCUManager(object):
                 tip_profile=tip_profile)
 
             phase = 'CUT_OR_FORM'
-            self._set_phase(device, phase)
+            self._set_phase(device, phase, channel=channel)
 
             device.refresh()
             context['pullback_start_m'] = float(
@@ -12410,9 +12937,12 @@ class BMCUManager(object):
                         -self.release_retract_mm, self.release_retract_feed)
 
             phase = 'TOOLHEAD_RELEASE'
-            self._set_phase(device, phase)
-            context['unload_assist'] = endpoint.assist_unload(
-                material, assist_limit_mm)
+            self._set_phase(device, phase, channel=channel)
+            if delegated_pullback and not parked_at_marker:
+                context['unload_assist'] = endpoint.assist_unload(material)
+            else:
+                context['unload_assist'] = endpoint.assist_unload(
+                    material, assist_limit_mm)
 
             if delegated_pullback:
 
@@ -12444,7 +12974,7 @@ class BMCUManager(object):
                                     'Snapmaker endpoint cannot perform the required '
                                     'stock Head park before long pullback')
                             phase = 'PARK_SOURCE_HEAD'
-                            self._set_phase(device, phase)
+                            self._set_phase(device, phase, channel=channel)
                             park_for_pullback()
                             context['endpoint_released'] = True
                             context['park_confirmed_before_pullback'] = True
@@ -12460,7 +12990,7 @@ class BMCUManager(object):
                         device, channel, timeout=4.0)
                 context['release_buffer_pct'] = release_buffer_pct
                 phase = 'PULLBACK'
-                self._set_phase(device, phase)
+                self._set_phase(device, phase, channel=channel)
                 device.set_motion(channel, protocol.MOTION_PULL_BACK)
                 context['pullback_started'] = True
         except Exception:
@@ -12495,7 +13025,7 @@ class BMCUManager(object):
                               progress_callback=None):
         route_key = self._route_key(device, channel)
         phase = 'PULLBACK'
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         delegated_u1_pullback = bool(
             endpoint.driver == 'snapmaker_u1' and
             context.get('delegated_pullback'))
@@ -12527,7 +13057,7 @@ class BMCUManager(object):
         device.refresh()
 
         phase = 'VERIFY_SOURCE_STATE'
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         while context.get('foreground_head_prefetch_in_progress'):
             if callable(cancel_check) and cancel_check():
                 raise BMCUError('BMCU pullback was cancelled during Head pickup')
@@ -12659,6 +13189,7 @@ class BMCUManager(object):
                 channel_metadata.get('unload_retract_mm', 200.0)),
             'phase': phase,
         }
+        self._clear_matching_last_error(device, channel, endpoint)
         return pullback
 
     def _unload_locked(self, device, endpoint, channel, release_endpoint=True,
@@ -12671,13 +13202,11 @@ class BMCUManager(object):
         synchronous_u1_pullback = bool(
             endpoint.driver == 'snapmaker_u1' and
             endpoint.delegates_long_unload_to_feeder())
-        if synchronous_u1_pullback:
-            if reconcile_requires_park:
-                raise BMCUError(
-                    'a synchronous Snapmaker unload cannot request early Head '
-                    'park; use the split background transition that owns the '
-                    'parked negative tip tail')
-            retain_selected_endpoint = True
+        if synchronous_u1_pullback and reconcile_requires_park:
+            raise BMCUError(
+                'a synchronous Snapmaker unload cannot request split-transition '
+                'park reconciliation; use the split background transition that '
+                'owns the parked negative tip tail')
         context = self._begin_unload_locked(
             device, endpoint, channel,
             reconcile_requires_park=reconcile_requires_park,
@@ -12775,7 +13304,7 @@ class BMCUManager(object):
                 route_key, release_sensor=not preserve_sensor_takeover)
             raise BMCUError('invalid prestage Channel for %s' % device.name)
         phase = 'CLEAR_PRESTAGE'
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         try:
             if endpoint.driver == 'snapmaker_u1':
                 allow_selected = bool(
@@ -12811,10 +13340,7 @@ class BMCUManager(object):
             self._drop_prestage_record(
                 route_key, release_sensor=not preserve_sensor_takeover)
         except Exception:
-            try:
-                device.stop_all()
-            except Exception:
-                pass
+            self._stop_channel_motion(device, channel)
             raise
 
     def clear_prestage(self, device_name=None, tool=None, channel=None, gcmd=None):
@@ -12926,7 +13452,7 @@ class BMCUManager(object):
         u1_hold_was_active = bool(
             endpoint.driver == 'snapmaker_u1' and
             self._u1_ownership_record(endpoint.name).get('persistent_hold'))
-        self._set_phase(device, phase)
+        self._set_phase(device, phase, channel=channel)
         try:
             self._check_automatic_ready(device, channel)
             self._arm_u1_persistent_hold(
@@ -12945,8 +13471,9 @@ class BMCUManager(object):
                 'prestage_timeout', self.contact_timeout) or
                 self.contact_timeout)
             motion_started = True
-            op_id = device.start_feed_distance(
-                channel, distance, safety_pct, int(timeout_s * 1000.0))
+            op_id = self._start_u1_async_feed(
+                device, channel, device.start_feed_distance,
+                distance, safety_pct, int(timeout_s * 1000.0))
             result = self._wait_feed_operation(
                 device, op_id, timeout_s + 2.0)
             if not result.get('ok'):
@@ -13005,13 +13532,15 @@ class BMCUManager(object):
         for device in self.devices:
             if device.ready:
                 device.stop_all()
+                self._release_u1_foreground_async_slot(device)
         gcmd.respond_info('BMCU all motion stopped')
 
     def cmd_CALIBRATE(self, gcmd):
         device = self._require_device(gcmd)
         if not device.ready or not device.runtime_configured:
             raise gcmd.error('%s is not ready' % device.name)
-        if device.name in self.active_operations:
+        if (device.name in self.active_operations or
+                self._u1_background_channel_conflict(device)):
             raise gcmd.error('%s is busy' % device.name)
 
         selection = str(gcmd.get('CHANNEL', 'ALL')).strip().upper()
@@ -13222,12 +13751,13 @@ class BMCUManager(object):
             self._arm_u1_persistent_hold(
                 endpoint, device, channel,
                 'manual %s' % label.lower())
-            op_id = device.start_distance_operation(
-                msg_type, channel, millimeters)
+            op_id = self._start_u1_async_feed(
+                device, channel, lambda ch: device.start_distance_operation(
+                    msg_type, ch, millimeters))
             minimum_s = 3.0 if msg_type == protocol.MSG_TEST_ENCODER else 6.0
             timeout_s = self._distance_wait_timeout(
                 device, millimeters, minimum_s)
-            result = device.wait_for_op(op_id, timeout=timeout_s)
+            result = self._wait_feed_operation(device, op_id, timeout_s)
             if not result['ok']:
                 raise BMCUError('%s failed: %s measured=%.2f mm' %
                                 (label, result['reason'],
@@ -13294,8 +13824,9 @@ class BMCUManager(object):
                 raise BMCUError(
                     '%s has active motion; input retract is blocked' % device.name)
 
-            op_id = device.start_channel_retract(channel)
-            result = device.wait_for_op(op_id, timeout=300.0)
+            op_id = self._start_u1_async_feed(
+                device, channel, device.start_channel_retract)
+            result = self._wait_feed_operation(device, op_id, 300.0)
             if not result['ok']:
                 raise BMCUError(
                     'Channel retract failed: %s measured=%.2f mm' %
@@ -13305,24 +13836,17 @@ class BMCUManager(object):
                 raise BMCUError(
                     'Channel retract completed but route ownership changed; '
                     'routing remains blocked for inspection')
-            if (isinstance(self.last_error, dict) and
-                    self.last_error.get('device') == device.name and
-                    self.last_error.get('channel', -1) == channel and
-                    self.last_error.get('code') in (
-                        'CHANNEL_RETRACT_FAILED', 'ROUTE_RECOVERY_FAILED')):
-                self.last_error = None
-                self._sync_status_cache_runtime()
+            if self._clear_matching_last_error(
+                    device, channel, self._endpoint_for_channel(device, channel)):
                 self._save_runtime()
             gcmd.respond_info(
                 '%s Channel %d input filament retracted (%.2f mm)' %
                 (device.name, channel + 1, result['measured_mm']))
         except Exception as exc:
-            try:
-                device.stop_all()
-            except Exception:
-                logging.exception(
-                    'BMCU %s could not stop after Channel retract failure',
-                    device.name)
+            if not self._stop_channel_motion(device, channel):
+                logging.error(
+                    'BMCU %s Channel %d could not stop after Channel retract failure',
+                    device.name, channel + 1)
             self._record_error(
                 'CHANNEL_RETRACT_FAILED', device=device.name, channel=channel,
                 phase='INPUT_RETRACT', details=str(exc))
@@ -13457,7 +13981,9 @@ class BMCUManager(object):
                 material = normalize_u1_material_name(material)
             except Exception as exc:
                 raise gcmd.error(str(exc))
-        color = gcmd.get('COLOR', metadata.get('color', '#FFFFFF')).upper()
+        color_arg = gcmd.get('COLOR', None)
+        color = (color_arg if color_arg is not None else
+                 metadata.get('color', '#FFFFFF')).upper()
         if not color.startswith('#'):
             color = '#' + color
         if not re.match(r'^#[0-9A-F]{6}$', color):
@@ -13503,6 +14029,8 @@ class BMCUManager(object):
             if not colors:
                 colors = [color]
             color = colors[0]
+        elif color_arg is not None and color != metadata.get('color'):
+            colors = [color]
         else:
             colors = [color] + [value for value in colors if value != color]
             colors = colors[:5]
@@ -13723,7 +14251,7 @@ class BMCUManager(object):
 
     def cmd_SET_PREFERENCES(self, gcmd):
         self._require_standalone_operation('BMCU_SET_PREFERENCES', gcmd)
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error(
                 'cannot change BMCU print-end preferences during an active operation')
         if self._print_state() in ('printing', 'paused', 'pause'):
@@ -14577,7 +15105,7 @@ class BMCUManager(object):
             material = self._channel_metadata(device, channel).get('material', '')
 
             if recovery_phase == 'verify':
-                self._set_phase(device, 'RESUME_BEFORE_ON_USE_VERIFY')
+                self._set_phase(device, 'RESUME_BEFORE_ON_USE_VERIFY', channel=channel)
                 endpoint.verify_loaded_after_pause(
                     material=material,
                     baseline=pending.get('coil_baseline'),
@@ -14586,14 +15114,14 @@ class BMCUManager(object):
                 self._endpoint_temperature_call(
                     endpoint, 'prepare_load', material, temperature_profile,
                     discard_position_prepared=True)
-                self._set_phase(device, 'RESUME_PRIME')
+                self._set_phase(device, 'RESUME_PRIME', channel=channel)
                 self._endpoint_temperature_call(
                     endpoint, 'prime', material, temperature_profile)
                 pending['phase'] = 'primed'
                 recovery_phase = 'primed'
 
             if recovery_phase == 'primed':
-                self._set_phase(device, 'RESUME_ON_USE')
+                self._set_phase(device, 'RESUME_ON_USE', channel=channel)
                 device.set_motion(channel, protocol.MOTION_ON_USE)
                 device.refresh()
                 if self._route_states_from_status(
@@ -14642,6 +15170,7 @@ class BMCUManager(object):
             self._activate_u1_logical_tool(int(tool), endpoint)
             self._commit_u1_toolchange(plan_index)
             self._save_runtime()
+            self._clear_matching_last_error(device, channel, endpoint)
             if gcmd is not None:
                 gcmd.respond_info(
                     'BMCU recovered interrupted T%d toolchange and resumed '
@@ -14673,6 +15202,7 @@ class BMCUManager(object):
 
         plan_index = -1
         background_endpoint = None
+        previous_error = self.last_error
         try:
             self._require_no_u1_cross_refill_pending()
             plan_index = self._locate_u1_toolchange(tool) \
@@ -14754,10 +15284,13 @@ class BMCUManager(object):
                     logging.exception(
                         'BMCU could not stop Snapmaker background work after '
                         'foreground toolchange failure')
-            self._record_error(
-                ('SNAPMAKER_TOOL_CHANGE_FAILED' if is_snapmaker else
-                 'GENERIC_TOOL_CHANGE_FAILED'),
-                phase='TOOL_CHANGE', details=str(exc))
+            if (not isinstance(self.last_error, dict) or
+                    self.last_error is previous_error or
+                    self.last_error.get('details') != str(exc)):
+                self._record_error(
+                    ('SNAPMAKER_TOOL_CHANGE_FAILED' if is_snapmaker else
+                     'GENERIC_TOOL_CHANGE_FAILED'),
+                    phase='TOOL_CHANGE', details=str(exc))
             self._safe_pause(defer_to_virtual_sd=True)
 
             raise self._command_pause_error(gcmd, exc)
@@ -14951,6 +15484,11 @@ class BMCUManager(object):
         gcmd.respond_info('BMCU state saved to %s' % self.state.path)
 
     def cmd_CLEAR_ERROR(self, gcmd):
+        if gcmd.get_int('HOST_ONLY', 0, minval=0, maxval=1):
+            self.last_error = None
+            self._sync_status_cache_runtime()
+            gcmd.respond_info('BMCU host error banner cleared')
+            return
         device = self._require_device(gcmd)
         device.reset_error()
         device.refresh()
@@ -15319,6 +15857,53 @@ class BMCUManager(object):
             'BMCU staged T%d -> %s Channel %d -> %s' %
             (tool, device.name, channel + 1, endpoint.name))
 
+    def _print_plan_endpoint_names(self):
+        names = set()
+        for mapping in self.print_plan_tools.values():
+            if not isinstance(mapping, dict) or mapping.get('external'):
+                continue
+            if mapping.get('native'):
+                head = int(mapping.get('head', -1))
+                for candidate in self.endpoints.values():
+                    if (candidate.driver == 'snapmaker_u1' and
+                            int(candidate.get('head_index', -1)) == head):
+                        names.add(candidate.name)
+                continue
+            device = self._mapping_device(mapping)
+            if device is None:
+                continue
+            endpoint = self._endpoint_for_channel(device, int(mapping.get('channel', -1)))
+            if endpoint is not None:
+                names.add(endpoint.name)
+        return names
+
+    def _retract_leftover_u1_prestages(self, gcmd):
+        needed = self._print_plan_endpoint_names()
+        for route_key, staged in sorted(self.prestaged.items()):
+            if not isinstance(staged, dict):
+                continue
+            endpoint_name = str(staged.get('endpoint', '') or '')
+            device = self.devices_by_name.get(str(staged.get('device', '') or ''))
+            if endpoint_name not in needed or device is None:
+                continue
+            if (self.active_operations.get(device.name) or
+                    endpoint_name in getattr(self, '_u1_background_jobs', {})):
+                continue
+            channel = int(staged.get('channel', -1))
+            logging.info(
+                'BMCU retracting leftover prestaged %s Channel %d from %s before the print',
+                device.name, channel + 1, endpoint_name)
+            try:
+                self.clear_prestage(device_name=device.name, channel=channel)
+            except Exception as exc:
+                raise gcmd.error(
+                    'BMCU could not retract the leftover filament of %s Channel %d '
+                    'from %s before the print: %s' %
+                    (device.name, channel + 1, endpoint_name, exc))
+            gcmd.respond_info(
+                'BMCU retracted leftover %s Channel %d from %s' %
+                (device.name, channel + 1, endpoint_name))
+
     def cmd_PRINT_COMMIT(self, gcmd):
         self._require_standalone_operation('BMCU_PRINT_COMMIT', gcmd)
         if not self.print_plan_open:
@@ -15328,9 +15913,11 @@ class BMCUManager(object):
                 'the open BMCU print plan was interrupted by a Klipper restart; '
                 'restart the print so Begin/Map/Commit is emitted again')
 
-        self._reconcile_u1_leases(self.reactor.monotonic(), force=True)
         is_u1 = bool(
             self.printer_analysis.get('features', {}).get('snapmaker_u1'))
+        if is_u1 and self.prestaged:
+            self._retract_leftover_u1_prestages(gcmd)
+        self._reconcile_u1_leases(self.reactor.monotonic(), force=True)
         required_tools = set(self.print_plan_required)
         if is_u1:
             required_tools.update(self._u1_logical_tools_used())
@@ -15501,9 +16088,7 @@ class BMCUManager(object):
                     changed = True
                 if color is not None and metadata.get('color') != color:
                     metadata['color'] = color
-                    colors = list(metadata.get('colors', []) or [])
-                    metadata['colors'] = ([color] + [
-                        value for value in colors if value != color])[:5]
+                    metadata['colors'] = [color]
                     changed = True
                 if changed or getattr(device, 'slot_sync_required', False):
                     metadata_sync_devices[device.name] = device
@@ -15780,10 +16365,10 @@ class BMCUManager(object):
                     terminal_u1 = endpoint.driver == 'snapmaker_u1'
                     self._unload_locked(
                         device, endpoint, channel,
-
                         release_endpoint=not terminal_u1,
-                        retain_selected_endpoint=terminal_u1,
-                        temperature_profile=temperature_profile)
+                        retain_selected_endpoint=False,
+                        temperature_profile=temperature_profile,
+                        reason='print_end')
                 emptied = True
             except Exception as exc:
                 phase = self.active_operations.get(
@@ -16028,7 +16613,7 @@ class BMCUManager(object):
         device = self._require_device(gcmd)
         if self._print_state() in ('printing', 'paused', 'pause'):
             raise gcmd.error('LED preview is unavailable during a print')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error('LED preview is unavailable during BMCU motion')
         if not self._led_preview_runtime_supported(device):
             raise gcmd.error('%s firmware does not support live LED preview' % device.name)
@@ -16076,7 +16661,7 @@ class BMCUManager(object):
             return
         if self._print_state() in ('printing', 'paused', 'pause'):
             raise gcmd.error('lighting profiles cannot change during a print')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error('lighting profiles cannot change during BMCU motion')
 
         try:
@@ -16371,13 +16956,19 @@ class BMCUManager(object):
             self.reactor.monotonic() + self.firmware_update_power_settle_time)
         self._firmware_update_power_restore.pop(device.name, None)
 
+    @staticmethod
+    def _device_update_identified(device):
+        return bool(device.connected and device.hello_validated and
+                    not device.suspended and device.uid and
+                    device.caps.get('protocol') == protocol.PROTO_VERSION)
+
     def _firmware_update_export_nvm(self, device, token):
         if not re.fullmatch(r'[0-9a-f]{32}', token):
             raise BMCUError('invalid firmware-update export token')
-        if not device.ready or not device.runtime_configured or device.suspended:
-            raise BMCUError('%s is not ready for NVM export' % device.name)
+        if not self._device_update_identified(device):
+            raise BMCUError('%s is not identified for NVM export' % device.name)
         if (self._print_state() in ('printing', 'paused', 'pause') or
-                self.active_operations):
+                self.active_operations or self._u1_background_channel_locks):
             raise BMCUError('Finish printing and BMCU operations before NVM export')
         update_prepared = False
         try:
@@ -16570,7 +17161,7 @@ class BMCUManager(object):
             if print_state in ('printing', 'paused', 'pause'):
                 raise gcmd.error(
                     'printer is %s; serial flash guard is unavailable' % print_state)
-            if self.active_operations:
+            if self.active_operations or self._u1_background_channel_locks:
                 raise gcmd.error('BMCU operation is active; stop it before firmware flash')
             device.suspend_for_update(
                 device.suspend_reason if device.suspended else 'serial_flash_guard')
@@ -16593,11 +17184,11 @@ class BMCUManager(object):
             if action == 'CANCEL':
                 deadline = self.reactor.monotonic() + 15.0
                 while self.reactor.monotonic() < deadline:
-                    if device.ready and device.runtime_configured and not device.suspended:
+                    if self._device_update_identified(device):
                         break
                     now = self.reactor.monotonic()
                     self.reactor.pause(min(deadline, now + 0.1))
-                if not device.ready or not device.runtime_configured:
+                if not self._device_update_identified(device):
                     raise gcmd.error('%s did not reconnect to cancel update mode' % device.name)
                 try:
                     device.update_cancel()
@@ -16605,7 +17196,9 @@ class BMCUManager(object):
                 except Exception as exc:
                     raise gcmd.error('%s could not cancel firmware-update mode: %s' %
                                      (device.name, exc))
-                gcmd.respond_info('%s update mode cancelled and runtime restored' % device.name)
+                gcmd.respond_info('%s update mode cancelled%s' % (
+                    device.name, '; matching firmware required before operation'
+                    if device.firmware_compatible is False else ''))
             else:
                 gcmd.respond_info('%s serial reconnect scheduled' % device.name)
             return
@@ -16621,11 +17214,11 @@ class BMCUManager(object):
                 'printer is %s; finish or cancel the job before firmware flash' %
                 print_state)
         recovery = bool(gcmd.get_int('RECOVERY', 0, minval=0, maxval=1))
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error('BMCU operation is active; stop it before firmware flash')
         if not recovery:
-            if not device.ready or not device.runtime_configured:
-                raise gcmd.error('%s is not ready for firmware flash' % device.name)
+            if not self._device_update_identified(device):
+                raise gcmd.error('%s is not identified for firmware flash' % device.name)
             try:
                 refreshed = dict(device.refresh())
             except Exception as exc:
@@ -16722,18 +17315,19 @@ class BMCUManager(object):
                     'printer is %s; finish or cancel the job before update' %
                     print_state)
             self._require_u1_host_maintenance_idle(gcmd, 'BMCU host update')
-            if self.active_operations:
+            if self.active_operations or self._u1_background_channel_locks:
                 raise gcmd.error(
                     'BMCU operation is active; finish it before update')
             if self._forget_pending:
                 raise gcmd.error(
                     'BMCU device removal is prepared; finish or cancel it '
                     'before update')
-            if (self.print_plan_open or self.print_map_active or
-                    self.print_transaction_phase or self._u1_toolchange_plan):
-                raise gcmd.error(
-                    'BMCU print transaction is retained; finish or cancel the '
-                    'print transaction before update')
+            retained_print_transaction = bool(
+                self.print_plan_open or self.print_map_active or
+                self.print_tools or self.print_job_id or
+                self.print_transaction_phase or self._u1_toolchange_plan or
+                self._u1_original or self._u1_map_backup or
+                self._u1_used_backup or self._u1_end_unload_backup)
             if self.prestaged:
                 raise gcmd.error(
                     'clear every retained BMCU prestage before update')
@@ -16796,6 +17390,30 @@ class BMCUManager(object):
                     raise gcmd.error(
                         '%s still reports an active firmware operation; finish '
                         'it before update' % device.name)
+            if retained_print_transaction:
+                if not self._snapmaker_platform():
+                    raise gcmd.error(
+                        'BMCU print transaction is retained; finish or cancel the '
+                        'print transaction before update')
+                keep_loaded = bool(self.print_loaded_routes)
+                if keep_loaded:
+                    self.print_terminal_unload_pending = True
+                self._clear_print_session(
+                    'verified idle host update cleanup',
+                    preserve_loaded=keep_loaded)
+                self._save_print_session()
+                if (self.print_plan_open or self.print_map_active or
+                        self.print_tools or self.print_job_id or
+                        self.print_transaction_phase or
+                        self._u1_toolchange_plan or self._u1_original or
+                        self._u1_map_backup or self._u1_used_backup or
+                        self._u1_end_unload_backup):
+                    raise gcmd.error(
+                        'BMCU retained print transaction could not be restored '
+                        'and cleared automatically before update')
+                logging.info(
+                    'BMCU automatically cleared a stale idle U1 print '
+                    'transaction before host update')
             if self._print_state() in ('printing', 'paused', 'pause'):
                 raise gcmd.error(
                     'printer activity changed while preparing update; retry '
@@ -16816,6 +17434,110 @@ class BMCUManager(object):
             self._update_prepared = False
             raise
 
+    def _u1_uninstall_native_path_settled(self, path):
+        if not isinstance(path, dict) or not path.get('known'):
+            return False
+        state = str(path.get('channel_state', '') or '').strip().lower()
+        return state in (
+            '', 'none', 'inited', 'wait_insert',
+            'preload_finish', 'load_finish', 'unload_finish')
+
+    def _prepare_disconnected_devices_for_uninstall(self, devices):
+        devices = [device for device in devices if device is not None]
+        if not devices:
+            return set()
+
+        offline_names = set(device.name for device in devices)
+        u1_endpoints = {}
+        for device in devices:
+            for channel in range(4):
+                endpoint = self._endpoint_for_channel(device, channel)
+                if endpoint is not None and endpoint.driver == 'snapmaker_u1':
+                    u1_endpoints[endpoint.name] = endpoint
+
+        # A disconnected BMCU cannot provide a trustworthy live route snapshot.
+        # For uninstall we do not require the stock feeder path itself to be
+        # EMPTY: a normal Snapmaker feeder may legitimately be PRELOADED while
+        # BMCU hardware is unplugged.  What matters is that the physical head
+        # entry sensor is clear and the native feeder is in a settled (not
+        # moving) state.  This lets uninstall restore stock ownership without
+        # forcing users to reconnect removed BMCU hardware.
+        for endpoint in u1_endpoints.values():
+            endpoint.require_entry_sensor_snapshot(timeout=1.25, expected=False)
+            path = endpoint.native_path_status()
+            if not self._u1_uninstall_native_path_settled(path):
+                raise BMCUError(
+                    '%s native feeder is not settled while a configured BMCU '
+                    'is disconnected (%s)' %
+                    (endpoint.name, path.get('channel_state', 'unknown')))
+
+        changed = False
+        for device in devices:
+            route_states = list(self._route_states_from_status(device.status))
+            motion = list(device.status.get('motion', []))
+            if len(motion) != 4:
+                motion = [protocol.MOTION_IDLE] * 4
+            for channel in range(4):
+                route_key = self._route_key(device, channel)
+                if self.loaded_tools.pop(route_key, None) is not None:
+                    changed = True
+                record = self._channel_record(device, channel)
+                if (record.get('tail_detached') or
+                        record.get('tail_follower_pending') or
+                        record.get('tail_endpoint') or
+                        record.get('tail_follower_device') or
+                        record.get('tail_follower_uid') or
+                        int(record.get('tail_follower_channel', -1)) != -1 or
+                        int(record.get('tail_follower_tool', -1)) != -1):
+                    record['tail_detached'] = False
+                    record['tail_endpoint'] = ''
+                    record['tail_path_length_mm'] = 0.0
+                    record['tail_follower_pending'] = False
+                    record['tail_follower_device'] = ''
+                    record['tail_follower_uid'] = ''
+                    record['tail_follower_channel'] = -1
+                    record['tail_follower_tool'] = -1
+                    changed = True
+
+                endpoint = self._endpoint_for_channel(device, channel)
+                if endpoint is not None and endpoint.driver == 'snapmaker_u1':
+                    ownership = self._u1_ownership_record(endpoint.name)
+                    try:
+                        owner_channel = int(ownership.get('channel', -1))
+                    except (TypeError, ValueError, OverflowError):
+                        owner_channel = -1
+                    owner_uid = str(ownership.get('device_uid', '') or '').upper()
+                    device_uid = self._device_uid(device)
+                    same_device = bool(owner_uid and device_uid and
+                                       owner_uid == device_uid)
+                    if not owner_uid:
+                        same_device = str(ownership.get('device', '') or '') == device.name
+                    if same_device and owner_channel == channel:
+                        if str(ownership.get('route_state', 'EMPTY')).upper() != 'EMPTY':
+                            ownership['route_state'] = 'EMPTY'
+                            changed = True
+                        if ownership.get('tail_detached') or ownership.get('follower_pending'):
+                            ownership['tail_detached'] = False
+                            ownership['tail_sensor_cleared'] = False
+                            self._clear_u1_follower_commit(ownership)
+                            changed = True
+                    if self._clear_u1_disconnect_hazard(endpoint.name, device.name):
+                        changed = True
+
+                route_states[channel] = protocol.ROUTE_EMPTY
+                motion[channel] = protocol.MOTION_IDLE
+
+            device.status['route_state'] = route_states
+            device.status['motion'] = motion
+
+        if changed:
+            self.state.save()
+            self._u1_lease_dirty = True
+        logging.info(
+            'BMCU uninstall accepted disconnected device(s) after physical '
+            'U1 path verification: %s', ', '.join(sorted(offline_names)))
+        return offline_names
+
     def cmd_PREPARE_UNINSTALL(self, gcmd):
         action = str(gcmd.get('ACTION', 'PREPARE') or '').upper()
         if action == 'CANCEL':
@@ -16832,7 +17554,7 @@ class BMCUManager(object):
                     'printer is %s; finish or cancel the job before uninstall' %
                     print_state)
             self._require_u1_host_maintenance_idle(gcmd, 'BMCU uninstall')
-            if self.active_operations:
+            if self.active_operations or self._u1_background_channel_locks:
                 raise gcmd.error('BMCU operation is active; stop it before uninstall')
             if self.prestaged:
                 raise gcmd.error('Clear every BMCU prestage before uninstall')
@@ -16840,17 +17562,28 @@ class BMCUManager(object):
                 raise gcmd.error('BMCU background preparation is active; clear it before uninstall')
             occupied = []
             snapshots = {}
+            disconnected = []
             for device in self.devices:
                 if (not device.ready or not device.runtime_configured or
                         not device.status_reconciled):
-                    raise gcmd.error(
-                        '%s has no verified live route snapshot; reconnect BMCU '
-                        'before uninstall' % device.name)
-                snapshots[device.name] = copy.deepcopy(device.refresh())
-            for device in self.devices:
-                status = snapshots[device.name]
+                    disconnected.append(device)
+                    continue
+                try:
+                    status = copy.deepcopy(device.refresh())
+                except Exception:
+                    disconnected.append(device)
+                    continue
                 if (not device.ready or not device.runtime_configured or
-                        not device.status_reconciled or device.session_changed or
+                        not device.status_reconciled):
+                    disconnected.append(device)
+                    continue
+                snapshots[device.name] = status
+
+            for device in self.devices:
+                status = snapshots.get(device.name)
+                if status is None:
+                    continue
+                if (device.session_changed or
                         status.get('session_id') != device.status.get('session_id') or
                         self._route_states_from_status(status) !=
                         self._route_states_from_status(device.status)):
@@ -16860,8 +17593,6 @@ class BMCUManager(object):
                         any(value != protocol.MOTION_IDLE for value in status.get('motion', [])) or
                         len(status.get('motion', [])) != 4):
                     raise gcmd.error('%s is moving; stop BMCU before uninstall' % device.name)
-                if int(status.get('connected_mask', 0)) != 0x0f:
-                    raise gcmd.error('%s has an unavailable Channel; reconnect BMCU before uninstall' % device.name)
                 for channel in range(4):
                     route = self._route_state(device, channel, status=status)
                     if route != protocol.ROUTE_EMPTY:
@@ -16869,8 +17600,11 @@ class BMCUManager(object):
                                          protocol.ROUTE_NAMES.get(route, 'UNCERTAIN')))
             if occupied:
                 raise gcmd.error(
-                    'Unload or confirm EMPTY before uninstall: %s' %
+                    'Unload active BMCU routes before uninstall: %s' %
                     ', '.join('%s Channel %d=%s' % (item[0], item[1] + 1, item[2]) for item in occupied))
+
+            disconnected_names = self._prepare_disconnected_devices_for_uninstall(
+                disconnected)
 
             if self.u1_cross_refill_pending:
                 raise gcmd.error(
@@ -16911,20 +17645,27 @@ class BMCUManager(object):
                     endpoint.release_runtime_sensor_takeover()
                     continue
                 path = endpoint.native_path_status()
-                if not path.get('known') or path.get('busy'):
+                if not self._u1_uninstall_native_path_settled(path):
                     raise gcmd.error(
-                        '%s shared path cannot be handed back safely (%s); '
-                        'resolve the active BMCU ownership before uninstall' %
+                        '%s native feeder is not settled (%s); wait for native '
+                        'feeder motion to finish before uninstall' %
                         (endpoint.name, path.get('channel_state', 'unknown')))
                 self._handoff_u1_to_native(
                     endpoint, 'verified uninstall handoff to Snapmaker', save=True,
-                    close_generation=True)
+                    close_generation=True,
+                    allow_unverified_devices=disconnected_names,
+                    allow_settled_native_path=True)
                 restored.append(endpoint.name)
             self._require_u1_host_maintenance_idle(gcmd, 'BMCU uninstall')
             self.state.save()
-            gcmd.respond_info(
+            message = (
                 'BMCU uninstall is safe. Restored U1 endpoints: %s' %
                 (', '.join(restored) if restored else 'none'))
+            if disconnected_names:
+                message += (
+                    '. Disconnected BMCU accepted after physical path '
+                    'verification: %s' % ', '.join(sorted(disconnected_names)))
+            gcmd.respond_info(message)
         except Exception:
             self._uninstall_prepared = False
             raise
@@ -16959,7 +17700,7 @@ class BMCUManager(object):
             raise gcmd.error('disconnect %s before removing it' % device.name)
         if self._print_state() in ('printing', 'paused', 'pause'):
             raise gcmd.error('BMCU removal is unavailable while a print is active or paused')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error('BMCU removal is unavailable while a BMCU operation is active')
         if self.u1_cross_refill_pending:
             raise gcmd.error('BMCU removal is unavailable while Snapmaker refill recovery is pending')
@@ -17130,8 +17871,9 @@ class BMCUManager(object):
                 endpoint, device, channel, 'manual route feed')
             self._validate_endpoint_for_operation(endpoint)
             motion_started = True
-            op_id = device.start_feed_distance(
-                channel, millimeters, limit, int(timeout * 1000.0))
+            op_id = self._start_u1_async_feed(
+                device, channel, device.start_feed_distance,
+                millimeters, limit, int(timeout * 1000.0))
             result = self._wait_feed_operation(
                 device, op_id, timeout + 2.0)
             if not result.get('ok'):
@@ -17257,7 +17999,7 @@ class BMCUManager(object):
         if print_state in ('printing', 'paused', 'pause'):
             raise gcmd.error(
                 'route confirmation is unavailable while a print is active or paused')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error(
                 'route confirmation is unavailable while a BMCU operation is active')
         refill = getattr(self, 'refill', None)
@@ -17508,14 +18250,6 @@ class BMCUManager(object):
                     post_commit_errors.append('route journal commit failed: %s' % exc)
 
             self._uncertain_routes.discard(route_key)
-            if (isinstance(self.last_error, dict) and
-                    self.last_error.get('device') == device.name and
-                    self.last_error.get('channel', -1) == channel and
-                    self.last_error.get('code') in (
-                        'ROUTE_RECOVERY_FAILED', 'CHANNEL_RETRACT_FAILED',
-                        'ROUTE_UNCERTAIN')):
-                self.last_error = None
-                self._sync_status_cache_runtime()
             try:
                 self.device_status_changed(device, previous, current)
             except Exception as exc:
@@ -17527,6 +18261,7 @@ class BMCUManager(object):
 
             if route_empty:
                 try:
+                    self._drop_prestage_record(route_key, release_sensor=True)
                     unloaded_tool = self.loaded_tools.pop(route_key, -1)
                     if self.active_tool == unloaded_tool:
                         self.active_tool = -1
@@ -17575,6 +18310,7 @@ class BMCUManager(object):
                     (device.name, channel + 1, state,
                      '; '.join(post_commit_errors)))
 
+            self._clear_matching_last_error(device, channel, endpoint)
             gcmd.respond_info('%s Channel %d confirmed %s' %
                               (device.name, channel + 1, state))
         finally:
@@ -17593,7 +18329,7 @@ class BMCUManager(object):
             raise gcmd.error('MODE must be INPUT_RETRACT')
         if self._print_state() in ('printing', 'paused', 'pause'):
             raise gcmd.error('route recovery is unavailable while a print is active or paused')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error('route recovery is unavailable while a BMCU operation is active')
         if (getattr(self, '_critical_motion_active', False) or
                 getattr(self, '_critical_motion_depth', 0)):
@@ -17652,8 +18388,9 @@ class BMCUManager(object):
                 raise BMCUError('%s Channel %d did not enter the guarded EMPTY retract state' %
                                 (device.name, channel + 1))
 
-            op_id = device.start_channel_retract(channel)
-            result = device.wait_for_op(op_id, timeout=300.0)
+            op_id = self._start_u1_async_feed(
+                device, channel, device.start_channel_retract)
+            result = self._wait_feed_operation(device, op_id, 300.0)
             if not result['ok']:
                 raise BMCUError('recovery retract failed: %s measured=%.2f mm' %
                                 (result['reason'], result['measured_mm']))
@@ -17686,10 +18423,10 @@ class BMCUManager(object):
             gcmd.respond_info('%s Channel %d loose input filament retracted; route confirmed EMPTY' %
                               (device.name, channel + 1))
         except Exception as exc:
-            try:
-                device.stop_all()
-            except Exception:
-                logging.exception('BMCU could not stop after route recovery failure')
+            if not self._stop_channel_motion(device, channel):
+                logging.error(
+                    'BMCU could not stop %s Channel %d after route recovery failure',
+                    device.name, channel + 1)
             rollback_error = None
             if marked_empty and not recovered_empty:
                 try:
@@ -17719,7 +18456,7 @@ class BMCUManager(object):
             raise gcmd.error(
                 'Head EMPTY confirmation is unavailable while a print is active '
                 'or paused')
-        if self.active_operations:
+        if self.active_operations or self._u1_background_channel_locks:
             raise gcmd.error(
                 'Head EMPTY confirmation is unavailable while a BMCU operation '
                 'is active')

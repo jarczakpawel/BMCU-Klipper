@@ -295,7 +295,8 @@ def check_snapmaker_boot_integration(report, metadata):
     begin = '# BEGIN BMCU-KLIPPER SERVICE-HOOKS'
     end = '# END BMCU-KLIPPER SERVICE-HOOKS'
     call_marker = '# BMCU-KLIPPER PREPARE IMMEDIATELY BEFORE KLIPPER PRIVILEGE DROP'
-    call = 'bmcu_prepare_klipper_start || exit 1'
+    calls = ('bmcu_prepare_klipper_start || true',
+             'bmcu_prepare_klipper_start || exit 1')
     scope, reason = _managed_block(text, begin, end)
     valid = scope is not None
     if valid and '/etc/hooks/klipper.d' in scope:
@@ -320,8 +321,11 @@ def check_snapmaker_boot_integration(report, metadata):
                     valid, reason = False, 'managed pre-launch call is missing'
                     break
                 indent = re.match(r'^(\s*)', lines[index]).group(1)
-                if (lines[index - 2] != indent + call_marker or
-                        lines[index - 1] != indent + call):
+                window = lines[max(0, index - 4):index]
+                accepted = tuple(indent + call for call in calls)
+                if not any(window[position] == indent + call_marker and
+                           window[position + 1] in accepted
+                           for position in range(len(window) - 1)):
                     valid, reason = False, 'managed repair is not immediately before every Klipper launch'
                     break
     if valid:

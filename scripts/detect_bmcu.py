@@ -127,7 +127,6 @@ def parse_hello_identity(payload):
         return None
     uid, major, minor, patch, proto, _caps, session, channels, _profile = HELLO_ACK.unpack(payload)
     if (uid in (b'\x00' * 12, b'\xff' * 12) or
-            not bmcu_protocol.firmware_is_compatible((major, minor, patch)) or
             proto != PROTO_VERSION or session == 0 or
             channels != BMCU_CHANNELS):
         return None

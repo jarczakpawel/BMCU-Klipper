@@ -146,6 +146,13 @@ static constexpr int      PWM_lim  = 1000;
 static constexpr float    kAS5600_PI = 3.14159265358979323846f;
 
 static constexpr float kAS5600_MM_PER_CNT = -(kAS5600_PI * 7.5f) / 4096.0f;
+static constexpr float kAS5600_M_PER_CNT = -kAS5600_MM_PER_CNT * 0.001f;
+static int64_t as5600_odometer_count[4] = {0,0,0,0};
+
+static inline float encoder_meters(uint8_t ch)
+{
+    return ch < kChCount ? -(float)as5600_odometer_count[ch] * kAS5600_M_PER_CNT : 0.0f;
+}
 
 AS5600_soft_IIC_many MC_AS5600;
 static GPIO_TypeDef* const AS5600_SCL_PORT[4] = { GPIOB, GPIOB, GPIOB, GPIOB };
@@ -185,6 +192,9 @@ static float  MC_PULL_stu_raw[4]        = {1.65f, 1.65f, 1.65f, 1.65f};
 static int8_t MC_PULL_stu[4]            = {0, 0, 0, 0};
 
 static uint8_t  MC_ONLINE_key_stu[4]    = {0, 0, 0, 0};
+static uint8_t  g_key_empty[4]           = {0, 0, 0, 0};
+static bool     g_key_sample_fresh       = false;
+static constexpr uint8_t kKeyEmptyPublications = ADC_DMA_FILTER_BLOCKS + 1u;
 static uint8_t  g_on_use_low_latch[4]   = {0, 0, 0, 0};
 static uint8_t  g_on_use_jam_latch[4]   = {0, 0, 0, 0};
 static uint32_t g_on_use_hi_pwm_us[4]   = {0u, 0u, 0u, 0u};
@@ -246,11 +256,12 @@ enum : uint8_t
 static uint8_t  dm_loaded[4]            = {1,1,1,1};
 static uint8_t  dm_fail_latch[4]        = {0,0,0,0};
 static uint8_t  dm_auto_state[4]        = {0,0,0,0};
-static uint8_t  dm_autoload_gate[4]     = {0,0,0,0};
+static uint8_t  dm_autoload_gate[4]     = {1,1,1,1};
 static uint8_t  dm_auto_try[4]          = {0,0,0,0};
 static uint64_t dm_auto_t0_ms[4]        = {0ull,0ull,0ull,0ull};
 static float    dm_auto_remain_m[4]     = {0,0,0,0};
 static float    dm_auto_last_m[4]       = {0,0,0,0};
+static uint8_t  dm_idle_empty[4]         = {0,0,0,0};
 
 static uint64_t dm_loaded_drop_t0_ms[4] = {0ull,0ull,0ull,0ull};
 #endif
@@ -307,7 +318,7 @@ bool filament_channel_inserted[4]       = {false, false, false, false};
 uint8_t Motion_control_filament_present(uint8_t CHx)
 {
     if (CHx >= kChCount) return 0u;
-    return (MC_ONLINE_key_stu[CHx] != 0u) ? 1u : 0u;
+    return filament_channel_inserted[CHx] && MC_ONLINE_key_stu[CHx] != 0u ? 1u : 0u;
 }
 
 uint8_t Motion_control_channel_retract_target_reached(uint8_t CHx)
@@ -337,9 +348,7 @@ uint8_t Motion_control_encoder_io_ok(uint8_t CHx)
 
 float Motion_control_encoder_meters(uint8_t CHx)
 {
-    if (CHx >= kChCount) return 0.0f;
-
-    return ams[motion_control_ams_num].filament[CHx].meters;
+    return encoder_meters(CHx);
 }
 
 static constexpr float MC_PULL_PIDP_PCT = 25.0f;
@@ -536,6 +545,7 @@ void Motion_control_prepare_calibration(void)
         dm_auto_t0_ms[i] = 0ull;
         dm_auto_remain_m[i] = 0.0f;
         dm_auto_last_m[i] = 0.0f;
+        dm_idle_empty[i] = 0u;
 #endif
     }
     A.now_filament_num = 0xFFu;
@@ -634,6 +644,10 @@ static inline void MC_PULL_ONLINE_init()
 static inline bool MC_PULL_ONLINE_read(uint32_t now_ticks)
 {
     const float *data = ADC_DMA_get_value();
+    static uint32_t last_generation = 0u;
+    const uint32_t generation = ADC_DMA_generation();
+    g_key_sample_fresh = generation != last_generation && ADC_DMA_ready();
+    last_generation = generation;
     if (!ADC_DMA_sample_ready())
         return false;
 
@@ -973,7 +987,7 @@ public:
             send_start_ms = time_now;
             send_stop_latch = false;
             send_len_abort = 0;
-            send_start_m = ams[motion_control_ams_num].filament[CHx].meters;
+            send_start_m = encoder_meters(CHx);
         }
 
         if (_motion == filament_motion_enum::filament_motion_pull) {
@@ -1186,6 +1200,16 @@ public:
 
     void run(float time_E, uint64_t now_ms)
     {
+        if (!MC_PULL_calibration_is_valid((uint8_t)CHx))
+        {
+            PID_speed.clear();
+            PID_pressure.clear();
+            pwm_zeroed = 1;
+            x_prev[CHx] = 0.0f;
+            Motion_control_set_PWM(CHx, 0);
+            return;
+        }
+
         if (motion == filament_motion_enum::filament_motion_stop &&
             motor_stop_time == 0 &&
             pwm_zeroed)
@@ -1269,10 +1293,12 @@ public:
                              (dm_loaded[CHx] == 0u))
                     {
                         const uint8_t ks = MC_ONLINE_key_stu[CHx];
-                        auto &A = ams[motion_control_ams_num];
-                        const float cur_m = A.filament[CHx].meters;
+                        const float cur_m = encoder_meters(CHx);
 
-                        if (dm_fail_latch[CHx])
+                        if (dm_fail_latch[CHx] &&
+                            dm_auto_state[CHx] != DM_AUTO_S1_FAIL_RETRACT &&
+                            dm_auto_state[CHx] != DM_AUTO_S2_FAIL_RETRACT &&
+                            dm_auto_state[CHx] != DM_AUTO_S2_FAIL_EXTRA)
                         {
                             dm_autoload_active = true;
                             dm_autoload_x = 0.0f;
@@ -1280,19 +1306,15 @@ public:
                         }
                         else
                         {
-                            if (dm_auto_state[CHx] == DM_AUTO_IDLE)
+                            if (dm_auto_state[CHx] == DM_AUTO_IDLE &&
+                                dm_autoload_gate[CHx] == 0u)
                             {
                                 if (ks == 2u)
                                 {
-                                    if (dm_autoload_gate[CHx] == 0u)
-                                    {
-                                        dm_autoload_gate[CHx] = 1u;
-                                        dm_auto_state[CHx] = DM_AUTO_S1_DEBOUNCE;
-                                        dm_auto_t0_ms[CHx] = now_ms;
-                                    }
+                                    dm_auto_state[CHx] = DM_AUTO_S1_DEBOUNCE;
+                                    dm_auto_t0_ms[CHx] = now_ms;
                                 }
-                                else if (ks == 1u &&
-                                         dm_autoload_gate[CHx] == 0u)
+                                else if (ks == 1u)
                                 {
                                     dm_autoload_gate[CHx] = 1u;
                                     dm_auto_state[CHx]    = DM_AUTO_S2_PUSH;
@@ -1308,13 +1330,22 @@ public:
                                 dm_autoload_active = true;
                                 MC_STU_RGB_set(CHx, 0xFF, 0xFF, 0x00);
 
-                                if (ks != 2u)
+                                if (ks == 1u)
+                                {
+                                    dm_autoload_gate[CHx] = 1u;
+                                    dm_auto_state[CHx]    = DM_AUTO_S2_PUSH;
+                                    dm_auto_try[CHx]      = 0u;
+                                    dm_auto_remain_m[CHx] = bmcu_config_autoload_len(CHx);
+                                    dm_auto_last_m[CHx]   = cur_m;
+                                }
+                                else if (ks != 2u)
                                 {
                                     dm_auto_state[CHx] = DM_AUTO_IDLE;
                                     dm_auto_t0_ms[CHx] = 0ull;
                                 }
                                 else if ((now_ms - dm_auto_t0_ms[CHx]) >= DM_AUTO_S1_DEBOUNCE_MS)
                                 {
+                                    dm_autoload_gate[CHx] = 1u;
                                     dm_auto_state[CHx] = DM_AUTO_S1_PUSH;
                                     dm_auto_t0_ms[CHx] = now_ms;
                                 }
@@ -1331,6 +1362,7 @@ public:
                                 }
                                 else if (ks == 1u)
                                 {
+                                    dm_autoload_gate[CHx] = 1u;
                                     dm_auto_state[CHx]    = DM_AUTO_S2_PUSH;
                                     dm_auto_try[CHx]      = 0u;
                                     dm_auto_remain_m[CHx] = bmcu_config_autoload_len(CHx);
@@ -1410,6 +1442,9 @@ public:
                                     {
                                         dm_fail_latch[CHx] = 1u;
                                         dm_auto_state[CHx] = DM_AUTO_S2_FAIL_RETRACT;
+                                        dm_auto_remain_m[CHx] = bmcu_config_autoload_len(CHx);
+                                        dm_auto_last_m[CHx] = cur_m;
+                                        dm_auto_t0_ms[CHx] = now_ms;
                                     }
                                     else
                                     {
@@ -1489,17 +1524,29 @@ public:
                                 break;
 
                             case DM_AUTO_S2_FAIL_RETRACT:
+                            case DM_AUTO_S2_FAIL_EXTRA:
+                            {
                                 dm_autoload_active = true;
                                 MC_STU_RGB_set(CHx, 0xFF, 0x00, 0x00);
 
-                                if (ks == 0u)
+                                const float moved = absf(cur_m - dm_auto_last_m[CHx]);
+                                dm_auto_last_m[CHx] = cur_m;
+                                float remain = dm_auto_remain_m[CHx] - moved;
+                                if (remain < 0.0f) remain = 0.0f;
+                                dm_auto_remain_m[CHx] = remain;
+                                const bool extra = dm_auto_state[CHx] == DM_AUTO_S2_FAIL_EXTRA;
+                                const uint64_t limit_ms = extra ? DM_AUTO_FAIL_EXTRA_MS :
+                                                                   DM_AUTO_S1_FAIL_RETRACT_MS;
+
+                                if (ks == 0u || dm_auto_remain_m[CHx] <= 0.0f ||
+                                    (now_ms - dm_auto_t0_ms[CHx]) >= limit_ms)
                                 {
                                     dm_auto_state[CHx]    = DM_AUTO_IDLE;
                                     dm_auto_try[CHx]      = 0u;
                                     dm_auto_remain_m[CHx] = 0.0f;
                                     dm_auto_t0_ms[CHx]    = 0ull;
                                 }
-                                else if (ks == 2u)
+                                else if (!extra && ks == 2u)
                                 {
                                     dm_auto_state[CHx] = DM_AUTO_S2_FAIL_EXTRA;
                                     dm_auto_t0_ms[CHx] = now_ms;
@@ -1509,30 +1556,7 @@ public:
                                     dm_autoload_x = dir * DM_AUTO_PWM_PULL;
                                 }
                                 break;
-
-                            case DM_AUTO_S2_FAIL_EXTRA:
-                                dm_autoload_active = true;
-                                MC_STU_RGB_set(CHx, 0xFF, 0x00, 0x00);
-
-                                if (ks == 0u)
-                                {
-                                    dm_auto_state[CHx]    = DM_AUTO_IDLE;
-                                    dm_auto_try[CHx]      = 0u;
-                                    dm_auto_remain_m[CHx] = 0.0f;
-                                    dm_auto_t0_ms[CHx]    = 0ull;
-                                }
-                                else if ((now_ms - dm_auto_t0_ms[CHx]) >= DM_AUTO_FAIL_EXTRA_MS)
-                                {
-                                    dm_auto_state[CHx]    = DM_AUTO_IDLE;
-                                    dm_auto_try[CHx]      = 0u;
-                                    dm_auto_remain_m[CHx] = 0.0f;
-                                    dm_auto_t0_ms[CHx]    = 0ull;
-                                }
-                                else
-                                {
-                                    dm_autoload_x = dir * DM_AUTO_PWM_PULL;
-                                }
-                                break;
+                            }
 
                             default:
                                 dm_auto_state[CHx]    = DM_AUTO_IDLE;
@@ -1805,7 +1829,7 @@ public:
                     if (!send_len_abort)
                     {
                         constexpr float SEND_MAX_M = 10.0f;
-                        const float moved_m = absf(ams[motion_control_ams_num].filament[CHx].meters - send_start_m);
+                        const float moved_m = absf(encoder_meters(CHx) - send_start_m);
                         if (moved_m >= SEND_MAX_M) send_len_abort = 1;
                     }
 
@@ -2182,7 +2206,7 @@ bool Motion_control_start_channel_retract(uint8_t channel)
     auto_unload_empty_t0_ms[channel] = 0ull;
     auto_unload_rearm_t0_ms[channel] = 0ull;
     auto_unload_start_m[channel] =
-        ams[motion_control_ams_num].filament[channel].meters;
+        encoder_meters(channel);
     return true;
 }
 
@@ -2334,7 +2358,8 @@ static void motion_control_service_host_motion_gate(uint64_t now_ms)
 
         dm_loaded[ch] = loaded ? 1u : 0u;
         dm_loaded_drop_t0_ms[ch] = 0ull;
-        dm_autoload_gate[ch] = (key != 0u) ? 1u : 0u;
+        dm_autoload_gate[ch] = 1u;
+        dm_idle_empty[ch] = 0u;
 #endif
     }
     g_host_motion_enabled = true;
@@ -2410,8 +2435,8 @@ bool Motion_control_calibrate_motor_encoder(uint8_t selected_mask,
         if (!(selected_mask & bit) || !filament_channel_inserted[ch]) continue;
 
         MC_AS5600.updata_stu();
-        MC_AS5600.updata_angle();
-        if (!MC_AS5600.online[ch] ||
+        const uint8_t start_valid = MC_AS5600.updata_angle();
+        if (!(start_valid & (uint8_t)(1u << ch)) || !MC_AS5600.online[ch] ||
             MC_AS5600.magnet_stu[ch] == AS5600_soft_IIC_many::offline)
             return false;
 
@@ -2422,8 +2447,8 @@ bool Motion_control_calibrate_motor_encoder(uint8_t selected_mask,
         {
             delay(10);
             MC_AS5600.updata_stu();
-            MC_AS5600.updata_angle();
-            if (!MC_AS5600.online[ch] ||
+            const uint8_t test_valid = MC_AS5600.updata_angle();
+            if (!(test_valid & (uint8_t)(1u << ch)) || !MC_AS5600.online[ch] ||
                 MC_AS5600.magnet_stu[ch] == AS5600_soft_IIC_many::offline)
                 break;
             movement = calibration_angle_delta(
@@ -2440,20 +2465,27 @@ bool Motion_control_calibrate_motor_encoder(uint8_t selected_mask,
         }
         directions[ch] = movement > 0 ? 1 : -1;
 
+        bool return_encoder_ok = true;
         Motion_control_set_PWM(ch, -TEST_PWM);
         for (uint16_t step = 0u; step < RETURN_STEPS; step++)
         {
             delay(10);
-            MC_AS5600.updata_angle();
+            const uint8_t return_valid = MC_AS5600.updata_angle();
+            if (!(return_valid & (uint8_t)(1u << ch)))
+            {
+                return_encoder_ok = false;
+                break;
+            }
             const int remaining = calibration_angle_delta(
                 (int16_t)MC_AS5600.raw_angle[ch], start);
             if (remaining <= RETURN_COUNTS && remaining >= -RETURN_COUNTS) break;
         }
         Motion_control_set_PWM(ch, 0);
+        if (!return_encoder_ok) return false;
         delay(20);
         MC_AS5600.updata_stu();
-        MC_AS5600.updata_angle();
-        if (!MC_AS5600.online[ch] ||
+        const uint8_t final_valid = MC_AS5600.updata_angle();
+        if (!(final_valid & (uint8_t)(1u << ch)) || !MC_AS5600.online[ch] ||
             MC_AS5600.magnet_stu[ch] == AS5600_soft_IIC_many::offline)
             return false;
 
@@ -2466,58 +2498,17 @@ bool Motion_control_calibrate_motor_encoder(uint8_t selected_mask,
     return true;
 }
 
-bool Motion_control_commit_hardware_calibration(
-    uint8_t selected_mask, const uint8_t detector_none_cv[4],
-    const int8_t directions[4])
+void Motion_control_apply_hardware_calibration(void)
 {
-    selected_mask &= 0x0Fu;
-    if (!selected_mask || !detector_none_cv || !directions) return false;
-
-    const BmcuMotionNvm previous = g_bmcu_nvm;
-    float previous_thresholds[4];
+    Motion_control_apply_saved();
     for (uint8_t ch = 0u; ch < kChCount; ch++)
-        previous_thresholds[ch] = MC_DM_KEY_NONE_THRESH[ch];
-
-    for (uint8_t ch = 0u; ch < kChCount; ch++)
-    {
-        const uint8_t bit = (uint8_t)(1u << ch);
-        if (!(selected_mask & bit) || !filament_channel_inserted[ch]) continue;
-        if ((directions[ch] != -1 && directions[ch] != 1) ||
-            detector_none_cv[ch] < 60u || detector_none_cv[ch] > 139u)
-            return false;
-    }
-    for (uint8_t ch = 0u; ch < kChCount; ch++)
-    {
-        const uint8_t bit = (uint8_t)(1u << ch);
-        if (!(selected_mask & bit) || !filament_channel_inserted[ch]) continue;
-        g_bmcu_nvm.Motion_control_dir[ch] = directions[ch];
-        g_bmcu_nvm.dm_key_none_cv[ch] = detector_none_cv[ch];
-        MC_DM_KEY_NONE_THRESH[ch] = 0.01f * (float)detector_none_cv[ch];
-    }
-    g_bmcu_nvm.check = 0x40614061u;
-
-    if (!bmcu_config_save())
-    {
-        g_bmcu_nvm = previous;
-        for (uint8_t ch = 0u; ch < kChCount; ch++)
-            MC_DM_KEY_NONE_THRESH[ch] = previous_thresholds[ch];
-        return false;
-    }
-
-    for (uint8_t ch = 0u; ch < kChCount; ch++)
-    {
-        const uint8_t bit = (uint8_t)(1u << ch);
-        if (!(selected_mask & bit) || !filament_channel_inserted[ch]) continue;
-        MOTOR_CONTROL[ch].dir = (float)directions[ch];
-    }
-    return true;
+        MOTOR_CONTROL[ch].dir = (float)g_bmcu_nvm.Motion_control_dir[ch];
 }
 
 void AS5600_distance_updata(uint32_t now_ticks)
 {
-    static uint32_t last_ticks = 0u;
+    static uint32_t last_valid_ticks[4] = {0,0,0,0};
     static uint32_t last_poll_ticks = 0u;
-    static uint8_t  have_last_ticks = 0u;
     static uint8_t  was_ok[4] = {0,0,0,0};
     static uint32_t last_stu_ticks = 0u;
 
@@ -2539,38 +2530,21 @@ void AS5600_distance_updata(uint32_t now_ticks)
         MC_AS5600.updata_stu();
     }
 
-    if (!have_last_ticks)
-    {
-        last_ticks = now_ticks;
-        have_last_ticks = 1u;
-        return;
-    }
-
-    const uint32_t dt_ticks = (uint32_t)(now_ticks - last_ticks);
-    if (dt_ticks == 0u) return;
-    last_ticks = now_ticks;
-
-    static uint32_t inv_dt_ticks_cache = 0u;
-    static uint32_t inv_dt_tpus_cache = 0u;
-    static float inv_dt_cache = 0.0f;
-    if (dt_ticks != inv_dt_ticks_cache || tpus != inv_dt_tpus_cache)
-    {
-        inv_dt_ticks_cache = dt_ticks;
-        inv_dt_tpus_cache = tpus;
-        inv_dt_cache = (1000000.0f * (float)tpus) / (float)dt_ticks;
-    }
-    const float inv_dt = inv_dt_cache;
-
-    MC_AS5600.updata_angle();
+    const uint8_t valid = MC_AS5600.updata_angle();
+    const uint32_t sample_ticks = time_ticks32();
+    uint32_t cached_dt_ticks = 0u;
+    float inv_dt = 0.0f;
     auto &A = ams[motion_control_ams_num];
 
     for (uint8_t i = 0; i < kChCount; i++)
     {
-        const bool ok_now = MC_AS5600.online[i] && (MC_AS5600.magnet_stu[i] != AS5600_soft_IIC_many::offline);
+        const bool ok_now =
+            (valid & (uint8_t)(1u << i)) != 0u &&
+            MC_AS5600.magnet_stu[i] != AS5600_soft_IIC_many::offline;
 
         if (ok_now)
         {
-            g_as5600_fail[i] = 0;
+            g_as5600_fail[i] = 0u;
             if (g_as5600_okstreak[i] < 255u) g_as5600_okstreak[i]++;
             if (g_as5600_okstreak[i] >= kAS5600_OK_RECOVER) g_as5600_good[i] = 1u;
         }
@@ -2588,11 +2562,15 @@ void AS5600_distance_updata(uint32_t now_ticks)
             continue;
         }
 
+        if (!ok_now) continue;
+
         if (!was_ok[i])
         {
             as5600_distance_save[i] = MC_AS5600.raw_angle[i];
             speed_as5600[i] = 0.0f;
             was_ok[i] = 1u;
+            last_valid_ticks[i] = sample_ticks;
+            A.filament[i].meters = encoder_meters(i);
             continue;
         }
 
@@ -2603,11 +2581,21 @@ void AS5600_distance_updata(uint32_t now_ticks)
         if (diff > 2048) diff -= 4096;
         if (diff < -2048) diff += 4096;
 
+        const uint32_t dt_ticks = sample_ticks - last_valid_ticks[i];
+        if (!dt_ticks) continue;
+        last_valid_ticks[i] = sample_ticks;
         as5600_distance_save[i] = now;
+        as5600_odometer_count[i] += diff;
+        A.filament[i].meters = encoder_meters(i);
+
+        if (dt_ticks != cached_dt_ticks)
+        {
+            cached_dt_ticks = dt_ticks;
+            inv_dt = (1000000.0f * (float)tpus) / (float)dt_ticks;
+        }
 
         const float dist_mm = (float)diff * kAS5600_MM_PER_CNT;
         speed_as5600[i] = dist_mm * inv_dt;
-        A.filament[i].meters += dist_mm * 0.001f;
     }
 }
 
@@ -2626,9 +2614,9 @@ static float filament_pull_back_meters[4];
 
 static float filament_pull_back_target[4] = {0.200f, 0.200f, 0.200f, 0.200f};
 
-static bool motor_motion_filamnet_pull_back_to_online_key(uint64_t time_now)
+static uint8_t motor_motion_filament_pull_back_to_online_key(uint64_t time_now)
 {
-    bool wait = false;
+    uint8_t handled_mask = 0u;
     auto &A = ams[motion_control_ams_num];
 
     for (uint8_t i = 0; i < kChCount; i++)
@@ -2637,10 +2625,11 @@ static bool motor_motion_filamnet_pull_back_to_online_key(uint64_t time_now)
         {
         case filament_pulling_back:
         {
+            handled_mask |= (uint8_t)(1u << i);
             MC_STU_STATUS_set_latch(i, BMCU_LED_PULLBACK, time_now, 1u);
 
             const float target = filament_pull_back_target[i];
-            const float d = filament_pull_back_meters[i] - A.filament[i].meters;
+            const float d = filament_pull_back_meters[i] - encoder_meters(i);
 
             if (target <= 0.0f || d >= target)
             {
@@ -2650,7 +2639,7 @@ static bool motor_motion_filamnet_pull_back_to_online_key(uint64_t time_now)
                 filament_pull_back_target[i] = motion_control_pull_back_distance(i);
                 filament_now_position[i] = filament_redetect;
             }
-            else if (MC_ONLINE_key_stu[i] == 0)
+            else if (g_key_empty[i] >= kKeyEmptyPublications)
             {
                 g_pull_remain_m[i]  = 0.0f;
                 g_pull_speed_set[i] = -PULL_V_FAST;
@@ -2671,13 +2660,12 @@ static bool motor_motion_filamnet_pull_back_to_online_key(uint64_t time_now)
 
                 MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pull, 100, time_now);
             }
-
-            wait = true;
             break;
         }
 
         case filament_redetect:
         {
+            handled_mask |= (uint8_t)(1u << i);
             MC_STU_STATUS_set_latch(i, BMCU_LED_REDETECT, time_now, 0u);
 
             if (MC_ONLINE_key_stu[i] == 0)
@@ -2688,12 +2676,13 @@ static bool motor_motion_filamnet_pull_back_to_online_key(uint64_t time_now)
             {
                 MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
                 filament_now_position[i] = filament_idle;
-
-                A.filament_use_flag = 0x00;
                 A.filament[i].motion = _filament_motion::idle;
+                if (A.now_filament_num == i)
+                {
+                    A.now_filament_num = 0xFFu;
+                    A.filament_use_flag = 0u;
+                }
             }
-
-            wait = true;
             break;
         }
 
@@ -2702,178 +2691,174 @@ static bool motor_motion_filamnet_pull_back_to_online_key(uint64_t time_now)
         }
     }
 
-    return wait;
+    return handled_mask;
 }
 
-static void motor_motion_switch(uint64_t time_now)
+void Motion_control_stop_channel_motion(uint8_t channel)
+{
+    if (channel >= kChCount) return;
+    filament_now_position[channel] = filament_idle;
+    filament_pull_back_target[channel] = motion_control_pull_back_distance(channel);
+    g_pull_remain_m[channel] = 0.0f;
+    g_pull_speed_set[channel] = -PULL_V_FAST;
+    if (auto_unload_active[channel])
+        Motion_control_cancel_channel_retract(channel);
+    MOTOR_CONTROL[channel].set_motion(
+        filament_motion_enum::filament_motion_stop, 100,
+        time_ms_fast_from_ticks64(time_ticks64()));
+    Motion_control_set_PWM(channel, 0);
+}
+
+static void motor_motion_switch(uint64_t time_now, uint8_t handled_mask)
 {
     auto &A = ams[motion_control_ams_num];
 
-    const uint8_t num = A.now_filament_num;
-    const _filament_motion motion = (num < kChCount) ? A.filament[num].motion : _filament_motion::idle;
-
     for (uint8_t i = 0; i < kChCount; i++)
     {
-        if (i != num)
-        {
-            filament_now_position[i] = filament_idle;
-
-            if (filament_channel_inserted[i] && (MC_ONLINE_key_stu[i] != 0 || g_last_on_use_exit_ms[i] != 0))
-                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_idle, 1000, time_now);
-            else
-                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 1000, time_now);
-
-#if BMCU_DM_TWO_MICROSWITCH
-            if (dm_fail_latch[i])
-                MC_STU_STATUS_set_latch(
-                    i, BMCU_LED_ERROR, time_now, 0u);
-            else if (filament_channel_inserted[i] && dm_loaded[i])
-                MC_STU_STATUS_set_latch(
-                    i, BMCU_LED_IDLE, time_now, 0u);
-            else
-                MC_STU_STATUS_set_latch(
-                    i, BMCU_LED_EMPTY, time_now, 0u);
-#else
-            MC_STU_STATUS_set_latch(
-                i,
-                MC_ONLINE_key_stu[i] != 0u
-                    ? BMCU_LED_IDLE : BMCU_LED_EMPTY,
-                time_now, 0u);
-#endif
+        if (handled_mask & (uint8_t)(1u << i))
             continue;
-        }
 
-        if (num >= kChCount) continue;
+        const _filament_motion motion = A.filament[i].motion;
 
-        if (MC_ONLINE_key_stu[num] != 0)
+        if (MC_ONLINE_key_stu[i] != 0)
         {
             switch (motion)
             {
             case _filament_motion::before_on_use:
             {
-                filament_now_position[num] = filament_using;
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_before_on_use, 300, time_now);
-                MC_STU_STATUS_set_latch(num, BMCU_LED_BEFORE_LOAD, time_now, 0u);
+                filament_now_position[i] = filament_using;
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_before_on_use, 300, time_now);
+                MC_STU_STATUS_set_latch(i, BMCU_LED_BEFORE_LOAD, time_now, 0u);
                 break;
             }
 
             case _filament_motion::stop_on_use:
             {
-                filament_now_position[num] = filament_using;
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_stop_on_use, 300, time_now);
-                MC_STU_STATUS_set_latch(num, BMCU_LED_ERROR, time_now, 0u);
+                filament_now_position[i] = filament_using;
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop_on_use, 300, time_now);
+                MC_STU_STATUS_set_latch(i, BMCU_LED_ERROR, time_now, 0u);
                 break;
             }
 
             case _filament_motion::send_out:
             {
-                if (g_on_use_jam_latch[num])
+                if (g_on_use_jam_latch[i])
                 {
-                    if (MC_PULL_pct_f[num] > 85.0f)
+                    if (MC_PULL_pct_f[i] > 85.0f)
                     {
-                        g_on_use_low_latch[num] = 0u;
-                        g_on_use_jam_latch[num] = 0u;
-                        g_on_use_hi_pwm_us[num] = 0u;
+                        g_on_use_low_latch[i] = 0u;
+                        g_on_use_jam_latch[i] = 0u;
+                        g_on_use_hi_pwm_us[i] = 0u;
                     }
                     else
                     {
-                        MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
-                        MC_STU_STATUS_set_latch(num, BMCU_LED_LOADING, time_now, 0u);
+                        MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
+                        MC_STU_STATUS_set_latch(i, BMCU_LED_LOADING, time_now, 0u);
                         break;
                     }
                 }
 
-                MC_STU_STATUS_set_latch(num, BMCU_LED_LOADING, time_now, 0u);
-                filament_now_position[num] = filament_sending_out;
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_send, 100, time_now);
+                MC_STU_STATUS_set_latch(i, BMCU_LED_LOADING, time_now, 0u);
+                filament_now_position[i] = filament_sending_out;
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_send, 100, time_now);
                 break;
             }
 
             case _filament_motion::pull_back:
             {
-                MC_STU_STATUS_set_latch(num, BMCU_LED_UNLOADING, time_now, 1u);
+                MC_STU_STATUS_set_latch(i, BMCU_LED_UNLOADING, time_now, 1u);
 
-                if (filament_now_position[num] != filament_pulling_back)
+                if (filament_now_position[i] != filament_pulling_back)
                 {
                     const bool from_before_pull_back =
-                        filament_now_position[num] == filament_before_pull_back;
-                    filament_now_position[num] = filament_pulling_back;
+                        filament_now_position[i] == filament_before_pull_back;
+                    filament_now_position[i] = filament_pulling_back;
+                    g_key_empty[i] = 0u;
 
                     float target;
-                    if (g_on_use_jam_latch[num])
+                    if (g_on_use_jam_latch[i])
                     {
-                        filament_pull_back_meters[num] = A.filament[num].meters;
+                        filament_pull_back_meters[i] = encoder_meters(i);
                         target = 0.100f;
                     }
                     else
                     {
                         if (!from_before_pull_back)
-                            filament_pull_back_meters[num] = A.filament[num].meters;
-                        target = motion_control_pull_back_distance(num);
+                            filament_pull_back_meters[i] = encoder_meters(i);
+                        target = motion_control_pull_back_distance(i);
                     }
 
-                    filament_pull_back_target[num] = target;
+                    filament_pull_back_target[i] = target;
 
-                    const float d = filament_pull_back_meters[num] - A.filament[num].meters;
+                    const float d = filament_pull_back_meters[i] - encoder_meters(i);
                     const float remain = target - d;
-                    g_pull_remain_m[num]  = (remain > 0.0f) ? remain : 0.0f;
-                    g_pull_speed_set[num] = -PULL_V_FAST;
+                    g_pull_remain_m[i]  = (remain > 0.0f) ? remain : 0.0f;
+                    g_pull_speed_set[i] = -PULL_V_FAST;
                 }
 
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_pull, 100, time_now);
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pull, 100, time_now);
                 break;
             }
 
             case _filament_motion::before_pull_back:
             {
-                MC_STU_STATUS_set_latch(num, BMCU_LED_BEFORE_UNLOAD, time_now, 1u);
+                MC_STU_STATUS_set_latch(i, BMCU_LED_BEFORE_UNLOAD, time_now, 1u);
 
-                if (filament_now_position[num] != filament_before_pull_back)
+                if (filament_now_position[i] != filament_before_pull_back)
                 {
-                    filament_now_position[num] = filament_before_pull_back;
-                    filament_pull_back_meters[num] = A.filament[num].meters;
+                    filament_now_position[i] = filament_before_pull_back;
+                    filament_pull_back_meters[i] = encoder_meters(i);
                 }
 
-                const float target = motion_control_pull_back_distance(num);
-                const float retracted = filament_pull_back_meters[num] - A.filament[num].meters;
+                const float target = motion_control_pull_back_distance(i);
+                const float retracted = filament_pull_back_meters[i] - encoder_meters(i);
                 if (retracted >= target)
                 {
-                    MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
+                    MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
                     break;
                 }
 
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_before_pull_back, 300, time_now);
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_before_pull_back, 300, time_now);
                 break;
             }
 
             case _filament_motion::on_use:
             {
-                filament_now_position[num] = filament_using;
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_on_use, 300, time_now);
-                MC_STU_STATUS_set_latch(num, BMCU_LED_ACTIVE, time_now, 0u);
+                filament_now_position[i] = filament_using;
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_on_use, 300, time_now);
+                MC_STU_STATUS_set_latch(i, BMCU_LED_ACTIVE, time_now, 0u);
                 break;
             }
 
             case _filament_motion::idle:
             default:
             {
-                filament_now_position[num] = filament_idle;
+                filament_now_position[i] = filament_idle;
 
-                if (g_on_use_jam_latch[num])
+                if (g_on_use_jam_latch[i])
                 {
-                    MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
-                    MC_STU_RGB_set_latch(num, 0x38u, 0x35u, 0x32u, time_now, 0u);
+                    MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 100, time_now);
+                    MC_STU_RGB_set_latch(i, 0x38u, 0x35u, 0x32u, time_now, 0u);
                     break;
                 }
 
-                MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_idle, 100, time_now);
+                if (filament_channel_inserted[i] &&
+                    (MC_ONLINE_key_stu[i] != 0 || g_last_on_use_exit_ms[i] != 0))
+                    MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_idle, 1000, time_now);
+                else
+                    MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 1000, time_now);
 
 #if BMCU_DM_TWO_MICROSWITCH
-                if (dm_fail_latch[num])      MC_STU_STATUS_set_latch(num, BMCU_LED_ERROR, time_now, 0u);
-                else if (dm_loaded[num])     MC_STU_RGB_set_latch(num, 0x38u, 0x35u, 0x32u, time_now, 0u);
-                else                         MC_STU_RGB_set_latch(num, 0x00u, 0x00u, 0x00u, time_now, 0u);
+                if (dm_fail_latch[i])
+                    MC_STU_STATUS_set_latch(i, BMCU_LED_ERROR, time_now, 0u);
+                else if (filament_channel_inserted[i] && dm_loaded[i])
+                    MC_STU_STATUS_set_latch(i, BMCU_LED_IDLE, time_now, 0u);
+                else
+                    MC_STU_STATUS_set_latch(i, BMCU_LED_EMPTY, time_now, 0u);
 #else
-                MC_STU_RGB_set_latch(num, 0x38u, 0x35u, 0x32u, time_now, 0u);
+                MC_STU_STATUS_set_latch(
+                    i, MC_ONLINE_key_stu[i] != 0u ? BMCU_LED_IDLE : BMCU_LED_EMPTY,
+                    time_now, 0u);
 #endif
                 break;
             }
@@ -2881,9 +2866,19 @@ static void motor_motion_switch(uint64_t time_now)
         }
         else
         {
-            filament_now_position[num] = filament_idle;
-            MOTOR_CONTROL[num].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_idle, 100, time_now);
-            MC_STU_RGB_set_latch(num, 0x00u, 0x00u, 0x00u, time_now, 0u);
+            filament_now_position[i] = filament_idle;
+            if (motion == _filament_motion::idle)
+            {
+                if (filament_channel_inserted[i] && g_last_on_use_exit_ms[i] != 0u)
+                    MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_idle, 1000, time_now);
+                else
+                    MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_stop, 1000, time_now);
+            }
+            else
+            {
+                MOTOR_CONTROL[i].set_motion(filament_motion_enum::filament_motion_pressure_ctrl_idle, 100, time_now);
+            }
+            MC_STU_RGB_set_latch(i, 0x00u, 0x00u, 0x00u, time_now, 0u);
         }
     }
 }
@@ -2934,6 +2929,16 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
                              bool calibration_inhibit)
 {
     g_calibration_motion_inhibit = calibration_inhibit;
+
+    for (uint8_t ch = 0; ch < kChCount; ch++)
+    {
+        if (MC_ONLINE_key_stu[ch] != 0u || !ADC_DMA_ready() ||
+            filament_now_position[ch] != filament_pulling_back)
+            g_key_empty[ch] = 0u;
+        else if (g_key_sample_fresh && g_key_empty[ch] < kKeyEmptyPublications)
+            ++g_key_empty[ch];
+    }
+
 #if BMCU_DM_TWO_MICROSWITCH
     for (uint8_t ch = 0; ch < kChCount; ch++)
     {
@@ -2948,6 +2953,7 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
             dm_auto_last_m[ch]       = 0.0f;
             dm_loaded_drop_t0_ms[ch] = 0ull;
             dm_autoload_gate[ch]     = 1u;
+            dm_idle_empty[ch]        = 0u;
             auto_unload_reset(ch, 1u);
             continue;
         }
@@ -2962,19 +2968,31 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
             dm_auto_remain_m[ch]     = 0.0f;
             dm_auto_last_m[ch]       = 0.0f;
             dm_loaded_drop_t0_ms[ch] = 0ull;
-            dm_autoload_gate[ch]     = 0u;
+            dm_autoload_gate[ch]     = 1u;
+            dm_idle_empty[ch]        = 0u;
             continue;
         }
 
         const uint8_t ks = MC_ONLINE_key_stu[ch];
+        const bool idle =
+            filament_now_position[ch] == filament_idle &&
+            ams[motion_control_ams_num].filament[ch].motion == _filament_motion::idle &&
+            !auto_unload_active[ch];
+
+        if (!idle) dm_autoload_gate[ch] = 1u;
+        if (!idle || ks != 0u || !ADC_DMA_ready()) dm_idle_empty[ch] = 0u;
+        else if (g_key_sample_fresh && dm_idle_empty[ch] < kKeyEmptyPublications)
+            ++dm_idle_empty[ch];
 
         if (ks == 0u)
         {
-            if (filament_now_position[ch] == filament_idle)
+            if (dm_idle_empty[ch] >= kKeyEmptyPublications)
+            {
                 dm_autoload_gate[ch] = 0u;
+                dm_fail_latch[ch] = 0u;
+            }
 
             dm_loaded[ch]            = 0u;
-            dm_fail_latch[ch]        = 0u;
             dm_auto_state[ch]        = DM_AUTO_IDLE;
             dm_auto_try[ch]          = 0u;
             dm_auto_t0_ms[ch]        = 0ull;
@@ -2984,7 +3002,24 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
             continue;
         }
 
-        if (dm_loaded[ch] && (ks != 1u))
+        const auto &A = ams[motion_control_ams_num];
+        const _filament_motion host_motion = A.filament[ch].motion;
+        if (ks == 1u && g_key_sample_fresh &&
+            !dm_fail_latch[ch] &&
+            (host_motion == _filament_motion::before_on_use ||
+             host_motion == _filament_motion::on_use ||
+             host_motion == _filament_motion::stop_on_use))
+        {
+            dm_loaded[ch] = 1u;
+            dm_autoload_gate[ch] = 1u;
+            dm_auto_state[ch] = DM_AUTO_IDLE;
+            dm_auto_try[ch] = 0u;
+            dm_auto_remain_m[ch] = 0.0f;
+            dm_auto_last_m[ch] = 0.0f;
+            dm_auto_t0_ms[ch] = 0ull;
+        }
+
+        if (dm_loaded[ch] && ks != 1u)
         {
             uint64_t t0 = dm_loaded_drop_t0_ms[ch];
             if (t0 == 0ull) dm_loaded_drop_t0_ms[ch] = time_now;
@@ -2992,12 +3027,11 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
             {
                 dm_loaded[ch]            = 0u;
                 dm_loaded_drop_t0_ms[ch] = 0ull;
-
-                dm_auto_state[ch]    = DM_AUTO_IDLE;
-                dm_auto_try[ch]      = 0u;
-                dm_auto_t0_ms[ch]    = 0ull;
-                dm_auto_remain_m[ch] = 0.0f;
-                dm_auto_last_m[ch]   = 0.0f;
+                dm_auto_state[ch]        = DM_AUTO_IDLE;
+                dm_auto_try[ch]          = 0u;
+                dm_auto_t0_ms[ch]        = 0ull;
+                dm_auto_remain_m[ch]     = 0.0f;
+                dm_auto_last_m[ch]       = 0.0f;
             }
         }
         else
@@ -3046,10 +3080,13 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
     auto &Acol = ams[motion_control_ams_num];
 #endif
 
+    const bool all_empty = all_no_filament();
+
     if (!error && !calibration_inhibit)
     {
-        if (!motor_motion_filamnet_pull_back_to_online_key(time_now))
-            motor_motion_switch(time_now);
+        const uint8_t pullback_mask =
+            motor_motion_filament_pull_back_to_online_key(time_now);
+        motor_motion_switch(time_now, pullback_mask);
     }
     else
     {
@@ -3172,7 +3209,7 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
                         auto_unload_active_t0_ms[i] = time_now;
                         auto_unload_empty_t0_ms[i] = 0ull;
                         auto_unload_start_m[i] =
-                            ams[motion_control_ams_num].filament[i].meters;
+                            encoder_meters(i);
                         auto_unload_blocked[i] = 1u;
                     }
                     auto_unload_arm[i] = 0u;
@@ -3188,7 +3225,7 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
             if (auto_unload_active[i])
             {
                 const float current_m =
-                    ams[motion_control_ams_num].filament[i].meters;
+                    encoder_meters(i);
                 const float total_retracted_m =
                     absf(current_m - auto_unload_start_m[i]);
                 const bool hard_limit =
@@ -3314,7 +3351,8 @@ static void motor_motion_run(int error, uint64_t time_now, uint32_t now_ticks,
             else
 #endif
             {
-                if (key == 0u && (uint8_t)(pct_u8 - 49u) <= 2u)
+                if (key == 0u && all_empty &&
+                        (uint8_t)(pct_u8 - 49u) <= 2u)
                     lighting_buffer_rgb(BMCU_BUFFER_NEUTRAL, &r, &g, &b);
             }
         }
@@ -3355,11 +3393,8 @@ void Motion_control_run(int error)
         {
             if (!error)
             {
-                if (A.now_filament_num == ch)
-                {
-                    if (A.filament[ch].motion == _filament_motion::send_out)
-                        MOTOR_CONTROL[ch].set_motion(filament_motion_enum::filament_motion_stop, 100, now_ms);
-                }
+                if (A.filament[ch].motion == _filament_motion::send_out)
+                    MOTOR_CONTROL[ch].set_motion(filament_motion_enum::filament_motion_stop, 100, now_ms);
             }
 
             if (g_on_use_jam_latch[ch])
@@ -3479,7 +3514,7 @@ void MC_PWM_init()
     TIM_OCInitTypeDef TIM_OCInitStructure;
 
     TIM_TimeBaseStructure.TIM_Period        = 999;
-    TIM_TimeBaseStructure.TIM_Prescaler     = 1;
+    TIM_TimeBaseStructure.TIM_Prescaler     = 0;
     TIM_TimeBaseStructure.TIM_ClockDivision = 0;
     TIM_TimeBaseStructure.TIM_CounterMode   = TIM_CounterMode_Up;
 
@@ -3569,31 +3604,16 @@ void Motion_control_init()
     #if BMCU_DM_TWO_MICROSWITCH
         for (uint8_t ch = 0; ch < kChCount; ch++)
         {
-            if (!filament_channel_inserted[ch])
-            {
-                dm_loaded[ch]            = 1u;
-                dm_fail_latch[ch]        = 0u;
-                dm_auto_state[ch]        = DM_AUTO_IDLE;
-                dm_auto_try[ch]          = 0u;
-                dm_auto_t0_ms[ch]        = 0ull;
-                dm_auto_remain_m[ch]     = 0.0f;
-                dm_auto_last_m[ch]       = 0.0f;
-                dm_loaded_drop_t0_ms[ch] = 0ull;
-                dm_autoload_gate[ch]     = 0u;
-                continue;
-            }
-
             const uint8_t ks = MC_ONLINE_key_stu[ch];
-
-            dm_autoload_gate[ch] = (ks != 0u) ? 1u : 0u;
-            dm_loaded[ch] = (ks == 1u) ? 1u : 0u;
-
+            dm_loaded[ch] = !filament_channel_inserted[ch] || ks == 1u ? 1u : 0u;
             dm_fail_latch[ch]        = 0u;
             dm_auto_state[ch]        = DM_AUTO_IDLE;
+            dm_autoload_gate[ch]     = 1u;
             dm_auto_try[ch]          = 0u;
             dm_auto_t0_ms[ch]        = 0ull;
             dm_auto_remain_m[ch]     = 0.0f;
             dm_auto_last_m[ch]       = 0.0f;
+            dm_idle_empty[ch]        = 0u;
             dm_loaded_drop_t0_ms[ch] = 0ull;
         }
     #endif
@@ -3601,12 +3621,14 @@ void Motion_control_init()
     MC_AS5600.init(AS5600_SCL_PORT, AS5600_SCL_PIN,
                AS5600_SDA_PORT, AS5600_SDA_PIN,
                4);
-    MC_AS5600.updata_angle();
+    const uint8_t angle_valid = MC_AS5600.updata_angle();
     MC_AS5600.updata_stu();
 
     for (uint8_t i = 0; i < kChCount; i++)
     {
-        const bool ok = MC_AS5600.online[i] && (MC_AS5600.magnet_stu[i] != AS5600_soft_IIC_many::offline);
+        const bool ok = (angle_valid & (uint8_t)(1u << i)) != 0u &&
+                        MC_AS5600.online[i] &&
+                        MC_AS5600.magnet_stu[i] != AS5600_soft_IIC_many::offline;
         g_as5600_good[i]     = ok ? 1u : 0u;
         g_as5600_fail[i]     = ok ? 0u : kAS5600_FAIL_TRIP;
         g_as5600_okstreak[i] = ok ? kAS5600_OK_RECOVER : 0u;

@@ -6,6 +6,7 @@
 void Motion_control_boot_safe_init();
 void Motion_control_init();
 void Motion_control_set_PWM(uint8_t CHx, int PWM);
+void Motion_control_stop_channel_motion(uint8_t channel);
 void Motion_control_set_host_motion_enabled(bool enabled);
 int16_t Motion_control_get_pwm(uint8_t CHx);
 uint8_t Motion_control_filament_present(uint8_t CHx);
@@ -25,9 +26,7 @@ bool Motion_control_save_dm_key_none_thresholds(void);
 bool Motion_control_calibrate_motor_encoder(uint8_t selected_mask,
                                             int8_t directions[4]);
 
-bool Motion_control_commit_hardware_calibration(
-    uint8_t selected_mask, const uint8_t detector_none_cv[4],
-    const int8_t directions[4]);
+void Motion_control_apply_hardware_calibration(void);
 
 void MC_PULL_detect_channels_inserted();
 

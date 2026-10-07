@@ -8,7 +8,7 @@
 
 static constexpr uint32_t kCh      = 8;
 static constexpr uint32_t kBlock   = 32;
-static constexpr uint32_t kNBlocks = 4;
+static constexpr uint32_t kNBlocks = ADC_DMA_FILTER_BLOCKS;
 static constexpr uint32_t kBufLen  = (kCh * kBlock * 2);
 static constexpr uint32_t kHalfLen = (kBufLen / 2);
 
@@ -27,6 +27,7 @@ static float            g_v[2][kCh] __attribute__((aligned(4)));
 static volatile uint8_t g_v_rd = 0;
 static volatile uint8_t g_acc_dirty = 0;
 static volatile uint8_t g_sample_ready = 0;
+static uint32_t g_publication = 0u;
 static uint32_t g_last_progress_tick = 0u;
 static uint32_t g_last_restart_tick = 0u;
 
@@ -225,10 +226,16 @@ const float *ADC_DMA_get_value()
 
         adc_dma_compiler_barrier();
         g_v_rd = wr;
+        ++g_publication;
         g_acc_dirty = 0u;
     }
 
     return g_v[g_v_rd];
+}
+
+uint32_t ADC_DMA_generation()
+{
+    return g_publication;
 }
 
 void ADC_DMA_filter_reset()
@@ -286,7 +293,7 @@ void ADC_DMA_init()
     RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC2, ENABLE);
-    RCC_ADCCLKConfig(RCC_PCLK2_Div8);
+    RCC_ADCCLKConfig(RCC_PCLK2_Div4);
 
     ADC_DMA_gpio_analog();
 

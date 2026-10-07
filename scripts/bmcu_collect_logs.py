@@ -39,7 +39,7 @@ def request_json(base, path):
     try:
         url = base.rstrip('/') + path
         request = urllib.request.Request(url, headers={'Accept': 'application/json'})
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:
             raw = response.read(MAX_JSON_BYTES + 1)
         if len(raw) > MAX_JSON_BYTES:
             return None

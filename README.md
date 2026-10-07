@@ -1,8 +1,12 @@
 # BMCU-Klipper
 
+> [!WARNING]
+> **Before updating BMCU-Klipper, completely unload all filament from every BMCU and toolhead.**
+> A BMCU-Klipper update may also require a matching BMCU firmware update. If the required firmware version changes, update the BMCU firmware before using BMCU again.
+
 BMCU is an open **Multi Color Unit**, originally designed for Bambu Lab printers. Firmware updates for Bambu Lab printers that restrict interoperability - which in my opinion are incompatible with European law ([more on this topic](https://github.com/jarczakpawel/BMCU-C-PJARCZAK/blob/main/bmcu-vs-firmware-locks.md)) - are what led to the creation of BMCU-Klipper.
 
-BMCU-Klipper is an integration with an open system, so channel routing, toolhead assignments, load/unload, refill, prestaging, tip forming and source planning can be adapted precisely to a specific printer. You do not need to adapt the printer to a closed ecosystem - here you can change both BMCU behavior and the way it works with the printer, and every part of the integration can later be improved or modified for your own needs.
+BMCU-Klipper integrates BMCU with Klipper and provides routing, load/unload, refill, prestaging, tip forming and source planning.
 
 ### Snapmaker U1 - video guide
 
@@ -10,9 +14,7 @@ BMCU-Klipper is an integration with an open system, so channel routing, toolhead
 
 BMCU-Klipper is also compatible with PAXX12 Extended Firmware on Snapmaker U1. Installation is the same as on the stock firmware.
 
-One of the most important goals of the project was to keep the integration as lightweight as possible so that BMCU also works on weaker Klipper hosts. Each module has its own process handling USB/UART transport, while G-code analysis and planning of future source changes run in a separate process. The module running in Klipper only receives small batches of prepared data - by default at most 2 packets, 256 B and 0.5 ms of work per reactor entry - and then returns control to Klipper. Subsequent state updates are merged, background tasks are deferred while the printer is moving, and BMCU reactor activity is completely suppressed during homing and probing. When nothing is happening, the manager automatically reduces its polling frequency. Motors, the buffer and current filament transport are controlled by BMCU firmware, so the printer's main MCU does not receive this workload.
-
-In my tests, the impact of the integration is unnoticeable. It was meant to be feather-light, and in my opinion that goal has been achieved.
+The integration keeps USB/UART transport and print planning outside Klipper's main reactor where possible, while BMCU firmware handles motor and buffer control.
 
 ## Connecting BMCU
 
@@ -29,7 +31,7 @@ The project core is prepared for additional printers and hardware adapters.
 
 ## Installation and update
 
-The installer supports Snapmaker U1 and Generic Klipper hosts using systemd. Other service managers are not currently supported on Generic hosts.
+The installer supports Snapmaker U1 and Generic Klipper hosts. If several Klipper instances are detected, select the intended instance or pass `--config-dir`.
 
 The simplest method is to run the installer directly on the Klipper host:
 
@@ -37,7 +39,9 @@ The simplest method is to run the installer directly on the Klipper host:
 curl -fsSL https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/install.sh | sh
 ```
 
-If BMCU-Klipper is already installed, the same command performs an update. After updating the printer firmware or operating system, run the installer again.
+Installation, update and reinstallation use the same command. Do not run it during an active print.
+
+After updating the printer firmware or operating system, run the installer again.
 
 Panel:
 
@@ -66,15 +70,15 @@ From an extracted BMCU-Klipper package:
 sh ./uninstall
 ```
 
-The uninstaller requires Klipper READY, an idle printer and empty BMCU routes. On Snapmaker U1 it restores the native feeder state before removing BMCU-Klipper.
-
-If Klipper cannot reach READY and every filament path is physically empty, use host recovery:
+Without a package on the printer:
 
 ```sh
-sh ./uninstall --host-recovery --confirm-paths-empty
+curl -fsSL https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/install.sh | sh -s -- --uninstall
 ```
 
-Host recovery leaves Klipper stopped and cannot restore U1 feeder settings while Klipper is unavailable.
+BMCU-Klipper is removed automatically and Klipper is restarted. On Snapmaker U1, the native feeder configuration is restored.
+
+A backup of BMCU settings is kept in `printer_data/bmcu-backups/`.
 
 ## First setup
 

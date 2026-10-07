@@ -4,23 +4,6 @@ Dedicated BMCU integration for the four-head Snapmaker U1.
 
 The integration uses the native U1 model of heads, feeders, sensors and states, while adding BMCU channels as additional logical material sources. The entire workflow remains consistent with Snapmaker mechanics: U1 handles its own heads and hotends, while BMCU handles material transport, routing and source preparation.
 
-## Contents
-
-- [Integration scope](#integration-scope)
-- [Requirements](#requirements)
-- [Installation and update](#installation-and-update)
-- [First setup](#first-setup)
-- [Source and tool model](#source-and-tool-model)
-- [Load, unload and tool change](#load-unload-and-tool-change)
-- [Tip forming and background work](#tip-forming-and-background-work)
-- [Runout and refill](#runout-and-refill)
-- [OrcaSlicer and Snapmaker Orca](#orcaslicer-and-snapmaker-orca)
-- [Panel and BMCU firmware](#panel-and-bmcu-firmware)
-- [Optional 24 V power](#optional-24-v-power)
-- [Diagnostics](#diagnostics)
-- [After a U1 firmware update](#after-a-u1-firmware-update)
-- [Uninstallation](#uninstallation)
-
 ## Integration scope
 
 | Area | U1 implementation |
@@ -48,9 +31,9 @@ Before installation:
 Settings > Print Preferences > Auto Loading
 ```
 
-3. Finish any active print and bring Klipper to the `ready` state.
+3. Finish any active print.
 
-Root Access is used by the installer for persistent host changes. Klipper runs as the `lava` user.
+Root Access is required for installation.
 
 ## Installation and update
 
@@ -136,18 +119,6 @@ The original Snapmaker feeders can continue to work as native `T0-T3` sources. T
 If stock filament occupies the route, it must be retracted manually before BMCU takes over that route. The simplest approach is to use the stock feeder as an independent source or as the final source in a print, when later automatic filament retraction will not be needed.
 
 BMCU works well as a replacement for the stock feeders because every channel can both feed and retract filament. PTFE routes can be configured freely, and the panel can decide whether the final filament remains loaded after a successful print. On the next print, the integration checks the state of every used head: if another BMCU source is loaded on a route, it is safely unloaded before the correct material is loaded.
-
-I consider BMCU an ideal feeder for the Snapmaker U1 and I am genuinely proud of the results of this integration. You can connect multiple BMCU modules, assign all filaments in OrcaSlicer and not worry about which material is currently loaded.
-
-## Host changes made by the installer
-
-| Component | Role |
-| --- | --- |
-| `/home/lava/printer_data/config/bmcu/` | managed BMCU configuration |
-| `printer.cfg` | managed `include` block |
-| Klipper `extras` | symlinks to `bmcu.py`, `bmcu_core`, `bmcu_panel.py` |
-| `/oem/bmcu-klipper/` | persistent U1 integration bootstrap |
-| `/etc/init.d/S60klipper` | hook executed before the actual Klipper startup |
 
 ## Load, unload and tool change
 
@@ -264,17 +235,7 @@ Panel:
 http://PRINTER_IP:8291/
 ```
 
-It supports, among other things:
-
-- BMCU devices,
-- channels and routing,
-- materials and colors,
-- calibration,
-- manual load/unload/retract,
-- lighting,
-- Orca profiles,
-- firmware update,
-- diagnostic export.
+Use the panel for devices, routing, materials, calibration, load/unload, firmware updates and diagnostics.
 
 Firmware:
 
@@ -311,16 +272,6 @@ In the panel:
 Diagnostics -> Export logs
 ```
 
-The export may contain:
-
-- BMCU log,
-- Klipper log,
-- Moonraker log,
-- BMCU configuration,
-- runtime status,
-- printer status,
-- last G-code.
-
 From the console:
 
 ```sh
@@ -328,17 +279,7 @@ From the console:
 ./collect-logs --include-last-gcode
 ```
 
-`RESTART` and `FIRMWARE_RESTART` restart Klipper internally. They do not restart the BMCU sidecar processes. A Klipper service restart or printer reboot runs the service hooks.
-
-If the U1 planner is missing or unresponsive, BMCU attempts to restart it automatically. If recovery fails, check `bmcu-planner.log` and, over SSH:
-
-```sh
-ps | grep '[b]mcu_'
-```
-
-BMCU remembers the native feeder AUTO setting before taking ownership of a shared path and restores it when the last BMCU route is detached. If needed, use **Enable native auto feed** in the panel or [`BMCU_SNAP_FEEDER ... TAKEOVER=0 AUTO=1`](../../docs/COMMANDS.md#bmcu_snap_feeder).
-
-Do not edit `u1_ownership` by hand to clear a route mismatch. Use the panel's route confirmation/recovery controls instead.
+Use the panel's route confirmation/recovery controls if a route state needs to be corrected.
 
 ## After a U1 firmware update
 
@@ -358,20 +299,9 @@ Connect to U1 over SSH, enter the extracted BMCU-Klipper directory and run:
 sh ./uninstall
 ```
 
-The uninstaller removes managed BMCU components from `printer.cfg`, Klipper modules, runtime, serial-port access and the U1 hook.
+BMCU-Klipper is removed, the native feeder configuration is restored and Klipper is restarted automatically.
 
-Normal uninstall requires Klipper READY, an idle printer and empty BMCU routes. The native feeder state is restored before the managed U1 components are removed.
-
-If Klipper cannot reach READY, see the [host recovery mode](../../README.md#uninstallation). Host recovery leaves Klipper stopped and cannot restore native AUTO while Klipper is unavailable.
-
-For the 24 V configuration, helper backups are stored in:
-
-```text
-/oem/user-24v/S60klipper.before-24v
-/oem/user-24v/printer.cfg.before-24v
-```
-
-When disabling 24 V, restore the sections belonging to the helper from the appropriate backup.
+If you enabled the optional U1 24 V output with `enable-24v.sh`, that configuration is separate from BMCU-Klipper and is not removed by the uninstaller.
 
 Full command list: [../../docs/COMMANDS.md](../../docs/COMMANDS.md).  
 Back to the main README: [../../README.md](../../README.md).

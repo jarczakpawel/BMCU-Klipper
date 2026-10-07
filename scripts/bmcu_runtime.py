@@ -30,7 +30,7 @@ class RuntimeErrorReply(RuntimeError):
     pass
 
 class RuntimeClient:
-    def __init__(self, port: str, baud: int = 115200, timeout: float = 2.0):
+    def __init__(self, port: str, baud: int = 115200, timeout: float = 30.0):
         self.port = str(port)
         if not self.port or '\x00' in self.port or len(self.port) > 4096:
             raise ValueError('invalid serial port')
@@ -67,7 +67,7 @@ class RuntimeClient:
         self.last_rx_seq = None
         import serial
         kwargs = dict(port=self.port, baudrate=self.baud, timeout=0,
-                      write_timeout=1.0, rtscts=False, dsrdtr=False)
+                      write_timeout=10.0, rtscts=False, dsrdtr=False)
         if os.name == 'posix':
             kwargs['exclusive'] = True
         try:
@@ -173,28 +173,31 @@ class RuntimeClient:
                     return packet_payload
         raise TimeoutError('runtime request timeout type=0x%02X id=%d' % (msg_type, cmd_id))
 
-    def handshake(self):
+    def handshake(self, require_compatible=True):
         nonce = struct.unpack('<I', os.urandom(4))[0]
         payload = self.request(
             protocol.MSG_HELLO, struct.pack('<I', nonce),
-            expected=(protocol.MSG_HELLO_ACK,), timeout=3.0)
+            expected=(protocol.MSG_HELLO_ACK,), timeout=30.0)
         self.hello = protocol.parse_hello(payload)
         if self.hello['channels'] != 4:
             raise RuntimeError('unsupported BMCU channel count %s' % self.hello['channels'])
-        if (self.hello['protocol'] != protocol.PROTO_VERSION or
+        if self.hello['protocol'] != protocol.PROTO_VERSION:
+            raise RuntimeError(
+                'unsupported BMCU protocol %s; expected %s' %
+                (self.hello['protocol'], protocol.PROTO_VERSION))
+        if (require_compatible and
                 not protocol.firmware_is_compatible(
                     self.hello.get('firmware_tuple', (0, 0, 0)))):
             raise RuntimeError(
-                'BMCU firmware is outside the supported %s..%s range; '
-                'flash bundled firmware %s' %
-                ('.'.join(str(part) for part in protocol.MIN_COMPATIBLE_FIRMWARE),
-                 protocol.REQUIRED_FIRMWARE_TEXT,
+                'BMCU firmware %s is not supported for operation; firmware %s '
+                'is required' %
+                (self.hello.get('firmware', 'unknown'),
                  protocol.REQUIRED_FIRMWARE_TEXT))
         self.request(protocol.MSG_SESSION_CONFIRM,
                      struct.pack('<I', int(self.hello['session_id']) & 0xFFFFFFFF),
-                     timeout=2.0)
+                     timeout=30.0)
         caps_payload = self.request(protocol.MSG_GET_CAPS,
-                                    expected=(protocol.MSG_CAPS,), timeout=2.0)
+                                    expected=(protocol.MSG_CAPS,), timeout=30.0)
         self.caps = protocol.parse_caps(caps_payload)
         if self.hello['uid'] != self.caps['uid']:
             raise RuntimeError('HELLO/CAPS UID mismatch')
@@ -209,10 +212,10 @@ class RuntimeClient:
     def prepare_update(self):
         if self.hello is None:
             self.handshake()
-        return self.request(protocol.MSG_UPDATE_PREPARE, timeout=3.0)
+        return self.request(protocol.MSG_UPDATE_PREPARE, timeout=30.0)
 
     def cancel_update(self):
-        return self.request(protocol.MSG_UPDATE_CANCEL, timeout=2.0)
+        return self.request(protocol.MSG_UPDATE_CANCEL, timeout=30.0)
 
     def export_nvm(self, chunk_size: int = 224, retries: int = 3):
         if chunk_size < 16 or chunk_size > 224:
@@ -230,7 +233,7 @@ class RuntimeClient:
                     raw = self.request(
                         protocol.MSG_NVM_READ,
                         struct.pack('<HH', offset, amount),
-                        expected=(protocol.MSG_NVM_DATA,), timeout=3.0)
+                        expected=(protocol.MSG_NVM_DATA,), timeout=30.0)
                     break
                 except TimeoutError:
                     if attempt >= retries:

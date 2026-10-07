@@ -377,7 +377,7 @@ def _transport_preexec(user, uid, gid):
             os.setuid(uid)
     return prepare
 
-def _wait_transport_started(process, socket_path, timeout=2.0):
+def _wait_transport_started(process, socket_path, timeout=10.0):
     deadline = time.monotonic() + max(0.2, float(timeout))
     while time.monotonic() < deadline:
         code = process.poll()
@@ -588,7 +588,7 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
         except Exception:
             try:
                 process.terminate()
-                process.wait(timeout=1.0)
+                process.wait(timeout=5.0)
             except Exception:
                 try:
                     process.kill()
@@ -652,7 +652,7 @@ def _planner_paths_ready(socket_path, result_dir, uid, gid):
         result_info.st_uid == uid and result_info.st_gid == gid and
         stat.S_IMODE(result_info.st_mode) == 0o700)
 
-def _wait_planner_started(process, socket_path, timeout=2.0):
+def _wait_planner_started(process, socket_path, timeout=10.0):
     deadline = time.monotonic() + max(0.2, float(timeout))
     while time.monotonic() < deadline:
         code = process.poll()
@@ -763,7 +763,7 @@ def ensure_planner_process(bmcu_dir, metadata, restart=False):
     except Exception:
         try:
             process.terminate()
-            process.wait(timeout=1.0)
+            process.wait(timeout=5.0)
         except Exception:
             try:
                 process.kill()
@@ -841,7 +841,7 @@ def _lower_panel_priority(pid):
         pass
     return False
 
-def _wait_panel_started(process, timeout=2.0):
+def _wait_panel_started(process, timeout=10.0):
 
     deadline = time.monotonic() + max(0.1, float(timeout))
     while time.monotonic() < deadline:
@@ -1148,7 +1148,7 @@ def auto_discover_generic_bmcu(bmcu_dir, metadata, quiet=False):
         result = subprocess.run(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, close_fds=True,
-            timeout=max(8.0, 3.0 * len(candidates)))
+            timeout=max(30.0, 6.0 * len(candidates)))
         if result.returncode == 1:
             return 0
         if result.returncode != 0 or not os.path.isfile(detected):
@@ -1170,7 +1170,7 @@ def auto_discover_generic_bmcu(bmcu_dir, metadata, quiet=False):
              '--cfg', bmcu_cfg, '--detected', detected,
              '--backup-dir', backup_dir],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, close_fds=True, timeout=10.0)
+            stderr=subprocess.STDOUT, text=True, close_fds=True, timeout=30.0)
         if applied.returncode != 0:
             if not quiet:
                 message = (applied.stdout or '').strip().splitlines()
@@ -1194,7 +1194,7 @@ def auto_discover_generic_bmcu(bmcu_dir, metadata, quiet=False):
         except OSError:
             pass
 
-def repair(metadata_path, quiet=False, repair_config=True):
+def repair(metadata_path, quiet=False, repair_config=True, processes=True):
     metadata = read_metadata(metadata_path)
     bmcu_dir, extras_dir, source_dir = validate_paths(metadata, metadata_path)
     lock = acquire_lock(bmcu_dir)
@@ -1255,19 +1255,10 @@ def repair(metadata_path, quiet=False, repair_config=True):
     finally:
         os.close(lock)
     discovery_changed = 0
-    lock = acquire_lock(bmcu_dir)
-    try:
-        transport_changed = ensure_transport_processes(bmcu_dir, metadata)
-        planner_changed = ensure_planner_process(bmcu_dir, metadata)
-    finally:
-        os.close(lock)
-    panel_changed = 0
-    try:
-        panel_changed = ensure_panel_process(bmcu_dir)
-    except Exception as exc:
-        if not quiet:
-            print('WARNING: BMCU external panel was not started: %s' % exc,
-                  file=sys.stderr)
+    transport_changed = planner_changed = panel_changed = 0
+    if processes:
+        transport_changed, planner_changed, panel_changed = _ensure_all_processes(
+            bmcu_dir, metadata, quiet)
     try:
         write_boot_stamp(bmcu_dir, changed, changed_include, metadata_path)
     except OSError as exc:
@@ -1281,6 +1272,31 @@ def repair(metadata_path, quiet=False, repair_config=True):
               (changed, changed_include, discovery_changed, transport_changed,
                planner_changed, panel_changed))
     return changed
+
+def _ensure_all_processes(bmcu_dir, metadata, quiet=False):
+    lock = acquire_lock(bmcu_dir)
+    try:
+        transport_changed = ensure_transport_processes(bmcu_dir, metadata)
+        planner_changed = ensure_planner_process(bmcu_dir, metadata)
+    finally:
+        os.close(lock)
+    panel_changed = 0
+    try:
+        panel_changed = ensure_panel_process(bmcu_dir)
+    except Exception as exc:
+        if not quiet:
+            print('WARNING: BMCU external panel was not started: %s' % exc,
+                  file=sys.stderr)
+    return transport_changed, planner_changed, panel_changed
+
+def ensure_processes(metadata_path, quiet=False):
+    metadata = read_metadata(metadata_path)
+    bmcu_dir, _extras_dir, _source_dir = validate_paths(metadata, metadata_path)
+    changed = _ensure_all_processes(bmcu_dir, metadata, quiet)
+    if not quiet:
+        print('BMCU helper processes ready (%d transport, %d planner, %d panel '
+              'start(s)).' % changed)
+    return sum(changed)
 
 def sync_planner(metadata_path, restart=False):
     metadata = read_metadata(metadata_path)
@@ -1343,18 +1359,24 @@ def main():
     action.add_argument('--sync-transports', action='store_true')
     action.add_argument('--sync-planner', action='store_true')
     action.add_argument('--restart-planner', action='store_true')
+    action.add_argument('--ensure-processes', action='store_true')
     parser.add_argument('--metadata', default=default_metadata())
     parser.add_argument('--quiet', action='store_true')
+    parser.add_argument('--no-processes', action='store_true',
+                        help='repair links and printer.cfg only')
     parser.add_argument('--links-only', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.remove:
         remove(args.metadata, args.quiet)
+    elif args.ensure_processes:
+        ensure_processes(args.metadata, args.quiet)
     elif args.sync_transports:
         sync_transports(args.metadata)
     elif args.sync_planner or args.restart_planner:
         sync_planner(args.metadata, restart=args.restart_planner)
     else:
-        repair(args.metadata, args.quiet, not args.links_only)
+        repair(args.metadata, args.quiet, not args.links_only,
+               processes=not args.no_processes)
     return 0
 
 if __name__ == '__main__':

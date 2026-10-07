@@ -61,12 +61,8 @@ Run it as `root`. After a U1 firmware update, run the helper again if you still 
 
 ## Important
 
-BMCU is an open DIY project and exists in many hardware implementations. Modules can be bought from many different AliExpress sellers, on the second-hand market, or assembled independently. They are produced by many people and companies, and quality is not the same everywhere.
+BMCU is open DIY hardware and exists in different board revisions. Verify the pinout, wiring and power source before connecting it. Incorrect wiring or a damaged module can damage the printer or BMCU.
 
-There are also modules that are damaged or were never properly tested before sale. A seller's statement that a BMCU was tested does not guarantee that it actually was.
-
-Be especially careful when taking power directly from the printer. In the worst case, a damaged module or incorrect wiring can damage the printer port or electronics.
-
-You need to know what you are connecting and where the power comes from. I am responsible for the firmware and the BMCU-Klipper integration, not for the quality or condition of a particular BMCU module. The entire hardware side is your responsibility - as with almost any 3D printer modification.
+Be especially careful when taking `24V` directly from the printer.
 
 Back to the [main README](../README.md).

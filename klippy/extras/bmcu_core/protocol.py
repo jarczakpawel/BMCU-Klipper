@@ -6,7 +6,7 @@ import struct
 from .release import REQUIRED_FIRMWARE, REQUIRED_FIRMWARE_TEXT
 
 PROTO_VERSION = 1
-MIN_COMPATIBLE_FIRMWARE = (1, 0, 0)
+MIN_COMPATIBLE_FIRMWARE = REQUIRED_FIRMWARE
 
 
 def firmware_is_compatible(value):
@@ -14,10 +14,7 @@ def firmware_is_compatible(value):
         firmware = tuple(int(part) for part in value)
     except (TypeError, ValueError):
         return False
-    return (
-        len(firmware) == 3 and
-        firmware[:2] == REQUIRED_FIRMWARE[:2] and
-        MIN_COMPATIBLE_FIRMWARE <= firmware <= REQUIRED_FIRMWARE)
+    return len(firmware) == 3 and firmware == REQUIRED_FIRMWARE
 
 MSG_HELLO = 0x01
 MSG_PING = 0x02
@@ -424,10 +421,25 @@ def parse_calibration(payload):
         raise ValueError('invalid calibration metadata')
     if valid and not (minimum < neutral < maximum):
         raise ValueError('invalid calibrated buffer ordering')
+
+    # Firmware stores the calibrated range after centering the neutral point at
+    # 1.65 V and applying sensor polarity. Reconstruct the physical ADC
+    # voltages that were captured during calibration for diagnostics.
+    def calibration_point_to_raw(value):
+        adjusted = value if polarity > 0 else 3.30 - value
+        return adjusted - offset
+
+    raw_minimum = calibration_point_to_raw(minimum)
+    raw_neutral = 1.65 - offset
+    raw_maximum = calibration_point_to_raw(maximum)
+    _require_finite(
+        (raw_minimum, raw_neutral, raw_maximum), 'raw calibration')
     return {
         'channel': ch, 'capture_mask': mask, 'valid': bool(valid),
         'polarity': polarity, 'current_raw': current, 'offset': offset,
         'minimum': minimum, 'neutral': neutral, 'maximum': maximum,
+        'raw_minimum': raw_minimum, 'raw_neutral': raw_neutral,
+        'raw_maximum': raw_maximum,
     }
 
 def parse_op_result(payload):
@@ -581,6 +593,12 @@ def pack_slots(slots):
             slot.get('temperature_min', 0), slot.get('temperature_max', 0),
             slot.get('material', '')))
     return bytes(payload)
+
+def map_status_operation_id(payload, mapper):
+    offset = _STATUS.size - struct.calcsize('<I4B6B')
+    op_id = struct.unpack_from('<I', payload, offset)[0]
+    return (payload[:offset] + struct.pack('<I', mapper(op_id)) +
+            payload[offset + 4:])
 
 def parse_snapshot(payload):
     status_size = _STATUS.size

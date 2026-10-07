@@ -1,6 +1,9 @@
 #include "Flash_saves.h"
 #include "ams.h"
 #include "hal/irq_wch.h"
+#include "hal/time_hw.h"
+#include "bmcu_config.h"
+#include <stddef.h>
 #include <string.h>
 
 #include "ch32v20x_rcc.h"
@@ -32,6 +35,27 @@ static uint32_t crc32_hw_words(const void* data, uint32_t bytes)
 
 static constexpr uint32_t FLASH_ERASED_WORD = 0xE339E339u;
 
+#ifndef BMCU_HOST_TEST
+class Flash_clock_guard
+{
+    const uint32_t was_slow;
+public:
+    Flash_clock_guard() : was_slow(time_hw_slow)
+    {
+        if (!was_slow) time_hw_flash_clock(1u);
+    }
+    ~Flash_clock_guard()
+    {
+        if (!was_slow && !(FLASH->STATR & FLASH_FLAG_BSY))
+            time_hw_flash_clock(0u);
+    }
+};
+#else
+class Flash_clock_guard
+{
+};
+#endif
+
 static inline bool flash_word_is_blank(uint32_t value)
 {
     return value == FLASH_ERASED_WORD || value == 0xFFFFFFFFu;
@@ -55,6 +79,7 @@ static void mark_bad_page(uint32_t page)
 
 static bool flash_range_is_erased(uint32_t base_addr, uint32_t bytes)
 {
+    Flash_clock_guard clock;
     const uint32_t* p = (const uint32_t*)base_addr;
     for (uint32_t i = 0u; i < (bytes >> 2); i++)
         if (!flash_word_is_blank(p[i])) return false;
@@ -64,6 +89,7 @@ static bool flash_range_is_erased(uint32_t base_addr, uint32_t bytes)
 static bool flash256_prog(uint32_t page_addr, const uint32_t words[64])
 {
     if (page_addr & (FLASH_NVM256_PAGE_SIZE - 1u)) return false;
+    Flash_clock_guard clock;
     if (memcmp((const void*)page_addr, words, FLASH_NVM256_PAGE_SIZE) == 0)
         return true;
 
@@ -82,6 +108,7 @@ static bool flash256_prog(uint32_t page_addr, const uint32_t words[64])
 static bool flash256_erase(uint32_t page_addr)
 {
     if (page_addr & (FLASH_NVM256_PAGE_SIZE - 1u)) return false;
+    Flash_clock_guard clock;
 
     const uint32_t irq = irq_save_wch();
     FLASH_Unlock_Fast();
@@ -97,6 +124,7 @@ static bool flash256_erase(uint32_t page_addr)
 static bool flash_word_prog_std(uint32_t addr, uint32_t data)
 {
     if (addr & 3u) return false;
+    Flash_clock_guard clock;
     const uint32_t current = *(const volatile uint32_t*)addr;
     if (current == data) return true;
 
@@ -159,6 +187,7 @@ static inline bool seq32_newer(uint32_t candidate, uint32_t current)
 
 static bool nvm_record_validate(uint32_t page_addr, uint32_t expected_magic, NVMRecordHeader* out)
 {
+    Flash_clock_guard clock;
     const uint8_t* bytes = (const uint8_t*)page_addr;
     const uint32_t commit = *(const volatile uint32_t*)(page_addr + NVM_RECORD_COMMIT_OFF);
     const uint32_t commit_inv = *(const volatile uint32_t*)(page_addr + NVM_RECORD_COMMIT_INV_OFF);
@@ -201,6 +230,7 @@ static bool nvm_record_program_page(uint32_t page, uint32_t magic, uint32_t sequ
                               uint32_t metadata, uint32_t flags,
                               const void* payload, uint16_t length)
 {
+    Flash_clock_guard clock;
     if (page >= FLASH_NVM_PAGE_COUNT) return false;
     if (length > (uint16_t)(NVM_RECORD_BODY_BYTES - sizeof(NVMRecordHeader))) return false;
 
@@ -240,6 +270,7 @@ static bool nvm_record_same(uint32_t first_page, const NVMRecordLatest& latest,
                              uint32_t metadata, uint32_t flags,
                              const void* payload, uint16_t length)
 {
+    Flash_clock_guard clock;
     if (!latest.found || latest.header.format != NVM_FORMAT_VERSION ||
         latest.header.metadata != metadata || latest.header.flags != flags ||
         latest.header.length != length)
@@ -282,6 +313,7 @@ static NVMRecordReadResult nvm_record_read_group(uint32_t first_page, uint32_t p
                                       uint32_t magic, void* out, uint16_t max_length,
                                       uint16_t* got_length, uint32_t* metadata)
 {
+    Flash_clock_guard clock;
     const NVMRecordLatest latest = nvm_record_find_latest(first_page, page_count, magic);
     if (!latest.found) return NVM_RECORD_NONE;
     if (metadata) *metadata = latest.header.metadata;
@@ -409,6 +441,16 @@ static bool sta_select_target(uint32_t* target_slot)
 void Flash_saves_init(void)
 {
     RCC_AHBPeriphClockCmd(RCC_AHBPeriph_CRC, ENABLE);
+#ifndef BMCU_HOST_TEST
+    {
+        Flash_clock_guard clock;
+        FLASH_Unlock();
+        FLASH_Unlock_Fast();
+        FLASH_Access_Clock_Cfg(FLASH_Access_SYSTEM_HALF);
+        FLASH_Lock_Fast();
+        FLASH_Lock();
+    }
+#endif
     g_nvm_fault = 0u;
     g_bad_page_mask = 0u;
     flash_runtime_cache_clear();
@@ -428,6 +470,7 @@ bool Flash_NVM_read_raw(uint16_t offset, void* out, uint16_t bytes)
 {
     if ((!out && bytes) || (uint32_t)offset + (uint32_t)bytes > FLASH_NVM_TOTAL_SIZE)
         return false;
+    Flash_clock_guard clock;
     if (bytes) memcpy(out, (const void*)(FLASH_NVM_BASE_ADDR + (uint32_t)offset), bytes);
     return true;
 }
@@ -456,6 +499,7 @@ bool Flash_NVM_full_clear(void)
 bool Flash_AMS_state_read(uint8_t route_state[4])
 {
     if (!route_state) return false;
+    Flash_clock_guard clock;
 
     uint8_t best_raw = 0u;
     uint8_t best_states[4] = {
@@ -508,6 +552,7 @@ bool Flash_AMS_state_read(uint8_t route_state[4])
 
 bool Flash_AMS_state_write(const uint8_t route_state[4])
 {
+    Flash_clock_guard clock;
     const uint8_t raw = state_encode(route_state);
     if (raw == 0xFFu) return false;
     if (g_sta_have_saved && g_sta_saved_active && g_sta_saved_raw == raw)
@@ -541,12 +586,24 @@ bool Flash_AMS_state_write(const uint8_t route_state[4])
     return false;
 }
 
+struct alignas(4) FlashHardwarePayload
+{
+    int32_t directions[4];
+    uint32_t check;
+    uint8_t detector_none_cv[4];
+};
+
 struct alignas(4) FlashCalPayload
 {
     float offsets[4];
     float minimums[4];
     float maximums[4];
+    FlashHardwarePayload hardware;
 };
+
+static_assert(sizeof(FlashHardwarePayload) == 24u, "hardware NVM layout changed");
+static_assert(offsetof(FlashCalPayload, hardware) == 48u, "legacy calibration layout changed");
+static_assert(sizeof(FlashCalPayload) <= NVM_RECORD_BODY_BYTES - sizeof(NVMRecordHeader), "calibration exceeds NVM record");
 
 bool Flash_MC_PULL_cal_write_all(const float offs[4], const float vmin[4],
                                  const float vmax[4], const int8_t pol[4],
@@ -557,6 +614,12 @@ bool Flash_MC_PULL_cal_write_all(const float offs[4], const float vmin[4],
     memcpy(payload.offsets, offs, sizeof(payload.offsets));
     memcpy(payload.minimums, vmin, sizeof(payload.minimums));
     memcpy(payload.maximums, vmax, sizeof(payload.maximums));
+    for (uint8_t ch = 0u; ch < 4u; ch++)
+    {
+        payload.hardware.directions[ch] = g_bmcu_nvm.Motion_control_dir[ch];
+        payload.hardware.detector_none_cv[ch] = g_bmcu_nvm.dm_key_none_cv[ch];
+    }
+    payload.hardware.check = g_bmcu_nvm.check;
 
     uint32_t metadata = ((uint32_t)(valid_mask & 0x0Fu) << 8);
     for (uint8_t channel = 0u; channel < 4u; channel++)
@@ -580,7 +643,7 @@ bool Flash_MC_PULL_cal_read(float offs[4], float vmin[4], float vmax[4],
     if (result == NVM_RECORD_TOMBSTONE) return false;
 
     if (result != NVM_RECORD_DATA) return false;
-    if (got != sizeof(payload)) return false;
+    if (got != sizeof(payload) && got != offsetof(FlashCalPayload, hardware)) return false;
 
     memcpy(offs, payload.offsets, sizeof(payload.offsets));
     memcpy(vmin, payload.minimums, sizeof(payload.minimums));
@@ -590,7 +653,7 @@ bool Flash_MC_PULL_cal_read(float offs[4], float vmin[4], float vmax[4],
             pol[channel] = (metadata & (1u << channel)) ? -1 : 1;
 
     uint8_t mask = (uint8_t)((metadata >> 8) & 0x0Fu);
-    if (mask == 0u)
+    if (mask == 0u && got == offsetof(FlashCalPayload, hardware))
     {
         bool sane = true;
         for (uint8_t channel = 0u; channel < 4u; channel++)
@@ -604,6 +667,18 @@ bool Flash_MC_PULL_cal_read(float offs[4], float vmin[4], float vmax[4],
 
 bool Flash_MC_PULL_cal_clear(void)
 {
+    FlashCalPayload payload{};
+    uint16_t got = 0u;
+    if (nvm_record_read_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            &payload, sizeof(payload), &got, nullptr) == NVM_RECORD_DATA &&
+        got == sizeof(payload))
+    {
+        memset(&payload, 0, offsetof(FlashCalPayload, hardware));
+        return nvm_record_write_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            0u, 0u, &payload, sizeof(payload), 2u, 0u);
+    }
     return nvm_record_write_group(FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT,
                             MAGIC_CAL, 0u, NVM_RECORD_FLAG_TOMBSTONE,
                             nullptr, 0u, 2u, 0u);
@@ -612,6 +687,20 @@ bool Flash_MC_PULL_cal_clear(void)
 bool Flash_Motion_write(const void* in, uint16_t bytes)
 {
     if (!in || bytes == 0u) return false;
+    FlashCalPayload payload{};
+    uint16_t got = 0u;
+    uint32_t metadata = 0u;
+    if (nvm_record_read_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            &payload, sizeof(payload), &got, &metadata) == NVM_RECORD_DATA &&
+        got == sizeof(payload))
+    {
+        if (bytes < sizeof(payload.hardware)) return false;
+        memcpy(&payload.hardware, in, sizeof(payload.hardware));
+        return nvm_record_write_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            metadata, 0u, &payload, sizeof(payload), 2u, 0u);
+    }
     return nvm_record_write_group(FLASH_NVM_MOTION_PAGE_FIRST, FLASH_NVM_MOTION_PAGE_COUNT,
                             MAGIC_MOT, 0u, 0u, in, bytes, 0u, 0u);
 }
@@ -620,6 +709,16 @@ bool Flash_Motion_read(void* out, uint16_t bytes)
 {
     if (!out || bytes == 0u) return false;
     uint16_t got = 0u;
+    FlashCalPayload payload{};
+    if (nvm_record_read_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            &payload, sizeof(payload), &got, nullptr) == NVM_RECORD_DATA &&
+        got == sizeof(payload))
+    {
+        if (bytes < sizeof(payload.hardware)) return false;
+        memcpy(out, &payload.hardware, sizeof(payload.hardware));
+        return true;
+    }
     const NVMRecordReadResult result = nvm_record_read_group(
         FLASH_NVM_MOTION_PAGE_FIRST, FLASH_NVM_MOTION_PAGE_COUNT, MAGIC_MOT,
         out, bytes, &got, nullptr);
@@ -629,6 +728,19 @@ bool Flash_Motion_read(void* out, uint16_t bytes)
 
 bool Flash_Motion_clear(void)
 {
+    FlashCalPayload payload{};
+    uint16_t got = 0u;
+    uint32_t metadata = 0u;
+    if (nvm_record_read_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            &payload, sizeof(payload), &got, &metadata) == NVM_RECORD_DATA &&
+        got == sizeof(payload))
+    {
+        memset(&payload.hardware, 0, sizeof(payload.hardware));
+        return nvm_record_write_group(
+            FLASH_NVM_CAL_PAGE_FIRST, FLASH_NVM_CAL_PAGE_COUNT, MAGIC_CAL,
+            metadata, 0u, &payload, sizeof(payload), 2u, 0u);
+    }
     return nvm_record_write_group(FLASH_NVM_MOTION_PAGE_FIRST, FLASH_NVM_MOTION_PAGE_COUNT,
                             MAGIC_MOT, 0u, NVM_RECORD_FLAG_TOMBSTONE,
                             nullptr, 0u, 0u, 0u);

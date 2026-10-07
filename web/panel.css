@@ -130,6 +130,7 @@ input[type=color]{padding:4px;height:42px;}
 .icon-button{border:0;background:transparent;color:var(--muted);font-size:28px;}
 .compact-dialog{max-width:560px;}
 .dialog-copy{color:var(--muted);line-height:1.55;}
+.dialog-toast-region{display:grid;gap:8px;margin:0 0 12px;}
 .toast-region{position:fixed;z-index:100;right:18px;bottom:18px;display:grid;gap:8px;max-width:min(420px,calc(100vw - 36px));}
 .toast{padding:12px 14px;border:1px solid var(--line);border-radius:11px;background:var(--surface2);box-shadow:var(--shadow);}
 .toast.success{border-color:rgba(82,209,137,.5);}

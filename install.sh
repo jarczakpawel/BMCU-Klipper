@@ -2,6 +2,11 @@
 set -eu
 
 URL=https://github.com/jarczakpawel/BMCU-Klipper/releases/latest/download/BMCU-Klipper.zip
+ACTION=install
+if [ "${1:-}" = "--uninstall" ]; then
+    ACTION=uninstall
+    shift
+fi
 TMP=${TMPDIR:-/tmp}/bmcu-klipper-install.$$
 ZIP=$TMP/BMCU-Klipper.zip
 
@@ -59,11 +64,11 @@ with zipfile.ZipFile(str(archive)) as z:
                 output.write(block)
 PY
 
-COUNT=$(find "$TMP/release" -maxdepth 2 -type f -name install -print | wc -l | tr -d ' ')
+COUNT=$(find "$TMP/release" -maxdepth 2 -type f -name "$ACTION" -print | wc -l | tr -d ' ')
 if [ "$COUNT" -ne 1 ]; then
-    echo "ERROR: release must contain exactly one installer." >&2
+    echo "ERROR: release must contain exactly one $ACTION script." >&2
     exit 1
 fi
-INSTALL=$(find "$TMP/release" -maxdepth 2 -type f -name install -print)
+SCRIPT=$(find "$TMP/release" -maxdepth 2 -type f -name "$ACTION" -print)
 
-sh "$INSTALL" "$@"
+sh "$SCRIPT" "$@"

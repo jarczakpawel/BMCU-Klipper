@@ -37,7 +37,12 @@ DEFAULT_VID = 0x1A86
 DEFAULT_PID = 0x7523
 MAX_ISP_FRAME = 4096
 MAX_ISP_RX = 8192
-ERASE_TIMEOUT = 60.0
+ERASE_TIMEOUT = 180.0
+ISP_WRITE_TIMEOUT = 30.0
+ISP_IDENTIFY_TIMEOUT = 5.0
+ISP_COMMAND_TIMEOUT = 10.0
+ISP_PROGRAM_TIMEOUT = 30.0
+USB_REENTRY_TIMEOUT = 60.0
 
 def _integer(value, name, minimum, maximum):
     if isinstance(value, bool):
@@ -145,7 +150,7 @@ class WchIsp:
         self.ser = None
         self.rx = bytearray()
 
-    def _write_all(self, packet, timeout=5.0):
+    def _write_all(self, packet, timeout=ISP_WRITE_TIMEOUT):
         deadline = time.monotonic() + float(timeout)
         offset = 0
         while offset < len(packet):
@@ -161,7 +166,7 @@ class WchIsp:
         import serial
         parity_map = {'N': serial.PARITY_NONE, 'E': serial.PARITY_EVEN, 'O': serial.PARITY_ODD}
         factory = self.serial_factory or serial.Serial
-        kwargs = dict(port=self.port, baudrate=self.baud, timeout=0, write_timeout=1.0,
+        kwargs = dict(port=self.port, baudrate=self.baud, timeout=0, write_timeout=10.0,
                       rtscts=False, dsrdtr=False, bytesize=serial.EIGHTBITS,
                       parity=parity_map[self.parity], stopbits=serial.STOPBITS_ONE)
         if os.name == 'posix':
@@ -268,7 +273,7 @@ def autodi_try(isp, identify_packet):
                     pulse_reset(isp, boot_is_dtr, reset_assert)
                     time.sleep(0.06)
                     isp.flush()
-                    code, data = isp.txrx(identify_packet, CMD_IDENTIFY, 0.6)
+                    code, data = isp.txrx(identify_packet, CMD_IDENTIFY, ISP_IDENTIFY_TIMEOUT)
                     if code == 0 and len(data) >= 2:
                         return boot_is_dtr, boot_assert, reset_assert
                 except Exception:
@@ -298,7 +303,7 @@ def _wait_manual_isp(isp, identify_packet, timeout, log_callback,
     while time.monotonic() < deadline:
         try:
             isp.flush()
-            code, data = isp.txrx(identify_packet, CMD_IDENTIFY, 0.8)
+            code, data = isp.txrx(identify_packet, CMD_IDENTIFY, ISP_IDENTIFY_TIMEOUT)
             if code == 0 and len(data) >= 2:
                 _log(log_callback, 'INFO', 'TTL bootloader detected')
                 return data
@@ -326,7 +331,7 @@ def _program_chunks(image):
     return chunks
 
 def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
-                manual_timeout=120.0, trace=False, log_callback=None,
+                manual_timeout=600.0, trace=False, log_callback=None,
                 progress_callback=None, before_erase=None, expected_isp_uid=''):
 
     image = bytes(image)
@@ -354,7 +359,7 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
             autodi = autodi_try(isp, identify_packet)
             if autodi is None:
                 raise RuntimeError('USB AutoDI failed - check the USB/DFU connection')
-            code, data = isp.txrx(identify_packet, CMD_IDENTIFY, 1.0)
+            code, data = isp.txrx(identify_packet, CMD_IDENTIFY, ISP_IDENTIFY_TIMEOUT)
         else:
             data = _wait_manual_isp(
                 isp, identify_packet, manual_timeout, log_callback,
@@ -366,7 +371,7 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
         if (chip_id, chip_type) != (BMCU_DEVICE_ID, BMCU_DEVICE_TYPE):
             raise RuntimeError('unexpected chip 0x%02X/0x%02X' % (chip_id, chip_type))
 
-        code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, 1.2)
+        code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, ISP_COMMAND_TIMEOUT)
         if code != 0 or len(cfg) < 14:
             raise RuntimeError('read_cfg failed')
         cfg12 = bytearray(cfg[2:14])
@@ -383,20 +388,20 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
         cfg_a[4:8] = b'\x00\xFF\x00\xFF'
         cfg_a[8:12] = b'\xFF\xFF\xFF\xFF'
         code, _ = isp.txrx(build_write_cfg(CFG_MASK_RDPR_USER_DATA_WPR, bytes(cfg_a)),
-                           CMD_WRITE_CFG, 2.0)
+                           CMD_WRITE_CFG, ISP_COMMAND_TIMEOUT)
         if code != 0:
             raise RuntimeError('write_cfg step1 failed')
-        code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, 1.2)
+        code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, ISP_COMMAND_TIMEOUT)
         if code != 0 or len(cfg) < 14:
             raise RuntimeError('read_cfg after step1 failed')
         try:
-            isp.txrx(build_isp_end(1), CMD_ISP_END, 1.2)
+            isp.txrx(build_isp_end(1), CMD_ISP_END, ISP_COMMAND_TIMEOUT)
         except Exception:
             pass
 
         if mode == 'usb':
             _progress(progress_callback, 6, 'usb', 'Re-entering bootloader automatically')
-            deadline = time.monotonic() + 3.0
+            deadline = time.monotonic() + USB_REENTRY_TIMEOUT
             last_error = None
             while True:
                 try:
@@ -406,7 +411,7 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
                     pulse_reset(isp, autodi[0], autodi[2])
                     time.sleep(0.08)
                     isp.flush()
-                    code, data = isp.txrx(identify_packet, CMD_IDENTIFY, 0.8)
+                    code, data = isp.txrx(identify_packet, CMD_IDENTIFY, ISP_IDENTIFY_TIMEOUT)
                     if code == 0 and len(data) >= 2:
                         break
                     last_error = RuntimeError('bad identify response')
@@ -422,10 +427,10 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
                 progress_callback=progress_callback, percent=6, reentry=True)
 
         for _ in range(2):
-            code, data = isp.txrx(identify_packet, CMD_IDENTIFY, 1.0)
+            code, data = isp.txrx(identify_packet, CMD_IDENTIFY, ISP_IDENTIFY_TIMEOUT)
             if code != 0 or len(data) < 2:
                 raise RuntimeError('identify after re-entry failed')
-            code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, 1.2)
+            code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, ISP_COMMAND_TIMEOUT)
             if code != 0 or len(cfg) < 14:
                 raise RuntimeError('read_cfg after re-entry failed')
         cfg12 = bytearray(cfg[2:14])
@@ -438,17 +443,17 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
         cfg_b[4:8] = b'\x00\x00\x00\x00'
         cfg_b[8:12] = b'\xFF\xFF\xFF\xFF'
         code, _ = isp.txrx(build_write_cfg(CFG_MASK_RDPR_USER_DATA_WPR, bytes(cfg_b)),
-                           CMD_WRITE_CFG, 2.0)
+                           CMD_WRITE_CFG, ISP_COMMAND_TIMEOUT)
         if code != 0:
             raise RuntimeError('write_cfg step2 failed')
-        code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, 1.2)
+        code, cfg = isp.txrx(build_read_cfg(), CMD_READ_CFG, ISP_COMMAND_TIMEOUT)
         if code != 0 or len(cfg) < 14:
             raise RuntimeError('read_cfg after step2 failed')
         cfg12 = bytearray(cfg[2:14])
         wpr = bytes(cfg12[8:12])
 
         seed = b'\x00' * 0x1E
-        code, key_response = isp.txrx(build_isp_key(seed), CMD_ISP_KEY, 1.2)
+        code, key_response = isp.txrx(build_isp_key(seed), CMD_ISP_KEY, ISP_COMMAND_TIMEOUT)
         if code != 0 or not key_response:
             raise RuntimeError('isp_key failed')
         boot_sum = key_response[0]
@@ -467,11 +472,11 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
             cfg12[0:2] = b'\xA5\x5A'
             cfg12[8:12] = b'\xFF\xFF\xFF\xFF'
             code, _ = isp.txrx(build_write_cfg(CFG_MASK_RDPR_USER_DATA_WPR, bytes(cfg12)),
-                               CMD_WRITE_CFG, 2.0)
+                               CMD_WRITE_CFG, ISP_COMMAND_TIMEOUT)
             if code != 0:
                 raise RuntimeError('write_cfg unprotect failed')
             time.sleep(0.08)
-            code, cfg_check = isp.txrx(build_read_cfg(), CMD_READ_CFG, 1.2)
+            code, cfg_check = isp.txrx(build_read_cfg(), CMD_READ_CFG, ISP_COMMAND_TIMEOUT)
             if code != 0 or len(cfg_check) < 14 or bytes(cfg_check[10:14]) != b'\xFF' * 4:
                 raise RuntimeError('write protection remains active')
 
@@ -485,11 +490,11 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
 
         for address, length in ((FLASH_SIZE - CHUNK, CHUNK), (FLASH_SIZE - 16, 16)):
             encrypted = xor_crypt(b'\xFF' * length, xor_key)
-            code, _ = isp.txrx(build_verify(address, encrypted), CMD_VERIFY, 2.0)
+            code, _ = isp.txrx(build_verify(address, encrypted), CMD_VERIFY, ISP_COMMAND_TIMEOUT)
             if code != 0:
                 raise RuntimeError('erase verification failed at 0x%04X' % address)
 
-        code, _ = isp.txrx(build_set_baud(int(fast_baud)), CMD_SET_BAUD, 1.2)
+        code, _ = isp.txrx(build_set_baud(int(fast_baud)), CMD_SET_BAUD, ISP_COMMAND_TIMEOUT)
         if code != 0:
             raise RuntimeError('set_baud failed')
         time.sleep(0.03)
@@ -502,31 +507,31 @@ def flash_image(port, image, mode='usb', baud=115200, fast_baud=1_000_000,
                   'Programming %d-byte firmware image' % len(image))
         for index, (address, plain) in enumerate(chunks, 1):
             code, _ = isp.txrx(build_program(address, xor_crypt(plain, xor_key)),
-                               CMD_PROGRAM, 5.0)
+                               CMD_PROGRAM, ISP_PROGRAM_TIMEOUT)
             if code != 0:
                 raise RuntimeError('program failed at 0x%04X' % address)
             _progress(progress_callback, 10 + index * 42 // total, 'program',
                       'Programming %d/%d' % (index, total))
         flush_address = chunks[-1][0] + len(chunks[-1][1])
-        code, _ = isp.txrx(build_program(flush_address, b''), CMD_PROGRAM, 5.0)
+        code, _ = isp.txrx(build_program(flush_address, b''), CMD_PROGRAM, ISP_PROGRAM_TIMEOUT)
         if code != 0:
             raise RuntimeError('program flush failed')
 
-        code, key_response2 = isp.txrx(build_isp_key(seed), CMD_ISP_KEY, 1.2)
+        code, key_response2 = isp.txrx(build_isp_key(seed), CMD_ISP_KEY, ISP_COMMAND_TIMEOUT)
         if code != 0 or not key_response2 or key_response2[0] != boot_sum:
             raise RuntimeError('isp_key before verify failed')
 
         _progress(progress_callback, 53, 'verify', 'Verifying programmed firmware')
         for index, (address, plain) in enumerate(chunks, 1):
             code, _ = isp.txrx(build_verify(address, xor_crypt(plain, xor_key)),
-                               CMD_VERIFY, 2.0)
+                               CMD_VERIFY, ISP_COMMAND_TIMEOUT)
             if code != 0:
                 raise RuntimeError('verify failed at 0x%04X' % address)
             _progress(progress_callback, 53 + index * 45 // total, 'verify',
                       'Verifying %d/%d' % (index, total))
 
         try:
-            isp.txrx(build_isp_end(0), CMD_ISP_END, 1.2)
+            isp.txrx(build_isp_end(0), CMD_ISP_END, ISP_COMMAND_TIMEOUT)
         except Exception:
             pass
         if autodi is not None:

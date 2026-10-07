@@ -207,8 +207,8 @@ int main(void)
 {
     SystemInit();
     SystemCoreClockUpdate();
-    Motion_control_boot_safe_init();
     time_hw_init();
+    Motion_control_boot_safe_init();
 
     __enable_irq();
 

@@ -151,7 +151,7 @@ The printer's normal `RESUME` is additionally used as a fail-closed gate for a p
 | `BMCU_STATUS` | - | Returns BMCU-Klipper state. |
 | `BMCU_REFRESH` | optional `DEVICE` | Forces a device-status refresh. |
 | `BMCU_STOP` | - | Sends stop to all ready BMCU modules. |
-| `BMCU_CLEAR_ERROR` | `DEVICE` | Clears controller error state, refreshes the snapshot and clears host `last_error`. |
+| `BMCU_CLEAR_ERROR` | optional `DEVICE`, `HOST_ONLY=1` | With `DEVICE`, clears controller error state, refreshes the snapshot and clears host `last_error`. `HOST_ONLY=1` dismisses only the host error banner. |
 | `BMCU_SAVE_STATE` | - | Forces saving the current persistent state. Normally this is done automatically. |
 | `BMCU_ANALYZE_PRINTER` | - | Analyzes Klipper objects and shows the detected topology/preset. Useful when creating a new integration. |
 
@@ -273,8 +273,8 @@ Main parameters:
 | Parameter | Meaning |
 | --- | --- |
 | `MATERIAL` | Material type. |
-| `COLOR` | Main color as `RRGGBB` or `#RRGGBB`. |
-| `COLORS` | Color list for multicolor material. |
+| `COLOR` | Main color as `RRGGBB` or `#RRGGBB`. Changing it without `COLORS` replaces the previous color list with that single color. |
+| `COLORS` | Explicit color list for multicolor material. |
 | `NAME` | Channel/spool name. |
 | `VENDOR` | Filament manufacturer. |
 | `SUBTYPE` | Additional type/subtype. |
@@ -994,9 +994,7 @@ Prepares runtime for safe uninstallation. It is used by the `uninstall` script.
 BMCU_PREPARE_UNINSTALL
 ```
 
-The command requires an idle printer and empty BMCU routes. On U1 it restores the native feeder state before removal.
-
-The `uninstall` script calls it automatically. If preparation is cancelled before Klipper stops:
+The `uninstall` script calls this command automatically when the running BMCU runtime supports it. If preparation is cancelled before Klipper stops:
 
 ```gcode
 BMCU_PREPARE_UNINSTALL ACTION=CANCEL

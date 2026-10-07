@@ -226,6 +226,33 @@ static bool any_motion_active(void)
     return false;
 }
 
+static bool channel_motion_active(uint8_t ch)
+{
+    if (ch >= 4u) return true;
+    return (uint8_t)ams[0].filament[ch].motion !=
+               (uint8_t)_filament_motion::idle ||
+           Motion_control_channel_retract_active(ch);
+}
+
+static bool load_motion_active_on_other_channel(uint8_t ch)
+{
+    for (uint8_t i = 0u; i < 4u; i++)
+    {
+        if (i == ch) continue;
+        const _filament_motion motion = ams[0].filament[i].motion;
+        if (motion == _filament_motion::send_out ||
+            motion == _filament_motion::before_on_use)
+            return true;
+    }
+    return false;
+}
+
+static bool operation_blocks_channel(uint8_t ch)
+{
+    if (MC_PULL_calibration_auto_active()) return true;
+    return g_op.active && g_op.ch == ch;
+}
+
 static bool any_operation_active(void)
 {
     return g_op.active || MC_PULL_calibration_auto_active();
@@ -318,17 +345,8 @@ static void send_error(uint32_t cmd_id, uint8_t ch, uint16_t err)
 
 static void set_active_ch(uint8_t ch)
 {
-    if (ch >= 4) return;
-    if (ams[0].now_filament_num != ch)
-    {
-        if (ams[0].now_filament_num < 4)
-        {
-            const uint8_t previous = ams[0].now_filament_num;
-            ams[0].filament[previous].motion = _filament_motion::idle;
-            Motion_control_set_PWM(previous, 0);
-        }
-        ams[0].now_filament_num = ch;
-    }
+    if (ch >= 4u) return;
+    ams[0].now_filament_num = ch;
 }
 
 static bool wire_to_motion(uint8_t wire, _filament_motion* motion)
@@ -369,7 +387,7 @@ static bool set_motion(uint8_t ch, _filament_motion motion, bool persist_route_c
     if (motion == _filament_motion::idle)
     {
         ams[0].filament[ch].motion = _filament_motion::idle;
-        Motion_control_set_PWM(ch, 0);
+        Motion_control_stop_channel_motion(ch);
         if (ams[0].now_filament_num == ch)
         {
             ams[0].now_filament_num = 0xFF;
@@ -406,11 +424,13 @@ static bool set_motion(uint8_t ch, _filament_motion motion, bool persist_route_c
         if (!ams_state_set_loaded(ch))
         {
             ams[0].filament[ch].motion = _filament_motion::idle;
-            Motion_control_set_PWM(ch, 0);
+            Motion_control_stop_channel_motion(ch);
             if (ams[0].now_filament_num == ch) ams[0].now_filament_num = 0xFFu;
             ams[0].filament_use_flag = 0u;
             return false;
         }
+        // ON_USE is per-channel. Other loaded channels may stay ON_USE
+        // concurrently when they feed different toolheads.
         return true;
     case _filament_motion::before_pull_back:
         ams[0].filament_use_flag = 0x04;
@@ -431,7 +451,7 @@ static void stop_all_motion(void)
     for (uint8_t i = 0; i < 4; i++)
     {
         ams[0].filament[i].motion = _filament_motion::idle;
-        Motion_control_set_PWM(i, 0);
+        Motion_control_stop_channel_motion(i);
     }
     ams[0].now_filament_num = 0xFF;
     ams[0].filament_use_flag = 0;
@@ -754,8 +774,10 @@ static bool start_distance_op(uint32_t op_id, uint8_t type, uint8_t ch,
                               uint8_t contact_pct, bool stop_on_contact,
                               bool occupies_route)
 {
-    if (any_operation_active() || any_motion_active()) return false;
-    if (ch >= 4u || !isfinite(mm) || mm < 5.0f || mm > 5000.0f) return false;
+    if (any_operation_active()) return false;
+    if (ch >= 4u || channel_motion_active(ch) ||
+        load_motion_active_on_other_channel(ch) ||
+        !isfinite(mm) || mm < 5.0f || mm > 5000.0f) return false;
     if (timeout_ms < 250u || timeout_ms > 300000u) return false;
     if (contact_pct < 55u || contact_pct > 98u) return false;
     if (!MC_PULL_calibration_is_valid(ch)) return false;
@@ -790,8 +812,9 @@ static bool start_distance_op(uint32_t op_id, uint8_t type, uint8_t ch,
 
 static bool start_channel_retract_op(uint32_t op_id, uint8_t ch)
 {
-    if (any_operation_active() || any_motion_active()) return false;
-    if (ch >= 4u || ams_state_get_route_state(ch) != AMS_ROUTE_EMPTY)
+    if (any_operation_active()) return false;
+    if (ch >= 4u || channel_motion_active(ch) ||
+        ams_state_get_route_state(ch) != AMS_ROUTE_EMPTY)
         return false;
     if (!MC_PULL_calibration_is_valid(ch) ||
         !Motion_control_filament_present(ch) ||
@@ -1188,8 +1211,11 @@ static void handle_packet(const uint8_t *data, uint16_t len)
     case MSG_SET_MOTION:
         {
             _filament_motion requested = _filament_motion::idle;
-            if (payload[0] >= 4u || any_operation_active() ||
-                    !wire_to_motion(payload[1], &requested))
+            if (payload[0] >= 4u || operation_blocks_channel(payload[0]) ||
+                    !wire_to_motion(payload[1], &requested) ||
+                    ((requested == _filament_motion::send_out ||
+                      requested == _filament_motion::before_on_use) &&
+                     load_motion_active_on_other_channel(payload[0])))
             {
                 send_error(header.cmd_id, 0xFF, 3);
                 break;
@@ -1205,7 +1231,7 @@ static void handle_packet(const uint8_t *data, uint16_t len)
         }
         break;
     case MSG_MARK_UNLOADED:
-        if (payload[0] >= 4u || any_operation_active())
+        if (payload[0] >= 4u || operation_blocks_channel(payload[0]))
         {
             send_error(header.cmd_id, 0xFF, 5);
             break;
@@ -1214,7 +1240,7 @@ static void handle_packet(const uint8_t *data, uint16_t len)
             const uint8_t ch = payload[0];
 
             ams[0].filament[ch].motion = _filament_motion::idle;
-            Motion_control_set_PWM(ch, 0);
+            Motion_control_stop_channel_motion(ch);
             if (!ams_state_set_unloaded(ch) || !ams_state_save_run())
             {
                 send_error(header.cmd_id, ch, 71);
@@ -1232,7 +1258,7 @@ static void handle_packet(const uint8_t *data, uint16_t len)
         }
         break;
     case MSG_MARK_LOADED:
-        if (payload[0] >= 4u || any_operation_active())
+        if (payload[0] >= 4u || operation_blocks_channel(payload[0]))
         {
             send_error(header.cmd_id, 0xFF, 5);
             break;
@@ -1241,7 +1267,7 @@ static void handle_packet(const uint8_t *data, uint16_t len)
             const uint8_t ch = payload[0];
 
             ams[0].filament[ch].motion = _filament_motion::idle;
-            Motion_control_set_PWM(ch, 0);
+            Motion_control_stop_channel_motion(ch);
             if (!ams_state_set_loaded(ch) || !ams_state_save_run())
             {
                 send_error(header.cmd_id, ch, 71);
@@ -1654,6 +1680,11 @@ static void handle_packet(const uint8_t *data, uint16_t len)
 
 static void process_rx(void)
 {
+    if (bmcu_uart_take_rx_loss())
+    {
+        rx_cobs_len = 0u;
+        rx_discarding = 1u;
+    }
     uint8_t byte = 0u;
     uint16_t bytes = 0u;
     uint8_t frames = 0u;

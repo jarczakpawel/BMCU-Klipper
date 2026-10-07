@@ -2562,6 +2562,12 @@ class SnapmakerU1Endpoint(Endpoint):
             color_mode = int(metadata.get('color_mode', 0) or 0) & 0xFF
         except (TypeError, ValueError):
             color_mode = 0
+        try:
+            spool_id = int(metadata.get('spool_id') or 0)
+        except (TypeError, ValueError, OverflowError):
+            spool_id = 0
+        if not 0 < spool_id <= 0x7FFFFFFF:
+            spool_id = 0
 
         soft = material.upper().startswith('TPU') or material.upper() in ('TPE', 'FLEX')
         parameters = self.printer.lookup_object('filament_parameters', None)
@@ -2579,7 +2585,7 @@ class SnapmakerU1Endpoint(Endpoint):
             False, 0, True, True,
         )
         if 'filament_spool_id' in config:
-            desired += (0,)
+            desired += (spool_id,)
         current = self._projection_tuple(config, head)
         if current == desired:
             self._last_runtime_metadata = desired
@@ -2587,8 +2593,8 @@ class SnapmakerU1Endpoint(Endpoint):
             self._native_cache_dirty = True
             logging.info(
                 'BMCU Head %d filament projection already current: '
-                'material=%s vendor=%s subtype=%s soft=%d',
-                head + 1, material, vendor, subtype, 1 if soft else 0)
+                'material=%s vendor=%s subtype=%s soft=%d spool_id=%d',
+                head + 1, material, vendor, subtype, 1 if soft else 0, spool_id)
             return False
 
         snapshot = {key: copy.deepcopy(config[key][head])
@@ -2608,7 +2614,7 @@ class SnapmakerU1Endpoint(Endpoint):
             config['filament_official'][head] = False
             config['filament_sku'][head] = 0
             if 'filament_spool_id' in config:
-                config['filament_spool_id'][head] = 0
+                config['filament_spool_id'][head] = spool_id
             config['filament_exist'][head] = True
             config['filament_edit'][head] = True
             self._backup_head(task, head)
@@ -2629,8 +2635,8 @@ class SnapmakerU1Endpoint(Endpoint):
         self._last_runtime_source = copy.deepcopy(metadata)
         self._native_cache_dirty = True
         logging.info(
-            'BMCU projected Head %d filament: material=%s vendor=%s subtype=%s soft=%d',
-            head + 1, material, vendor, subtype, 1 if soft else 0)
+            'BMCU projected Head %d filament: material=%s vendor=%s subtype=%s soft=%d spool_id=%d',
+            head + 1, material, vendor, subtype, 1 if soft else 0, spool_id)
         return True
 
     def capture_active_filament_state(self):
@@ -4688,7 +4694,7 @@ class SnapmakerU1Endpoint(Endpoint):
             raise EndpointError('U1 toolhead unload assist must be 0..500 mm')
         sensor_before = self.sensor_detected('entry_sensor')
 
-        if self.delegates_long_unload_to_feeder():
+        if self.delegates_long_unload_to_feeder() and limit <= 0.0:
             return {
                 'limit_mm': 0.0,
                 'requested_limit_mm': limit,

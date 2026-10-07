@@ -73,6 +73,7 @@ class TransportDaemon(object):
         self.serial_decoder = protocol.StreamDecoder()
         self.serial_tx = bytearray()
         self.next_serial_connect = 0.0
+        self.last_connect_error = ''
         self.serial_settle_until = 0.0
         self.serial_generation = 0
         self.seq = 1
@@ -172,6 +173,16 @@ class TransportDaemon(object):
         if len(payload) < 4:
             return payload
         return struct.pack('<I', int(op_id) & 0xffffffff) + payload[4:]
+
+    def _client_operation_id(self, wire_op):
+        record = self.external_pending.get(wire_op)
+        if (record is not None and
+                record.get('epoch') == self.client_epoch and
+                record.get('kind') in ('operation', 'operation_complete') and
+                self.operation_wire_by_client.get(
+                    (self.client_epoch, record.get('client_cmd'))) == wire_op):
+            return int(record['client_cmd'])
+        return 0
 
     @staticmethod
     def _semantic_status_fingerprint(status):
@@ -291,7 +302,9 @@ class TransportDaemon(object):
 
     def _queue_packet_client(self, msg_type, seq, cmd_id, payload,
                              reliable=False, urgent=False, control=False):
-
+        if msg_type in (protocol.MSG_STATUS, protocol.MSG_SNAPSHOT):
+            payload = protocol.map_status_operation_id(
+                payload, self._client_operation_id)
         self._queue_client(
             transport.OP_PACKET, msg_type, 0, cmd_id, payload,
             reliable=reliable, urgent=urgent, control=control)
@@ -486,7 +499,7 @@ class TransportDaemon(object):
         import serial
         candidates = self._serial_candidates()
         if not candidates:
-            raise RuntimeError('no serial candidate is present')
+            return
         last_error = None
         for offset in range(len(candidates)):
             index = (self.serial_candidate_cursor + offset) % len(candidates)
@@ -557,7 +570,8 @@ class TransportDaemon(object):
             logging.info('opened %s for %s', port, self.args.name)
             self._write_status_file(force=True)
             return
-        raise RuntimeError('no serial candidate could be opened: %s' % last_error)
+        if last_error is not None:
+            raise RuntimeError('no serial candidate could be opened: %s' % last_error)
 
     def _close_serial(self, reason, notify=True):
         was_open = self.serial is not None or self.session_ready
@@ -697,6 +711,12 @@ class TransportDaemon(object):
             target_wire = self.operation_wire_by_client.get(
                 (self.client_epoch, client_op))
             completed = self.external_pending.get(target_wire)
+            if client_op and not target_wire:
+                self._queue_packet_client(
+                    protocol.MSG_ERROR, 0, cmd_id,
+                    struct.pack('<BHI', 0xff, 22, client_op),
+                    reliable=True, control=True)
+                return
             if (completed is not None and
                     completed.get('kind') == 'operation_complete' and
                     completed.get('result_payload') is not None):
@@ -725,7 +745,7 @@ class TransportDaemon(object):
                 (self.client_epoch, client_op))
             record['kind'] = 'operation_query'
             record['target_client_op'] = client_op
-            record['target_wire_op'] = target_wire or client_op
+            record['target_wire_op'] = target_wire or 0
             if target_wire:
                 payload = struct.pack('<I', target_wire)
         self.external_pending[wire_cmd] = record
@@ -894,7 +914,11 @@ class TransportDaemon(object):
                     self._remove_external(cmd_id)
                 return
             if record is not None and record.get('kind') == 'operation_query':
-                client_op = record.get('target_client_op')
+                wire_op = struct.unpack_from('<I', payload)[0]
+                client_op = self._client_operation_id(wire_op)
+                target_wire = record.get('target_wire_op', 0)
+                if target_wire and wire_op != target_wire:
+                    raise RuntimeError('operation result ID does not match query')
                 translated = self._rewrite_op_result_id(payload, client_op)
                 self._remove_external(cmd_id)
                 if record.get('epoch') == self.client_epoch:
@@ -935,8 +959,12 @@ class TransportDaemon(object):
 
         if msg_type in (protocol.MSG_JAM, protocol.MSG_ERROR,
                         protocol.MSG_OP_RESULT):
+            if msg_type == protocol.MSG_OP_RESULT:
+                wire_op = struct.unpack_from('<I', payload)[0]
+                payload = self._rewrite_op_result_id(
+                    payload, self._client_operation_id(wire_op))
             self._queue_packet_client(
-                msg_type, seq, cmd_id, payload, reliable=True,
+                msg_type, seq, 0, payload, reliable=True,
                 urgent=True, control=True)
 
     def _read_serial(self):
@@ -988,11 +1016,15 @@ class TransportDaemon(object):
 
     def _periodic(self, now):
         if self.serial is None and not self.serial_released and now >= self.next_serial_connect:
+            self.next_serial_connect = now + self.args.reconnect
             try:
                 self._open_serial()
+                self.last_connect_error = ''
             except Exception as exc:
-                logging.warning('serial connect failed: %s', exc)
-                self.next_serial_connect = now + self.args.reconnect
+                error = str(exc)
+                if error != self.last_connect_error:
+                    logging.warning('serial connect failed: %s', error)
+                self.last_connect_error = error
         if self.serial is not None:
             if not self.session_ready:
                 if (now >= self.serial_settle_until and

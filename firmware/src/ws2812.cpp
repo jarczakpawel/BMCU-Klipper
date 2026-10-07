@@ -137,7 +137,7 @@ void WS2812_class::write_frame(uint8_t override_index, uint32_t override_grb)
 
 void WS2812_class::updata(void)
 {
-    if (!dirty) return;
+    if (!dirty || time_hw_slow) return;
     write_frame(0xFFu, 0u);
     dirty = false;
 }

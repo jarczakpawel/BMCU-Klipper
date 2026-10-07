@@ -556,7 +556,7 @@ def detect_service(candidate: Candidate, override_backend: str = "", override_na
             listed = subprocess.run(
                 [systemctl, "list-units", "--all", "--type=service", "--plain",
                  "--no-legend", "--no-pager", "klipper*.service"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
             for line in listed.stdout.splitlines():
                 unit = line.split(None, 1)[0] if line.strip() else ""
                 if unit.endswith(".service"):
@@ -574,7 +574,7 @@ def detect_service(candidate: Candidate, override_backend: str = "", override_na
                 result = subprocess.run(
                     [systemctl, "show", "%s.service" % name,
                      "--property=LoadState", "--property=MainPID"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=15)
             except (OSError, subprocess.TimeoutExpired):
                 continue
             fields = {}
@@ -622,7 +622,7 @@ def detect_service(candidate: Candidate, override_backend: str = "", override_na
     if supervisorctl:
         try:
             result = subprocess.run([supervisorctl, "status"], stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, timeout=5)
+                                    stderr=subprocess.DEVNULL, text=True, timeout=15)
             names = []
             for line in result.stdout.splitlines():
                 raw_name = line.split(None, 1)[0] if line.strip() else ""
@@ -632,7 +632,7 @@ def detect_service(candidate: Candidate, override_backend: str = "", override_na
             if candidate.pid:
                 for name in names:
                     probe = subprocess.run([supervisorctl, "pid", name], stdout=subprocess.PIPE,
-                                           stderr=subprocess.DEVNULL, text=True, timeout=5)
+                                           stderr=subprocess.DEVNULL, text=True, timeout=15)
                     if probe.stdout.strip() == str(candidate.pid):
                         return ServiceSpec(backend="supervisor", name=name,
                                            reason="supervisord pid match")
@@ -844,11 +844,11 @@ def print_shell(plan: Plan):
     for key, value in values.items():
         print("%s=%s" % (key, shlex.quote(str(value))))
 
-def query_printer_idle(url: str, timeout: float = 3.0) -> tuple[bool, str]:
+def query_printer_idle(url: str, timeout: float = 20.0) -> tuple[bool, str]:
     try:
         timeout = float(timeout)
-        if not math.isfinite(timeout) or not 0.2 <= timeout <= 30.0:
-            raise RuntimeError("Moonraker timeout must be within 0.2..30 seconds")
+        if not math.isfinite(timeout) or not 0.2 <= timeout <= 120.0:
+            raise RuntimeError("Moonraker timeout must be within 0.2..120 seconds")
         base = validate_moonraker_url(url)
     except (TypeError, ValueError, RuntimeError) as exc:
         return False, "Moonraker query blocked: %s" % exc
@@ -889,7 +889,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     idle = sub.add_parser("printer-idle")
     idle.add_argument("--moonraker-url", default="http://127.0.0.1:7125")
-    idle.add_argument("--timeout", type=float, default=3.0)
+    idle.add_argument("--timeout", type=float, default=20.0)
     return parser
 
 def main(argv=None) -> int:
