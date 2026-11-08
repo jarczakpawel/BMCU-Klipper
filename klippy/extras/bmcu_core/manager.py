@@ -2436,6 +2436,8 @@ class BMCUManager(object):
         self._clear_print_session(
             'print_stats:stop event', preserve_loaded=keep_loaded)
         self._status_cache = None
+        self._queue_deferred_task(
+            'print-stop-follow', self._stop_finished_print_follow)
 
         for device_name in list(self._pending_device_status):
             self._queue_deferred_task(
@@ -2447,6 +2449,44 @@ class BMCUManager(object):
                 self._timer, self.reactor.monotonic())
         except Exception:
             pass
+
+    def _stop_finished_print_follow(self, eventtime):
+        if (self._print_state() not in (
+                'complete', 'completed', 'cancelled', 'canceled',
+                'error', 'failed', 'standby', 'ready', 'idle') or
+                self._critical_motion_active or self.active_operations or
+                self._u1_background_channel_locks or self._u1_background_jobs):
+            return
+        for device in self.devices:
+            if (not device.ready or not device.status_reconciled or
+                    getattr(device, 'suspended', False)):
+                continue
+            try:
+                status = device.refresh()
+                if int(status.get('active_op_state', 0) or 0) != protocol.OP_STATE_IDLE:
+                    continue
+                stopped = []
+                for channel, motion in enumerate(status.get('motion', ())):
+                    if (int(motion) == protocol.MOTION_ON_USE and
+                            self._route_state(device, channel) == protocol.ROUTE_LOADED):
+                        device.set_motion(channel, protocol.MOTION_IDLE)
+                        stopped.append(channel)
+                if stopped:
+                    status = device.refresh()
+                    if any(int(status['motion'][channel]) != protocol.MOTION_IDLE
+                           for channel in stopped):
+                        raise BMCUError(
+                            '%s did not confirm IDLE after print stop' % device.name)
+                    logging.info(
+                        'BMCU %s stopped post-print ON_USE on Channel(s) %s; '
+                        'loaded route states preserved',
+                        device.name, ', '.join(str(ch + 1) for ch in stopped))
+            except Exception as exc:
+                logging.exception(
+                    'BMCU %s could not stop post-print ON_USE', device.name)
+                self._record_error(
+                    'PRINT_STOP_FOLLOW_FAILED', device=device.name,
+                    phase='PRINT_STOP_FOLLOW', details=str(exc))
 
     def _manager_needs_fast_tick(self, eventtime):
         if (self.active_operations or self._u1_background_channel_locks or
@@ -8876,6 +8916,8 @@ class BMCUManager(object):
                 self.print_terminal_unload_pending = True
             self._clear_print_session(
                 'print state %s' % state, preserve_loaded=keep_loaded)
+            self._queue_deferred_task(
+                'print-stop-follow', self._stop_finished_print_follow)
         elif (state in ('standby', 'ready', 'idle') and
               (self._print_session_seen_active or
                previous in ('printing', 'paused', 'pause'))):
@@ -8885,6 +8927,8 @@ class BMCUManager(object):
             self._clear_print_session(
                 'print returned to %s' % state,
                 preserve_loaded=keep_loaded)
+            self._queue_deferred_task(
+                'print-stop-follow', self._stop_finished_print_follow)
 
     def _virtual_sd_dispatch_active(self):
         virtual_sdcard = self.printer.lookup_object('virtual_sdcard', None)

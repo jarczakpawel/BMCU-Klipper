@@ -11,6 +11,7 @@ import logging.handlers
 import json
 import os
 import select
+import secrets
 import signal
 import socket
 import stat
@@ -58,7 +59,7 @@ class TransportDaemon(object):
 
         self.external_pending = {}
         self.operation_wire_by_client = {}
-        self.external_cmd = 1
+        self.external_cmd = secrets.randbelow(_INTERNAL_BASE - 1) + 1
         self.reliable = collections.deque()
         self.latest_status = None
         self.latest_snapshot = None

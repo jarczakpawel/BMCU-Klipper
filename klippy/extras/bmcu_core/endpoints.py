@@ -90,7 +90,6 @@ def u1_tip_movement_defaults():
         'G1 E46.4 F1740\n'
         'G1 E-46.4 F2400\n'
         'G1 E20 F340\n'
-        'BMCU_TEMP S0\n'
         'G1 E-20 F210\n'
         'G1 E-21.1 F2700')
     defaults['rigid_fine'] = defaults['rigid_standard'].replace(
@@ -573,6 +572,10 @@ def validate_u1_tip_profile(profile):
     defaults = u1_tip_movement_defaults()
     for key in _U1_TIP_MOVEMENT_KEYS:
         candidate = movements.get(key) if isinstance(movements, dict) else None
+        if isinstance(candidate, str):
+            candidate = re.sub(
+                r'(?im)^[ \t]*BMCU_TEMP[ \t]+S0(?:\.0+)?[ \t]*(?:\r?\n|$)',
+                '', candidate)
         normalized_movements[key] = validate_u1_tip_movements(
             candidate or defaults[key])
     if temperature_mode not in _U1_TIP_TEMPERATURE_MODES:
@@ -4760,14 +4763,16 @@ class SnapmakerU1Endpoint(Endpoint):
                 raise EndpointError(
                     'U1 toolhead filament sensor became unavailable during unload')
 
-        if sensor_after is not False:
+        delegated = self.delegates_long_unload_to_feeder()
+        if sensor_after is not False and not delegated:
             raise EndpointError(
                 'U1 toolhead still detects filament after %.1f mm assist; '
                 'BMCU pullback was not started' % moved)
         return {
             'limit_mm': limit, 'moved_mm': moved,
             'sensor_before': sensor_before, 'sensor_after': sensor_after,
-            'sensor_cleared': True,
+            'sensor_cleared': sensor_after is False,
+            'delegated_to_bmcu': delegated,
         }
 
     def _snap_tail_context(self, material='', temperature_profile=None):
